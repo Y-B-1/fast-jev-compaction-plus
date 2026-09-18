@@ -46,7 +46,10 @@ built-in compaction summary with the original messages.
    32k — is checked separately. The same full state is resent with every
    request, so fewer requests is strictly cheaper; requests run concurrently
    and their answers are merged.
-6. Decisions per call, against `keepThreshold`:
+6. Decisions per call, against `keepThreshold`. A Noul answer of 0.5 is Jev
+   saying it is unsure, and distance from 0.5 is the confidence signal, so the
+   default threshold is deliberately low: deleting context cannot be undone, and
+   an uncertain answer should keep. The decisions are:
    - `keepResult ≥ threshold` → keep call and result;
    - else `keepCall ≥ threshold` → keep the call, truncate the result to its
      first `truncateHeadChars` characters plus a one-line note;
@@ -107,7 +110,7 @@ put it in a source file.
 | `baseUrl` | `https://api.typesafe.ai/v1/systemone` | System One endpoint |
 | `fetch` | native `fetch` | Injectable fetch implementation for tests |
 | `goal` | last 3 user prompts | Ongoing task description included in the state |
-| `keepThreshold` | `0.5` | Minimum keep probability for a call or result to stay |
+| `keepThreshold` | `0.15` | Minimum Jev probability for a call or result to stay |
 | `preserveRecentMessages` | `6` | Newest messages never touched (the first is always kept) |
 | `maxStateTokens` | `25000` | Estimated token ceiling for the state |
 | `maxRequestTokens` | `60000` | Estimated ceiling for state plus one batch of questions (Jev allows 64k) |

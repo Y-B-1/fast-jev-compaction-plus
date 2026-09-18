@@ -95,7 +95,11 @@ export interface FittedState {
 export interface CompactOptions {
   /** Ongoing task description; defaults to the last few user prompts. */
   goal?: string;
-  /** Minimum keep probability for a call or result to stay. Default 0.5. */
+  /**
+   * Minimum Jev probability for a call or result to stay. Default 0.15: a Noul
+   * of 0.5 means "unsure", so anything above a low floor is kept and only a
+   * confident "no longer needed" deletes.
+   */
   keepThreshold?: number;
   /** Newest messages never touched (the first message is always kept). Default 6. */
   preserveRecentMessages?: number;

@@ -75,7 +75,7 @@ const fit = {
 describe('options', () => {
   it('fills in defaults and ignores non-finite values', () => {
     expect(resolveOptions()).toMatchObject({
-      keepThreshold: 0.5,
+      keepThreshold: 0.15,
       preserveRecentMessages: 6,
       maxStateTokens: 25_000,
       maxRequestTokens: 60_000,
@@ -86,7 +86,7 @@ describe('options', () => {
       preserveRecentMessages: 2.7,
       truncateHeadChars: -1.2,
     })).toMatchObject({
-      keepThreshold: 0.5,
+      keepThreshold: 0.15,
       preserveRecentMessages: 2,
       truncateHeadChars: 0,
     });
@@ -644,6 +644,25 @@ describe('jev context limits', () => {
   it('rejects a state that leaves no room for a single question', () => {
     expect(() => batchCalls([call('t1')], 31_990, { maxRequestTokens: 60_000 })).toThrow(
       /state plus one question/,
+    );
+  });
+});
+
+describe('keep threshold', () => {
+  const call = { id: 't1', tool: 'Read', pinned: false };
+
+  it('keeps a call Jev is unsure about', () => {
+    const decision = decideCall(call, { keepCall: 0.5, keepResult: 0.5 }, resolveOptions());
+    expect(decision.action).toBe('keep');
+  });
+
+  it('drops only when Jev is confident the call is spent', () => {
+    const options = resolveOptions();
+    expect(decideCall(call, { keepCall: 0.2, keepResult: 0.05 }, options).action).toBe(
+      'drop_result',
+    );
+    expect(decideCall(call, { keepCall: 0.05, keepResult: 0.03 }, options).action).toBe(
+      'drop_call',
     );
   });
 });

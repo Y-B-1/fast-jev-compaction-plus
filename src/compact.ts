@@ -16,7 +16,15 @@ import type {
 
 export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   goal: '',
-  keepThreshold: 0.5,
+  /**
+   * A Noul of 0.5 is Jev saying it is unsure, not "half". Distance from 0.5 is
+   * the confidence signal, so a threshold of 0.5 puts every uncertain answer on
+   * the delete side of an irreversible decision. Deleting context is the
+   * high-stakes action here, so the gate sits on the drop: a call is removed
+   * only when Jev is fairly sure it is no longer needed. See
+   * https://docs.typesafe.ai/confidence.
+   */
+  keepThreshold: 0.15,
   preserveRecentMessages: 6,
   maxStateTokens: 25_000,
   maxRequestTokens: 60_000,
