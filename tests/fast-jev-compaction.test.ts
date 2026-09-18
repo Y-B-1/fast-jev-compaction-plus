@@ -337,15 +337,20 @@ describe('compact', () => {
   it('resends the full state with every batch and merges the answers', async () => {
     const seen: Seen[] = [];
     const messages = transcript();
-    const stateTokens = fitState(messages, collectToolCalls(messages, 1), {
+    const calls = collectToolCalls(messages, 1);
+    const stateTokens = fitState(messages, calls, {
       ...fit,
       goal: '',
       preserveRecentMessages: 1,
     }).tokens;
+    // Room for exactly one call's questions, so every call gets its own batch.
+    const perCall = Math.max(
+      ...calls.map((call) => estimateTokens(JSON.stringify(questionsFor(call)))),
+    );
     const output = await compact(
       messages,
       fakeJev((name) => (name.startsWith('call_') ? 0.9 : 0.1), seen),
-      { preserveRecentMessages: 1, maxRequestTokens: stateTokens + 150 },
+      { preserveRecentMessages: 1, maxRequestTokens: stateTokens + perCall + 25 },
     );
 
     expect(output.stats.requests).toBe(seen.length);
@@ -634,11 +639,12 @@ describe('jev context limits', () => {
   });
 
   it('uses the whole 64k request budget, not 32k', () => {
-    const perCall = estimateTokens(JSON.stringify(questionsFor(call('t1'))));
-    const calls = Array.from({ length: 200 }, (_, i) => call(`t${i + 1}`));
-    const batches = batchCalls(calls, 25_000, { maxRequestTokens: 60_000 });
-    expect(batches).toHaveLength(1);
-    expect(perCall * 200).toBeLessThan(60_000 - 25_000);
+    const calls = Array.from({ length: 90 }, (_, i) => call(`t${i + 1}`));
+    // One request under the real 64k limit, several under the old 30k ceiling.
+    expect(batchCalls(calls, 25_000, { maxRequestTokens: 60_000 })).toHaveLength(1);
+    expect(
+      batchCalls(calls, 25_000, { maxRequestTokens: 30_000 }).length,
+    ).toBeGreaterThan(5);
   });
 
   it('rejects a state that leaves no room for a single question', () => {
