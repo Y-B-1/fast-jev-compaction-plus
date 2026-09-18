@@ -101,7 +101,7 @@ export interface CompactOptions {
   preserveRecentMessages?: number;
   /** Estimated token ceiling for the state. Default 25000. */
   maxStateTokens?: number;
-  /** Estimated token ceiling for state plus one batch of questions. Default 30000. */
+  /** Estimated token ceiling for state plus one batch of questions. Default 60000. */
   maxRequestTokens?: number;
   /** Maximum concurrent Jev requests. Default 4. A batch that still fails after
    * the asker's own retries is salvaged: its calls are simply left unanswered. */

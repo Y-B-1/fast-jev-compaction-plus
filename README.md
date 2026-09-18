@@ -41,9 +41,11 @@ built-in compaction summary with the original messages.
    **result** stay verbatim (its contents are still needed and re-running the
    tool would not do).
 5. Questions are split into as many requests as needed so state plus questions
-   stays under `maxRequestTokens` (30k by default, under Jev's 32k request
-   limit). The same full state is resent with every request; requests run
-   concurrently and their answers are merged.
+   stays under `maxRequestTokens` (60k by default, under Jev's 64k per-request
+   limit). Jev's second limit — state plus the single longest question under
+   32k — is checked separately. The same full state is resent with every
+   request, so fewer requests is strictly cheaper; requests run concurrently
+   and their answers are merged.
 6. Decisions per call, against `keepThreshold`:
    - `keepResult ≥ threshold` → keep call and result;
    - else `keepCall ≥ threshold` → keep the call, truncate the result to its
@@ -108,7 +110,7 @@ put it in a source file.
 | `keepThreshold` | `0.5` | Minimum keep probability for a call or result to stay |
 | `preserveRecentMessages` | `6` | Newest messages never touched (the first is always kept) |
 | `maxStateTokens` | `25000` | Estimated token ceiling for the state |
-| `maxRequestTokens` | `30000` | Estimated ceiling for state plus one batch of questions |
+| `maxRequestTokens` | `60000` | Estimated ceiling for state plus one batch of questions (Jev allows 64k) |
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
 
 `result.stats` reports message and character counts before and after, the
@@ -122,8 +124,9 @@ stage was needed, and the number of requests.
 - Token sizes are estimates from character counts, not a tokenizer.
 - Calibration is at the request level; a probability is not a proof that a
   result is safe to delete. The assistant can always re-run the tool.
-- The full state is repeated with every request, so a history near the state
-  ceiling costs one request per handful of questions.
+- The full state is repeated with every request, and Jev prefills it each time,
+  so the request count dominates the cost. Lowering `maxStateTokens` both
+  shrinks each prefill and leaves more of the 64k budget for questions.
 
 ## Claude Code plugin
 

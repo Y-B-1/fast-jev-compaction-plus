@@ -19,13 +19,21 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
   maxStateTokens: 25_000,
-  maxRequestTokens: 30_000,
+  maxRequestTokens: 60_000,
   maxConcurrentRequests: 4,
   truncateHeadChars: 300,
 };
 
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
 const REQUEST_OVERHEAD_TOKENS = 20;
+
+/**
+ * Jev's second context limit: the state plus the *single longest* question must
+ * fit this, independently of the whole-request budget. See
+ * https://docs.typesafe.ai/models — "64k tokens per request; 32k tokens for
+ * `state` plus the longest question".
+ */
+const MAX_STATE_PLUS_QUESTION_TOKENS = 32_000;
 
 function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -86,6 +94,12 @@ export function batchCalls(
   let currentTokens = 0;
   for (const call of calls) {
     const tokens = estimateTokens(JSON.stringify(questionsFor(call)));
+    if (stateTokens + tokens + REQUEST_OVERHEAD_TOKENS > MAX_STATE_PLUS_QUESTION_TOKENS) {
+      throw new Error(
+        `state plus one question exceeds Jev's ${MAX_STATE_PLUS_QUESTION_TOKENS}-token limit ` +
+          `(~${stateTokens} state + ~${tokens} question); lower maxStateTokens`,
+      );
+    }
     if (current.length > 0 && currentTokens + tokens > budget) {
       batches.push(current);
       current = [];

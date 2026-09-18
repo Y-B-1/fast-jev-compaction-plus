@@ -43,8 +43,8 @@
     "maxRequestTokens": {
       "type": "number",
       "title": "Maximum Jev request tokens",
-      "description": "Estimated token budget for state plus questions in one Jev request.",
-      "default": 30000
+      "description": "Estimated token budget for state plus questions in one Jev request. Jev allows 64k.",
+      "default": 60000
     },
     "truncateHeadChars": {
       "type": "number",
