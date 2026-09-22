@@ -394,10 +394,10 @@ describe('HTTP client', () => {
     const request = buildJevRequest({ apiKey: 'k' }, { a: 1 }, {
       q: { type: 'noul', instructions: 'x' },
     });
-    expect(request.url).toBe('https://api.typesafe.ai/v1/systemone');
+    expect(request.url).toBe('https://openrouter.ai/api/alpha/decisions');
     expect(request.headers.authorization).toBe('Bearer k');
     expect(JSON.parse(request.body)).toEqual({
-      model: 'jev-latest',
+      model: 'typesafe/jev-1.13',
       state: { a: 1 },
       questions: { q: { type: 'noul', instructions: 'x' } },
     });
