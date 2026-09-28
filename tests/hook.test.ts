@@ -3,6 +3,7 @@ import {
   compactSession,
   decisionLog,
   decisionLogLines,
+  getApiKey,
   register,
   resolveHookConfig,
   summarize,
@@ -146,6 +147,44 @@ describe('compactSession', () => {
     await expect(
       compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);
+  });
+});
+
+describe('getApiKey', () => {
+  const engine = (env: Record<string, string> = {}, settingsEnv: Record<string, string> = {}) => ({
+    env: { get: async (name: string) => env[name] },
+    settings: { read: async () => ({ env: settingsEnv }) },
+  });
+
+  it('prefers config.apiKey, then OPENROUTER_API_KEY, then TYPESAFE_API_KEY', async () => {
+    expect(await getApiKey(engine(), { ...resolveHookConfig({}), apiKey: 'configured' })).toBe(
+      'configured',
+    );
+    expect(
+      await getApiKey(engine({ OPENROUTER_API_KEY: 'router', TYPESAFE_API_KEY: 'typesafe' }), resolveHookConfig({})),
+    ).toBe('router');
+    expect(await getApiKey(engine({ TYPESAFE_API_KEY: 'typesafe' }), resolveHookConfig({}))).toBe(
+      'typesafe',
+    );
+    expect(await getApiKey(engine(), resolveHookConfig({}))).toBeUndefined();
+  });
+
+  it('treats an empty-string OPENROUTER_API_KEY as unset instead of blocking the fallback', async () => {
+    expect(
+      await getApiKey(engine({ OPENROUTER_API_KEY: '', TYPESAFE_API_KEY: 'typesafe' }), resolveHookConfig({})),
+    ).toBe('typesafe');
+    expect(
+      await getApiKey(
+        engine({}, { OPENROUTER_API_KEY: '', TYPESAFE_API_KEY: 'typesafe' }),
+        resolveHookConfig({}),
+      ),
+    ).toBe('typesafe');
+  });
+
+  it('falls back to the settings env block when the process environment has nothing', async () => {
+    expect(
+      await getApiKey(engine({}, { OPENROUTER_API_KEY: 'from-settings' }), resolveHookConfig({})),
+    ).toBe('from-settings');
   });
 });
 

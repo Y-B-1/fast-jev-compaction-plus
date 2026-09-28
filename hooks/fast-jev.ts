@@ -167,7 +167,7 @@ export async function compactSession(
   config: HookConfig,
   fetchFn: HookFetch,
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
+  if (!config.apiKey) throw new Error('OPENROUTER_API_KEY (or TYPESAFE_API_KEY) is not configured');
   const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
@@ -224,7 +224,20 @@ export function decisionLogLines(
   );
 }
 
-async function getApiKey(
+function settingsEnv(settings: Readonly<Record<string, unknown>>, name: string): string | undefined {
+  const env = settings['env'];
+  if (!env || typeof env !== 'object') return undefined;
+  const value = (env as Record<string, unknown>)[name];
+  return typeof value === 'string' && value ? value : undefined;
+}
+
+/**
+ * OPENROUTER_API_KEY, falling back to TYPESAFE_API_KEY, each checked in the
+ * environment and then in the settings' `env` block; an empty string counts
+ * as unset at every step, so it falls through to the next source instead of
+ * blocking the fallback chain.
+ */
+export async function getApiKey(
   $: {
     env: { get: (name: string) => Promise<string | undefined> };
     settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
@@ -232,13 +245,10 @@ async function getApiKey(
   config: HookConfig,
 ): Promise<string | undefined> {
   if (config.apiKey) return config.apiKey;
-  const fromEnv = (await $.env.get('OPENROUTER_API_KEY')) ?? (await $.env.get('TYPESAFE_API_KEY'));
-  if (fromEnv) return fromEnv;
   const settings = await $.settings.read();
-  const env = settings['env'];
-  if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)['OPENROUTER_API_KEY'] ?? (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
-    if (typeof value === 'string' && value) return value;
+  for (const name of ['OPENROUTER_API_KEY', 'TYPESAFE_API_KEY'] as const) {
+    const key = (await $.env.get(name)) || settingsEnv(settings, name);
+    if (key) return key;
   }
   return undefined;
 }
