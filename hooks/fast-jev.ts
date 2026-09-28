@@ -10,7 +10,13 @@ import type {
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
 import { trimOutput } from '../src/output.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import {
+  buildJevRequest,
+  DEFAULT_MODEL,
+  isRetryableStatus,
+  parseJevResponse,
+  retryDelayMs,
+} from '../src/request.js';
 import { redactCompactionState, redactText } from '../src/redact.js';
 import { goalFromMessages } from '../src/state.js';
 import type {
@@ -60,6 +66,8 @@ export type HookFetchResponse = {
   status: number;
   ok: boolean;
   text: string;
+  /** Lower-cased response headers, when the engine gives them (for `retry-after`). */
+  headers?: Record<string, string>;
 };
 
 /** The shape of `$.http.fetch`, so the hook can be driven without an engine. */
@@ -157,8 +165,73 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   return config;
 }
 
-/** A `JevAsker` over the engine's `$.http.fetch`. */
-export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
+export type JevAskerOptions = {
+  /** Deadline for each attempt. Default 20000 ms. */
+  timeoutMs?: number;
+  /** The hook's `next.signal`: ends a pending request when the dispatch ends. */
+  signal?: AbortSignal;
+};
+
+const JEV_TIMEOUT_MS = 20_000;
+
+function abortReason(signal: AbortSignal | undefined): unknown {
+  return signal?.reason ?? new Error('Jev request aborted');
+}
+
+/**
+ * Races `promise` against `timeoutMs` and `signal`. `$.http.fetch` takes no
+ * signal of its own, so a hung call is abandoned rather than cancelled; what
+ * matters is that the hook stops waiting on it. The hook runtime has no
+ * `setTimeout`, so the deadline is an `AbortSignal.timeout`.
+ */
+function bounded<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+  what: string,
+): Promise<T> {
+  // A call abandoned by a lost race may still reject later; that is expected.
+  promise.catch(() => {});
+  const deadline = AbortSignal.timeout(timeoutMs);
+  const either = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  let onAbort = () => {};
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    onAbort = () => {
+      if (signal?.aborted) return reject(abortReason(signal));
+      const error = new Error(`${what} timed out after ${timeoutMs} ms`);
+      error.name = 'TimeoutError';
+      reject(error);
+    };
+    if (either.aborted) onAbort();
+    else either.addEventListener('abort', onAbort, { once: true });
+  });
+  return Promise.race([promise, cancelled]).finally(() => either.removeEventListener('abort', onAbort));
+}
+
+/** Waits `ms`, or rejects as soon as `signal` aborts. */
+function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  const done = AbortSignal.timeout(ms);
+  const either = signal ? AbortSignal.any([signal, done]) : done;
+  return new Promise((resolve, reject) => {
+    const onAbort = () => (signal?.aborted ? reject(abortReason(signal)) : resolve());
+    if (either.aborted) onAbort();
+    else either.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
+ * A `JevAsker` over the engine's `$.http.fetch`: each attempt is bounded by a
+ * timeout and the hook's signal, and a 429 or 5xx is retried once, after the
+ * `retry-after` delay when the engine reports one.
+ */
+export function jevAsker(
+  fetchFn: HookFetch,
+  apiKey: string,
+  model: string,
+  options: JevAskerOptions = {},
+): JevAsker {
+  const timeoutMs = options.timeoutMs ?? JEV_TIMEOUT_MS;
+  const { signal } = options;
   return {
     async ask(state, questions) {
       // The state carries transcript text and tool inputs verbatim, and each
@@ -169,11 +242,19 @@ export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): Jev
         redactCompactionState(state, apiKey),
         redactCompactionState(questions, apiKey),
       );
-      const response = await fetchFn(request.url, {
-        method: request.method,
-        headers: request.headers,
-        body: request.body,
-      });
+      const attempt = () =>
+        bounded(
+          fetchFn(request.url, { method: request.method, headers: request.headers, body: request.body }),
+          timeoutMs,
+          signal,
+          'Jev request',
+        );
+      let response = await attempt();
+      if (!response.ok && isRetryableStatus(response.status)) {
+        const delay = retryDelayMs(response.headers?.['retry-after']);
+        if (delay > 0) await sleep(delay, signal);
+        response = await attempt();
+      }
       return parseJevResponse(response.status, response.ok, response.text);
     },
   };
@@ -283,9 +364,10 @@ export async function compactSession(
   config: HookConfig,
   fetchFn: HookFetch,
   archive?: ArchiveWriter,
+  askerOptions: JevAskerOptions = {},
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error('OPENROUTER_API_KEY (or TYPESAFE_API_KEY) is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), {
+  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model, askerOptions), {
     ...config,
     ...(archive ? { archive: archive.cite } : {}),
   });
@@ -438,9 +520,10 @@ export const register: Register = (on: On, options: PluginOptions) => {
         config,
         async (url, init) => {
           const response = await $.http.fetch(url, init);
-          return { status: response.status, ok: response.ok, text: response.text };
+          return { status: response.status, ok: response.ok, text: response.text, headers: response.headers };
         },
         config.archiveResults ? archiveWriter($) : undefined,
+        { signal: next.signal },
       );
       if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) log($, line);
@@ -546,10 +629,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const asker = jevAsker(
         async (url, init) => {
           const response = await $.http.fetch(url, init);
-          return { status: response.status, ok: response.ok, text: response.text };
+          return { status: response.status, ok: response.ok, text: response.text, headers: response.headers };
         },
         apiKey,
         configured.model,
+        { signal: next.signal },
       );
       const trimmed = await trimOutput(
         { command: e.command, goal: configured.goal ?? '', output: stdout },

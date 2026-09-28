@@ -196,6 +196,33 @@ describe('compactSession', () => {
     expect(all).not.toContain('hunter2hunter2');
   });
 
+  it('gives up on a Jev call that never answers instead of stalling the compaction', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    const never = () => new Promise<never>(() => {});
+    await expect(
+      compactSession(transcript(), config, never, undefined, { timeoutMs: 30 }),
+    ).rejects.toThrow(/timed out after 30 ms/);
+    const controller = new AbortController();
+    const pending = compactSession(transcript(), config, never, undefined, { signal: controller.signal });
+    controller.abort(new Error('dispatch ended'));
+    await expect(pending).rejects.toThrow(/dispatch ended/);
+  });
+
+  it('retries a 429 or 5xx once, and not a 4xx', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    const ok = jevFetch(() => 0.01);
+    let calls = 0;
+    const flaky = async (url: string, init?: { body?: string }) =>
+      ++calls === 1 ? { status: 503, ok: false, text: 'busy', headers: { 'retry-after': '0' } } : ok(url, init);
+    const { result } = await compactSession(transcript(), config, flaky);
+    expect(calls).toBe(2);
+    expect(result.decisions).toHaveLength(2);
+    calls = 0;
+    const bad = async () => (++calls, { status: 400, ok: false, text: 'bad request' });
+    await expect(compactSession(transcript(), config, bad)).rejects.toThrow(/400/);
+    expect(calls).toBe(1);
+  });
+
   it('archives a dropped call and cites the file in the note left behind, when an archive writer is given', async () => {
     const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
     const files = new Map<string, string>();
