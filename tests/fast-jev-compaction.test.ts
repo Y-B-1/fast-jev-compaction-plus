@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   applyDecisions,
   batchCalls,
@@ -543,9 +543,79 @@ describe('HTTP client', () => {
     expect(JSON.parse(bodies[0]!).model).toBe('jev-test');
 
     const keyless = new JevClient({ apiKey: '' });
-    await expect(keyless.ask('s', {})).rejects.toThrow(/TYPESAFE_API_KEY/);
+    await expect(keyless.ask('s', {})).rejects.toThrow(/OPENROUTER_API_KEY/);
     await expect(
       compactMessages(transcript(), { apiKey: '', preserveRecentMessages: 1 }),
-    ).rejects.toThrow(/TYPESAFE_API_KEY/);
+    ).rejects.toThrow(/OPENROUTER_API_KEY/);
+  });
+
+  it('reads OPENROUTER_API_KEY first, falling back to TYPESAFE_API_KEY, treating an empty string as unset', () => {
+    const original = { or: process.env.OPENROUTER_API_KEY, ts: process.env.TYPESAFE_API_KEY };
+    try {
+      process.env.OPENROUTER_API_KEY = 'router-key';
+      process.env.TYPESAFE_API_KEY = 'typesafe-key';
+      expect(new JevClient().ask).toBeInstanceOf(Function);
+      const request = buildJevRequest(
+        { apiKey: process.env.OPENROUTER_API_KEY || process.env.TYPESAFE_API_KEY || '' },
+        {},
+        {},
+      );
+      expect(request.headers.authorization).toBe('Bearer router-key');
+
+      process.env.OPENROUTER_API_KEY = '';
+      const fallback = buildJevRequest(
+        { apiKey: process.env.OPENROUTER_API_KEY || process.env.TYPESAFE_API_KEY || '' },
+        {},
+        {},
+      );
+      expect(fallback.headers.authorization).toBe('Bearer typesafe-key');
+    } finally {
+      if (original.or === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = original.or;
+      if (original.ts === undefined) delete process.env.TYPESAFE_API_KEY;
+      else process.env.TYPESAFE_API_KEY = original.ts;
+    }
+  });
+
+  it('times out a hung request and retries once on a 429, honoring retry-after', async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const client = new JevClient({
+        apiKey: 'k',
+        timeoutMs: 50,
+        fetch: (async (_url: string | URL | Request, init?: RequestInit) => {
+          calls += 1;
+          if (calls === 1) {
+            return new Response('{"error":"rate limited"}', {
+              status: 429,
+              headers: { 'retry-after': '0' },
+            });
+          }
+          return new Response(JSON.stringify({ answers: { q: { noul: 0.7 } } }), { status: 200 });
+        }) as typeof fetch,
+      });
+      const response = await client.ask('s', { q: { type: 'noul', instructions: 'x' } });
+      expect(response.answers.q).toEqual({ noul: 0.7 });
+      expect(calls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('aborts a hung request once the deadline passes', async () => {
+    const client = new JevClient({
+      apiKey: 'k',
+      timeoutMs: 10,
+      fetch: (async (_url: string | URL | Request, init?: RequestInit) => {
+        await new Promise((resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal!.reason));
+        });
+        throw new Error('unreachable');
+      }) as typeof fetch,
+    });
+    await expect(client.ask('s', { q: { type: 'noul', instructions: 'x' } })).rejects.toThrow(
+      /timed out/,
+    );
   });
 });

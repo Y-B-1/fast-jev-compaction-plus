@@ -62,6 +62,25 @@ export function parseJevResponse(
   return parsed as JevResponse;
 }
 
+/** A 429 or a 5xx is worth one retry; anything else is the caller's problem. */
+export function isRetryableStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+/**
+ * Milliseconds to wait before a retry, from a `retry-after` header value
+ * (either delay-seconds or an HTTP date), capped so a hostile or malformed
+ * header cannot stall the caller for long. Returns 0 when the header is
+ * absent or unparsable.
+ */
+export function retryDelayMs(value: string | null | undefined, capMs = 30_000): number {
+  if (!value) return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.min(Math.max(0, seconds * 1000), capMs);
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? 0 : Math.min(Math.max(0, at - Date.now()), capMs);
+}
+
 /** The `noul` probability of one answer; throws when it is not there. */
 export function noulAnswer(
   answers: Record<string, JevAnswer>,
