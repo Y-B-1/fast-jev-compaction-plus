@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  archiveWriter,
   compactSession,
   decisionLog,
   decisionLogLines,
@@ -56,6 +57,7 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
     expect(resolveHookConfig({})).toEqual({
+      archiveResults: true,
       compactAtPercent: 60,
       compactCooldownTurns: 3,
       minReductionRatio: 0.25,
@@ -70,6 +72,7 @@ describe('hook config', () => {
       maxStateTokens: 1000,
       model: 'jev-x',
       goal: 'g',
+      archiveResults: true,
       compactAtPercent: 60,
       compactCooldownTurns: 3,
       minReductionRatio: 0.25,
@@ -137,7 +140,7 @@ describe('compactSession', () => {
     expect(bodies).toHaveLength(1);
     expect(JSON.parse(bodies[0]!).model).toBe('jev-x');
     expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
-    expect(messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
+    expect(messages.map((m) => m.handle)).toEqual(['h-0', undefined, 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
     expect(summarize(output)).toMatch(/^\d+% reduction; 1 kept, 1 call_dropped; state ~\d+ tokens \(full\) in 1 request\(s\)$/);
     expect(decisionLog(output)).toBe('t1:Read:drop_call/call=0.01/result=0.01 t2:Bash:keep/call=0.90/result=0.90');
     expect(decisionLogLines(output)).toEqual([`decisions: ${decisionLog(output)}`]);
@@ -161,6 +164,60 @@ describe('compactSession', () => {
     await expect(
       compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);
+  });
+
+  it('archives a dropped call and cites the file in the note left behind, when an archive writer is given', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    const files = new Map<string, string>();
+    const writer = archiveWriter({
+      fs: {
+        exists: async (path: string) => files.has(path),
+        write: async (path: string, text: string) => void files.set(path, text),
+      },
+    });
+    const { result } = await compactSession(transcript(), config, jevFetch(() => 0.01), writer);
+    const dropped = result.messages.find((m) => m.text.includes('removed the Read call'));
+    expect(dropped?.text).toContain('.claude/fast-jev-compaction/tool-1.txt');
+    expect(files.get('.claude/fast-jev-compaction/tool-1.txt')).toBe(fileA);
+    expect(files.get('.claude/fast-jev-compaction/.gitignore')).toBe('*\n');
+  });
+});
+
+describe('archiveWriter', () => {
+  const fsStub = () => {
+    const files = new Map<string, string>();
+    return {
+      files,
+      fs: {
+        exists: async (path: string) => files.has(path),
+        write: async (path: string, text: string) => void files.set(path, text),
+      },
+    };
+  };
+
+  it('names a file per cited call, writes them on flush, and adds a .gitignore', async () => {
+    const stub = fsStub();
+    const writer = archiveWriter(stub);
+    const path = writer.cite('toolu_1', 'a'.repeat(5000));
+    expect(path).toBe('.claude/fast-jev-compaction/toolu_1.txt');
+    expect(stub.files.size).toBe(0);
+    await writer.flush();
+    expect(stub.files.get('.claude/fast-jev-compaction/.gitignore')).toBe('*\n');
+    expect(stub.files.get(path!)?.length).toBe(5000);
+  });
+
+  it('never archives text that looks like a credential', async () => {
+    const stub = fsStub();
+    const writer = archiveWriter(stub);
+    expect(writer.cite('toolu_2', 'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI7K7MDENG')).toBeUndefined();
+    await writer.flush();
+    expect(stub.files.size).toBe(0);
+  });
+
+  it('writes nothing when nothing was cited', async () => {
+    const stub = fsStub();
+    await archiveWriter(stub).flush();
+    expect(stub.files.size).toBe(0);
   });
 });
 

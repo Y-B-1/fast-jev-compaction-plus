@@ -10,7 +10,7 @@ import type {
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
-import { redactCompactionState } from '../src/redact.js';
+import { redactCompactionState, redactText } from '../src/redact.js';
 import { goalFromMessages } from '../src/state.js';
 import type {
   CompactOptions,
@@ -29,6 +29,7 @@ import type {
 export type BuiltinFallback = 'auto' | 'always' | 'never';
 
 const HOOK_DEFAULTS = {
+  archiveResults: true,
   compactAtPercent: 60,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
@@ -61,6 +62,7 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 
 export type HookConfig = CompactOptions & {
   apiKey?: string;
+  archiveResults: boolean;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
@@ -114,6 +116,10 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   }
   const config: HookConfig = {
     ...numbers,
+    archiveResults:
+      typeof options['archiveResults'] === 'boolean'
+        ? options['archiveResults']
+        : HOOK_DEFAULTS.archiveResults,
     compactAtPercent: optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent),
     minReductionRatio: optionNumber(
       options,
@@ -211,14 +217,58 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
+const ARCHIVE_DIR = '.claude/fast-jev-compaction';
+
+export type ArchiveWriter = {
+  /** Names the file a dropped call's or result's full text will be written to. */
+  cite: (toolUseId: string, text: string) => string | undefined;
+  /** Writes the files named so far. */
+  flush: () => Promise<void>;
+};
+
+/**
+ * Saves what compaction drops to `.claude/fast-jev-compaction/`, so a detail
+ * buried in a dropped call or result can still be read back later. Text that
+ * looks like a credential is never written, matching what the Jev request
+ * itself redacts.
+ */
+export function archiveWriter($: {
+  fs: {
+    exists: (path: string) => Promise<boolean>;
+    write: (path: string, text: string) => Promise<void>;
+  };
+}): ArchiveWriter {
+  const pending = new Map<string, string>();
+  return {
+    cite(toolUseId, text) {
+      if (!text || redactText(text, undefined) !== text) return undefined;
+      const path = `${ARCHIVE_DIR}/${toolUseId}.txt`;
+      pending.set(path, text);
+      return path;
+    },
+    async flush() {
+      if (pending.size === 0) return;
+      const ignorePath = `${ARCHIVE_DIR}/.gitignore`;
+      if (!(await $.fs.exists(ignorePath))) await $.fs.write(ignorePath, '*\n');
+      for (const [path, text] of pending) await $.fs.write(path, text);
+      pending.clear();
+    },
+  };
+}
+
 /** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
+  archive?: ArchiveWriter,
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error('OPENROUTER_API_KEY (or TYPESAFE_API_KEY) is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), {
+    ...config,
+    ...(archive ? { archive: archive.cite } : {}),
+  });
+  if (archive) await archive.flush();
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -359,10 +409,15 @@ export const register: Register = (on: On, options: PluginOptions) => {
         const goal = config.goal || goalFromMessages(event.messages);
         config.goal = `${goal}\n\nCompaction instructions: ${event.instructions}`;
       }
-      const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
-        const response = await $.http.fetch(url, init);
-        return { status: response.status, ok: response.ok, text: response.text };
-      });
+      const { result, messages } = await compactSession(
+        event.messages,
+        config,
+        async (url, init) => {
+          const response = await $.http.fetch(url, init);
+          return { status: response.status, ok: response.ok, text: response.text };
+        },
+        config.archiveResults ? archiveWriter($) : undefined,
+      );
       if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) log($, line);
       if (reductionRatio(result) < config.minReductionRatio) {

@@ -327,6 +327,7 @@ describe('decisions', () => {
 
     expect(kept.map((m) => m.text || m.toolUses[0]?.tool_use_id || m.toolResults?.[0]?.tool_use_id)).toEqual([
       'Never edit anything under src/generated. Fix the failing test.',
+      '[fast-jev-compaction removed the Read call {"file_path":"src/a.ts"}]',
       'a.ts looks fine; checking b.ts',
       'tool-2',
       'tool-2',
@@ -336,24 +337,23 @@ describe('decisions', () => {
       'go ahead',
     ]);
     expect(kept[0]).toBe(messages[0]);
-    expect(kept[2]).not.toBe(messages[4]);
-    expect(kept[2]?.toolUses[0]?.text).toMatch(
+    expect(kept[3]).not.toBe(messages[4]);
+    expect(kept[3]?.toolUses[0]?.text).toMatch(
       new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
     );
-    expect(kept[3]?.toolResults?.[0]?.text).toMatch(
+    expect(kept[4]?.toolResults?.[0]?.text).toMatch(
       new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
     );
-    expect(kept[2]).not.toBe(messages[4]);
-    expect(kept[3]).not.toBe(messages[5]);
-    expect(kept[4]).toBe(messages[6]);
-    expect(kept[5]?.toolResults?.[0]?.text).toContain('expected 2 to be 3');
+    expect(kept[4]).not.toBe(messages[5]);
+    expect(kept[5]).toBe(messages[6]);
+    expect(kept[6]?.toolResults?.[0]?.text).toContain('expected 2 to be 3');
 
     const shortMessages = transcript();
     shortMessages[4]!.toolUses[0]!.text = 'y'.repeat(100);
     shortMessages[5]!.toolResults![0]!.text = 'y'.repeat(100);
     const shortKept = applyDecisions(shortMessages, decisions, calls, 300);
-    expect(shortKept[2]).toBe(shortMessages[4]);
-    expect(shortKept[3]).toBe(shortMessages[5]);
+    expect(shortKept[3]).toBe(shortMessages[4]);
+    expect(shortKept[4]).toBe(shortMessages[5]);
   });
 
   it('drops an already-empty assistant message but keeps thinking-only text and empty user turns', () => {

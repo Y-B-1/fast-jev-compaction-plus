@@ -1,6 +1,13 @@
 export type Role = 'user' | 'assistant';
 
 /**
+ * Called for a dropped tool call's or result's full text, before it is cut;
+ * returns the path it was archived to (to cite in the marker left behind), or
+ * undefined when it was not archived (e.g. it looked like a credential).
+ */
+export type ArchiveResult = (toolUseId: string, text: string) => string | undefined;
+
+/**
  * A tool_use block of an assistant message. `text` and `isError` mirror the
  * outcome once the transcript holds it (Claude Code attaches them).
  */
@@ -95,6 +102,12 @@ export interface FittedState {
 }
 
 export interface CompactOptions {
+  /**
+   * Called for each dropped tool call's or result's full text before it is
+   * cut, so it can be saved somewhere the model can still read it back; the
+   * returned path (if any) is cited in the marker left in its place.
+   */
+  archive?: ArchiveResult;
   /** Ongoing task description; defaults to the last few user prompts. */
   goal?: string;
   /**

@@ -61,7 +61,12 @@ built-in compaction summary with the original messages.
    - else → remove the call together with its result.
 7. The message list is rebuilt: a message that loses all its content is
    removed, untouched messages are returned as the same objects, and no result
-   is ever left without its call.
+   is ever left without its call. With `archiveResults` on (the default), the
+   full text a call or result loses is first written to
+   `.claude/fast-jev-compaction/<tool_use_id>.txt` (a `.gitignore` there keeps
+   the directory out of version control), and the marker left in its place
+   cites the file so it can be `Read` or grepped back later. Text that looks
+   like a credential is never archived.
 
 Jev failures, malformed answers, a missing key, or a history that cannot be
 fitted throw; the caller (or the Claude Code hook) decides what to fall back to.
@@ -123,6 +128,7 @@ put it in a source file.
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
 | `compactAtPercent` | `60` | Context percentage at which `turn.complete` requests compaction |
 | `compactCooldownTurns` | `3` | Turns to wait after a compaction attempt that leaves the window still at or above `compactAtPercent`, before requesting another one |
+| `archiveResults` | `true` | Write the full text of a dropped tool call or result to `.claude/fast-jev-compaction/` and cite the file in the marker left in its place, so it can be `Read` or grepped back later; text that looks like a credential is never written |
 
 `result.stats` reports message and character counts before and after, the
 per-reason decision counts, the state size in estimated tokens, which fitting

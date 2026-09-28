@@ -1,6 +1,7 @@
 import { noulAnswer } from './request.js';
 import { collectToolCalls, estimateTokens, fitState } from './state.js';
 import type {
+  ArchiveResult,
   CallAnswer,
   CallDecision,
   CompactOptions,
@@ -247,16 +248,38 @@ export function splitsSurrogatePair(text: string, index: number): boolean {
   return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
 }
 
-function truncatedResultText(text: string, isError: boolean, headChars: number): string {
+function truncatedResultText(
+  text: string,
+  isError: boolean,
+  headChars: number,
+  archivedPath?: string,
+): string {
   if (text.length <= headChars + 120) return text;
   // End the head on a code point boundary: cutting a surrogate pair in half
   // would leave a lone surrogate in the rebuilt transcript, which the
   // Messages API rejects on every subsequent turn.
   const cut = splitsSurrogatePair(text, headChars) ? headChars - 1 : headChars;
   const head = cut > 0 ? `${text.slice(0, cut)}\n` : '';
+  const where = archivedPath
+    ? `; full output: ${archivedPath} (Read or grep it if needed)`
+    : '; re-run the tool if needed';
   return `${head}[fast-jev-compaction truncated ${text.length - cut} chars of this tool result${
     isError ? ' (error)' : ''
-  }; re-run the tool if needed]`;
+  }${where}]`;
+}
+
+/** One line standing in for a dropped call, naming where its output went. */
+function droppedCallNote(tool: ToolUse, archivedPath: string | undefined): string {
+  let input = '';
+  try {
+    input = JSON.stringify(tool.input);
+  } catch {
+    input = '{}';
+  }
+  if (input.length > 160) input = `${input.slice(0, 159)}…`;
+  return `[fast-jev-compaction removed the ${tool.tool} call ${input}${
+    archivedPath ? `; full output: ${archivedPath} (Read or grep it if needed)` : ''
+  }]`;
 }
 
 function isEmptyMessage(message: {
@@ -282,6 +305,7 @@ export function applyDecisions(
   decisions: readonly CallDecision[],
   calls: readonly ToolCall[],
   headChars: number,
+  archive?: ArchiveResult,
 ): Message[] {
   const byId = new Map(calls.map((call) => [call.id, call]));
   const actions = new Map<string, CallDecision['action']>();
@@ -304,6 +328,11 @@ export function applyDecisions(
       kept.push(message);
       continue;
     }
+    // A dropped call leaves one line naming it and where its output was
+    // archived, so a detail inside it can still be recovered.
+    const droppedCallNotes = message.toolUses
+      .filter((tool) => actions.get(tool.tool_use_id) === 'drop_call')
+      .map((tool) => droppedCallNote(tool, archive?.(tool.tool_use_id, tool.text ?? '')));
     const toolUses = message.toolUses
       .filter((tool) => actions.get(tool.tool_use_id) !== 'drop_call')
       .map((tool) => {
@@ -312,6 +341,7 @@ export function applyDecisions(
           tool.text ?? '',
           tool.isError ?? false,
           headChars,
+          archive?.(tool.tool_use_id, tool.text ?? ''),
         );
         if ((tool.text ?? '') === text) return tool;
         const copy: ToolUse = {
@@ -327,7 +357,12 @@ export function applyDecisions(
       .filter((result) => actions.get(result.tool_use_id) !== 'drop_call')
       .map((result) => {
         if (actions.get(result.tool_use_id) !== 'drop_result') return result;
-        const text = truncatedResultText(result.text, result.isError ?? false, headChars);
+        const text = truncatedResultText(
+          result.text,
+          result.isError ?? false,
+          headChars,
+          archive?.(result.tool_use_id, result.text),
+        );
         return text === result.text
           ? result
           : {
@@ -351,10 +386,14 @@ export function applyDecisions(
       kept.push(message);
       continue;
     }
-    if (isEmptyMessage({ text: message.text, toolUses, toolResults })) {
+    const text =
+      droppedCallNotes.length > 0
+        ? [message.text, ...droppedCallNotes].filter(Boolean).join('\n')
+        : message.text;
+    if (isEmptyMessage({ text, toolUses, toolResults })) {
       continue;
     }
-    const rebuilt: Message = { role: message.role, text: message.text, toolUses };
+    const rebuilt: Message = { role: message.role, text, toolUses };
     if (toolResults.length > 0) rebuilt.toolResults = toolResults;
     kept.push(rebuilt);
   }
@@ -442,6 +481,7 @@ export async function compact(
     decisions,
     calls,
     resolved.truncateHeadChars,
+    options.archive,
   );
   return {
     messages: kept,
