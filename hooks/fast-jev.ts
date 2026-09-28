@@ -290,6 +290,14 @@ export const register: Register = (on: On, options: PluginOptions) => {
   let compacting = false;
 
   on('session.compact', async ($, event, next) => {
+    // A subagent's or a fork's own transcript is not the main conversation
+    // this plugin is tuned for; let the engine handle it as it normally
+    // would. `precompute` computes nothing yet and installs no result, so
+    // there is nothing useful for Jev to do here either.
+    if (event.agentId) return next(event);
+    if (event.trigger === 'precompute') {
+      return { skip: 'fast-jev-compaction does not handle speculative compactions' };
+    }
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
       if (event.instructions?.trim()) {
@@ -327,8 +335,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
     // A subagent's turn is not the main conversation; requesting the main
     // loop's compaction from it would target the wrong loop while the
-    // subagent's own turn still runs.
-    if (event.agentId || compacting) return next(event);
+    // subagent's own turn still runs. Only a turn that actually answered
+    // should trigger auto-compaction: an aborted, refused or errored turn
+    // is not a point where the context has settled into something worth
+    // scoring speculatively.
+    if (event.agentId || event.reason !== 'answer' || compacting) return next(event);
     // Locked before the first await: two turns completing back to back must
     // not both read `compacting` as false and both dispatch a compaction.
     compacting = true;

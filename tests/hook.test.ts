@@ -233,10 +233,32 @@ describe('register', () => {
       ui: { log: () => {} },
     };
     const n = next();
-    await hooks['turn.complete']!($, { agentId: 'sub-1' }, n);
+    await hooks['turn.complete']!($, { agentId: 'sub-1', reason: 'answer' }, n);
     expect(compactCalls).toBe(0);
 
-    await hooks['turn.complete']!($, {}, n);
+    await hooks['turn.complete']!($, { reason: 'answer' }, n);
+    expect(compactCalls).toBe(1);
+  });
+
+  it('does not request compaction from a turn that did not answer', async () => {
+    const hooks = registered({ compactAtPercent: 0 });
+    let compactCalls = 0;
+    const $ = {
+      session: {
+        usage: async () => ({ context: { percent: 100 } }),
+        compact: async () => {
+          compactCalls++;
+          return { messages: [] };
+        },
+      },
+      ui: { log: () => {} },
+    };
+    const n = next();
+    await hooks['turn.complete']!($, { reason: 'aborted' }, n);
+    await hooks['turn.complete']!($, { reason: 'error' }, n);
+    expect(compactCalls).toBe(0);
+
+    await hooks['turn.complete']!($, { reason: 'answer' }, n);
     expect(compactCalls).toBe(1);
   });
 
@@ -254,6 +276,30 @@ describe('register', () => {
     );
     expect(out).toEqual({ skip: 'fast-jev-compaction: interrupted' });
     expect(e.toasts).toEqual([]);
+  });
+
+  it('leaves a subagent transcript to the engine', async () => {
+    const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 0 });
+    const e = engine(async () => ({ status: 200, ok: true, text: '{"answers":{}}' }));
+    const out = await hooks['session.compact']!(
+      e.$,
+      { trigger: 'plugin', agentId: 'sub-1', messages: transcript() },
+      next(),
+    );
+    expect(out).toEqual({ trigger: 'plugin', agentId: 'sub-1', messages: transcript() });
+  });
+
+  it('skips a speculative precompute instead of running Jev on it', async () => {
+    const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 0 });
+    const e = engine(async () => ({ status: 200, ok: true, text: '{"answers":{}}' }));
+    const out = await hooks['session.compact']!(
+      e.$,
+      { trigger: 'precompute', messages: transcript() },
+      next(),
+    );
+    expect(out).toEqual({
+      skip: 'fast-jev-compaction does not handle speculative compactions',
+    });
   });
 
   it('reports a real failure as a fallback when the dispatch was not interrupted', async () => {
