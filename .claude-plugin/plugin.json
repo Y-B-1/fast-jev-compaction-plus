@@ -76,6 +76,12 @@
       "description": "Characters from each end of a tool result quoted in its keep question, so Jev can judge the content and not only its length; 0 disables.",
       "default": 300
     },
+    "salvageChars": {
+      "type": "number",
+      "title": "Salvaged identifiers and errors",
+      "description": "Characters of identifiers and error lines recovered from the dropped part of a tool result and kept alongside its truncation note; 0 disables.",
+      "default": 300
+    },
     "model": {
       "type": "string",
       "title": "Jev model",

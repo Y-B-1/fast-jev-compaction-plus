@@ -84,6 +84,7 @@ describe('options', () => {
       maxRequestTokens: 60_000,
       truncateHeadChars: 300,
       resultPreviewChars: 300,
+      salvageChars: 300,
     });
     expect(resolveOptions({
       keepThreshold: Number.NaN,
@@ -390,6 +391,24 @@ describe('decisions', () => {
     expect(noHead[2]?.toolResults?.[0]?.text).toBe(
       `[fast-jev-compaction truncated ${total} chars of this tool result; re-run the tool if needed]`,
     );
+  });
+
+  it('appends salvaged identifiers and errors from the dropped tail when salvageChars is set', () => {
+    const messages = [
+      message('user', 'run the build'),
+      call('a', 'Bash', { command: 'npm run build' }, ''),
+      result('a', `${'filler line\n'.repeat(200)}Error: build failed\nsrc/deep/Thing.tsx\n`),
+    ];
+    const calls = collectToolCalls(messages, 0);
+    const decisions = [decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 })];
+
+    const withoutSalvage = applyDecisions(messages, decisions, calls, 50, undefined, 0);
+    expect(withoutSalvage[2]?.toolResults?.[0]?.text).not.toContain('src/deep/Thing.tsx');
+
+    const withSalvage = applyDecisions(messages, decisions, calls, 50, undefined, 600);
+    const text = withSalvage[2]?.toolResults?.[0]?.text ?? '';
+    expect(text).toContain('src/deep/Thing.tsx');
+    expect(text).toContain('Error: build failed');
   });
 
   it('never cuts the head of a dropped result inside a surrogate pair', () => {

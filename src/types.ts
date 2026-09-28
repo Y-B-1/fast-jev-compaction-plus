@@ -144,6 +144,13 @@ export interface CompactOptions {
    * Default 300.
    */
   resultPreviewChars?: number;
+  /**
+   * Characters of identifiers and error lines salvaged from the dropped part
+   * of a tool result and kept alongside its truncation note, since the head
+   * alone is often preamble for a listing or a build log. 0 disables. Default
+   * 300.
+   */
+  salvageChars?: number;
 }
 
 export interface ResolvedCompactOptions {
@@ -156,6 +163,7 @@ export interface ResolvedCompactOptions {
   maxConcurrentRequests: number;
   truncateHeadChars: number;
   resultPreviewChars: number;
+  salvageChars: number;
 }
 
 export interface CompactResult {

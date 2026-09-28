@@ -1,4 +1,5 @@
 import { noulAnswer } from './request.js';
+import { salvageBlock } from './salvage.js';
 import { collectToolCalls, estimateTokens, fitState } from './state.js';
 import type {
   ArchiveResult,
@@ -34,6 +35,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   maxConcurrentRequests: 4,
   truncateHeadChars: 300,
   resultPreviewChars: 300,
+  salvageChars: 300,
 };
 
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
@@ -86,6 +88,10 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
     resultPreviewChars: Math.max(
       0,
       Math.floor(finite(options.resultPreviewChars, DEFAULT_OPTIONS.resultPreviewChars)),
+    ),
+    salvageChars: Math.max(
+      0,
+      Math.floor(finite(options.salvageChars, DEFAULT_OPTIONS.salvageChars)),
     ),
   };
 }
@@ -260,6 +266,7 @@ function truncatedResultText(
   isError: boolean,
   headChars: number,
   archivedPath?: string,
+  salvageChars = 0,
 ): string {
   if (text.length <= headChars + 120) return text;
   // End the head on a code point boundary: cutting a surrogate pair in half
@@ -270,9 +277,14 @@ function truncatedResultText(
   const where = archivedPath
     ? `; full output: ${archivedPath} (Read or grep it if needed)`
     : '; re-run the tool if needed';
-  return `${head}[fast-jev-compaction truncated ${text.length - cut} chars of this tool result${
+  const note = `[fast-jev-compaction truncated ${text.length - cut} chars of this tool result${
     isError ? ' (error)' : ''
   }${where}]`;
+  // Identifiers and error lines recovered from the dropped tail: the head is
+  // preamble for a listing or a build log, and the useful parts live further
+  // down where they would otherwise be lost until the tool is re-run.
+  const salvaged = salvageBlock(text.slice(cut), salvageChars);
+  return salvaged ? `${head}${note}\n${salvaged}` : `${head}${note}`;
 }
 
 /** One line standing in for a dropped call, naming where its output went. */
@@ -313,6 +325,7 @@ export function applyDecisions(
   calls: readonly ToolCall[],
   headChars: number,
   archive?: ArchiveResult,
+  salvageChars = 0,
 ): Message[] {
   const byId = new Map(calls.map((call) => [call.id, call]));
   const actions = new Map<string, CallDecision['action']>();
@@ -349,6 +362,7 @@ export function applyDecisions(
           tool.isError ?? false,
           headChars,
           archive?.(tool.tool_use_id, tool.text ?? ''),
+          salvageChars,
         );
         if ((tool.text ?? '') === text) return tool;
         const copy: ToolUse = {
@@ -369,6 +383,7 @@ export function applyDecisions(
           result.isError ?? false,
           headChars,
           archive?.(result.tool_use_id, result.text),
+          salvageChars,
         );
         return text === result.text
           ? result
@@ -493,6 +508,7 @@ export async function compact(
     calls,
     resolved.truncateHeadChars,
     options.archive,
+    resolved.salvageChars,
   );
   return {
     messages: kept,
