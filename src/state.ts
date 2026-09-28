@@ -169,10 +169,29 @@ export function collectToolCalls(
   return calls;
 }
 
+// A field named like a credential is redacted by name, before the pattern-based
+// redaction in redact.ts even sees the value: that pass only catches a value
+// shaped like a known secret, so a short or custom-format one (`"password":
+// "hunter2"`) would otherwise reach Jev verbatim.
+const SENSITIVE_INPUT_KEY =
+  /(?:^|[_-])(authorization|api[-_]?key|access[-_]?token|refresh[-_]?token|token|secret|password|passwd|cookie|credential|private[-_]?key)(?:$|[_-])/i;
+
+function redactInputByKey(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value)) return '[Circular]';
+  seen.add(value);
+  if (Array.isArray(value)) return value.map((item) => redactInputByKey(item, seen));
+  const copy: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    copy[key] = SENSITIVE_INPUT_KEY.test(key) ? '[REDACTED]' : redactInputByKey(item, seen);
+  }
+  return copy;
+}
+
 function inputText(input: Record<string, unknown>, limit: number): string {
   let json = '';
   try {
-    json = JSON.stringify(input);
+    json = JSON.stringify(redactInputByKey(input));
   } catch {
     json = '[unserializable input]';
   }

@@ -173,6 +173,19 @@ describe('state fitting', () => {
     expect((state.history[4]?.tool_calls?.[0] as HistoryToolCall).result).toMatch(/^error, /);
   });
 
+  it('redacts a credential-shaped tool input field by name, not just by value shape', () => {
+    const messages = [
+      message('user', 'start'),
+      call('cred', 'Bash', { command: 'run-thing', password: 'hunter2', note: 'ok' }, 'ok'),
+      result('cred', 'ok'),
+    ];
+    const { state } = fitState(messages, collectToolCalls(messages, 0), fit);
+    const input = (state.history[1]?.tool_calls?.[0] as HistoryToolCall).input;
+    expect(input).not.toContain('hunter2');
+    expect(input).toContain('[REDACTED]');
+    expect(input).toContain('"note":"ok"');
+  });
+
   it('defaults the goal to the latest user prompts', () => {
     const { state } = fitState(transcript(), [], { ...fit, goal: '' });
     expect(state.goal).toContain('Fix the failing test');
