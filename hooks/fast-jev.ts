@@ -243,6 +243,12 @@ async function getApiKey(
   return undefined;
 }
 
+/** An interrupted dispatch is vetoed quietly: no summary, nothing replaced. */
+function interrupted($: { ui: { log: (text: string) => void } }): { skip: string } {
+  $.ui.log('compaction interrupted; nothing changed');
+  return { skip: 'fast-jev-compaction: interrupted' };
+}
+
 function notify(
   $: {
     ui: {
@@ -267,6 +273,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
       });
+      if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
         notify(
@@ -281,6 +288,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       );
       return { messages };
     } catch (error) {
+      if (next.signal.aborted) return interrupted($);
       notify(
         $,
         `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
@@ -290,7 +298,10 @@ export const register: Register = (on: On, options: PluginOptions) => {
   });
 
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
-    if (compacting) return next(event);
+    // A subagent's turn is not the main conversation; requesting the main
+    // loop's compaction from it would target the wrong loop while the
+    // subagent's own turn still runs.
+    if (event.agentId || compacting) return next(event);
     try {
       const { context } = await $.session.usage();
       if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);

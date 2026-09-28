@@ -3,6 +3,7 @@ import {
   compactSession,
   decisionLog,
   decisionLogLines,
+  register,
   resolveHookConfig,
   summarize,
   toSessionMessages,
@@ -145,5 +146,87 @@ describe('compactSession', () => {
     await expect(
       compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);
+  });
+});
+
+describe('register', () => {
+  type Hook = (...args: any[]) => Promise<unknown>;
+  function registered(options: Record<string, unknown> = {}) {
+    const hooks: Record<string, Hook> = {};
+    (register as any)((event: string, hook: Hook) => {
+      hooks[event] = hook;
+    }, { apiKey: 'k', ...options });
+    return hooks;
+  }
+  function engine(fetchFn: ReturnType<typeof jevFetch>) {
+    const logs: string[] = [];
+    const toasts: string[] = [];
+    const $ = {
+      http: {
+        fetch: async (url: string, init?: { body?: string }) => fetchFn(url, init),
+      },
+      ui: {
+        log: (t: string) => logs.push(t),
+        toast: (t: string) => toasts.push(t),
+      },
+      session: {
+        usage: async () => ({ context: { percent: 100 } }),
+        compact: async () => ({ messages: [] }),
+      },
+    };
+    return { $, logs, toasts };
+  }
+  function next(signal: AbortSignal = new AbortController().signal) {
+    return Object.assign(async (e: unknown) => e, { signal });
+  }
+
+  it('does not request compaction from a subagent turn', async () => {
+    const hooks = registered({ compactAtPercent: 0 });
+    let compactCalls = 0;
+    const $ = {
+      session: {
+        usage: async () => ({ context: { percent: 100 } }),
+        compact: async () => {
+          compactCalls++;
+          return { messages: [] };
+        },
+      },
+      ui: { log: () => {} },
+    };
+    const n = next();
+    await hooks['turn.complete']!($, { agentId: 'sub-1' }, n);
+    expect(compactCalls).toBe(0);
+
+    await hooks['turn.complete']!($, {}, n);
+    expect(compactCalls).toBe(1);
+  });
+
+  it('vetoes an interrupted dispatch instead of falling back to a summary', async () => {
+    const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 0 });
+    const controller = new AbortController();
+    const e = engine(async () => {
+      controller.abort();
+      throw new Error('gateway down');
+    });
+    const out = await hooks['session.compact']!(
+      e.$,
+      { trigger: 'manual', messages: transcript() },
+      next(controller.signal),
+    );
+    expect(out).toEqual({ skip: 'fast-jev-compaction: interrupted' });
+    expect(e.toasts).toEqual([]);
+  });
+
+  it('reports a real failure as a fallback when the dispatch was not interrupted', async () => {
+    const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 0 });
+    const e = engine(async () => ({ status: 500, ok: false, text: 'down' }));
+    const out = await hooks['session.compact']!(
+      e.$,
+      { trigger: 'manual', messages: transcript() },
+      next(),
+    );
+    expect(out).toEqual({ trigger: 'manual', messages: transcript() });
+    expect(e.toasts).toHaveLength(1);
+    expect(e.toasts[0]).toMatch(/fallback to built-in summary/);
   });
 });
