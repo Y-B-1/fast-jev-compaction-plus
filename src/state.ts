@@ -37,14 +37,26 @@ export function estimateTokens(text: string): number {
   return Math.ceil(tokens);
 }
 
+/** Whether ending a string at `index` would separate the two halves of a surrogate pair. */
+function splitsSurrogatePair(text: string, index: number): boolean {
+  const before = text.charCodeAt(index - 1);
+  const after = text.charCodeAt(index);
+  return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
+}
+
 export function truncate(text: string, limit: number): string {
-  return text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 1))}…`;
+  if (text.length <= limit) return text;
+  const cut = splitsSurrogatePair(text, limit - 1) ? limit - 2 : limit - 1;
+  return `${text.slice(0, Math.max(0, cut))}…`;
 }
 
 function abridge(text: string, head: number, tail: number): string {
   if (text.length <= head + tail + 40) return text;
-  const omitted = text.length - head - tail;
-  return `${text.slice(0, head)}\n[… ${omitted} chars omitted …]\n${text.slice(-tail)}`;
+  const headCut = splitsSurrogatePair(text, head) ? head - 1 : head;
+  const tailCut = splitsSurrogatePair(text, text.length - tail) ? tail - 1 : tail;
+  const omitted = text.length - headCut - tailCut;
+  const tailText = tailCut > 0 ? text.slice(-tailCut) : '';
+  return `${text.slice(0, headCut)}\n[… ${omitted} chars omitted …]\n${tailText}`;
 }
 
 export function isPinned(

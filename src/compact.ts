@@ -225,10 +225,21 @@ async function askBatches(
   return { answered, failed };
 }
 
+/** Whether ending `text` at `index` would separate the two halves of a surrogate pair. */
+export function splitsSurrogatePair(text: string, index: number): boolean {
+  const before = text.charCodeAt(index - 1);
+  const after = text.charCodeAt(index);
+  return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
+}
+
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
   if (text.length <= headChars + 120) return text;
-  const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : '';
-  return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
+  // End the head on a code point boundary: cutting a surrogate pair in half
+  // would leave a lone surrogate in the rebuilt transcript, which the
+  // Messages API rejects on every subsequent turn.
+  const cut = splitsSurrogatePair(text, headChars) ? headChars - 1 : headChars;
+  const head = cut > 0 ? `${text.slice(0, cut)}\n` : '';
+  return `${head}[fast-jev-compaction truncated ${text.length - cut} chars of this tool result${
     isError ? ' (error)' : ''
   }; re-run the tool if needed]`;
 }

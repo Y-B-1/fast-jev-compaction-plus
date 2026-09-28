@@ -14,6 +14,7 @@ import {
   questionsFor,
   reductionRatio,
   resolveOptions,
+  truncate,
   type HistoryToolCall,
   type JevAsker,
   type JevQuestions,
@@ -101,6 +102,17 @@ describe('token estimate', () => {
     expect(estimateTokens('12345678')).toBe(4);
     const json = JSON.stringify({ file_path: '/Users/x/src/a.ts', old_string: 'a = 1;', n: 42 });
     expect(estimateTokens(json)).toBeGreaterThanOrEqual(Math.ceil(json.length / 3));
+  });
+});
+
+describe('truncate', () => {
+  it('never cuts a surrogate pair in half', () => {
+    const emoji = '\u{1F600}';
+    const text = `${'x'.repeat(9)}${emoji}${'z'.repeat(5)}`;
+    // limit 11 would cut between the emoji's two code units; back off by one.
+    expect(truncate(text, 11)).toBe(`${'x'.repeat(9)}…`);
+    // limit 12 lands cleanly after the whole emoji.
+    expect(truncate(text, 12)).toBe(`${'x'.repeat(9)}${emoji}…`);
   });
 });
 
@@ -330,6 +342,28 @@ describe('decisions', () => {
     expect(noHead[2]?.toolResults?.[0]?.text).toBe(
       `[fast-jev-compaction truncated ${total} chars of this tool result; re-run the tool if needed]`,
     );
+  });
+
+  it('never cuts the head of a dropped result inside a surrogate pair', () => {
+    const emoji = '\u{1F600}';
+    const note = (omitted: number): string =>
+      `[fast-jev-compaction truncated ${omitted} chars of this tool result; re-run the tool if needed]`;
+    const truncated = (text: string): string | undefined => {
+      const messages = transcript();
+      messages[1]!.toolUses[0]!.text = text;
+      messages[2]!.toolResults![0]!.text = text;
+      const calls = collectToolCalls(messages, 0);
+      const decisions = [decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 })];
+      const kept = applyDecisions(messages, decisions, calls, 300);
+      expect(kept[1]?.toolUses[0]?.text).toBe(kept[2]?.toolResults?.[0]?.text);
+      return kept[2]?.toolResults?.[0]?.text;
+    };
+
+    const straddling = `${'x'.repeat(299)}${emoji.repeat(200)}`;
+    expect(truncated(straddling)).toBe(`${'x'.repeat(299)}\n${note(straddling.length - 299)}`);
+
+    const aligned = `${'x'.repeat(298)}${emoji.repeat(200)}`;
+    expect(truncated(aligned)).toBe(`${'x'.repeat(298)}${emoji}\n${note(aligned.length - 300)}`);
   });
 });
 
