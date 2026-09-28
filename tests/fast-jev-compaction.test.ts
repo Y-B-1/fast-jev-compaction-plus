@@ -9,6 +9,8 @@ import {
   decideCall,
   estimateTokens,
   fitState,
+  goalFromMessages,
+  isMachineText,
   JevClient,
   parseJevResponse,
   questionsFor,
@@ -811,6 +813,21 @@ describe('keep threshold', () => {
     expect(decideCall(call, { keepCall: 0.01, keepResult: 0.03 }, options).action).toBe(
       'drop_call',
     );
+  });
+});
+
+describe('goalFromMessages', () => {
+  it('excludes host-written text from the default goal', () => {
+    const messages = [
+      message('user', 'fix the flaky test'),
+      message('user', '<system-reminder>context about the repo</system-reminder>'),
+      message('user', '<command-name>compact</command-name>'),
+      message('user', 'also check the retry logic'),
+    ];
+    expect(isMachineText(messages[1]!.text)).toBe(true);
+    expect(isMachineText(messages[2]!.text)).toBe(true);
+    expect(isMachineText(messages[0]!.text)).toBe(false);
+    expect(goalFromMessages(messages)).toBe('fix the flaky test\nalso check the retry logic');
   });
 });
 
