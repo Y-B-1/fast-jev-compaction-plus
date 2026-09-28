@@ -34,6 +34,12 @@
       "description": "Context percentage at which turn.complete requests compaction.",
       "default": 60
     },
+    "compactCooldownTurns": {
+      "type": "number",
+      "title": "Compaction cooldown (turns)",
+      "description": "Turns to wait after a compaction attempt that leaves the window still at or above the compaction percentage, before requesting another one.",
+      "default": 3
+    },
     "minReductionRatio": {
       "type": "number",
       "title": "Minimum reduction ratio",

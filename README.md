@@ -121,6 +121,8 @@ put it in a source file.
 | `maxStateTokens` | `25000` | Estimated token ceiling for the state |
 | `maxRequestTokens` | `60000` | Estimated ceiling for state plus one batch of questions (Jev allows 64k) |
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
+| `compactAtPercent` | `60` | Context percentage at which `turn.complete` requests compaction |
+| `compactCooldownTurns` | `3` | Turns to wait after a compaction attempt that leaves the window still at or above `compactAtPercent`, before requesting another one |
 
 `result.stats` reports message and character counts before and after, the
 per-reason decision counts, the state size in estimated tokens, which fitting
