@@ -20,11 +20,20 @@ import type {
   ToolUse,
 } from '../src/types.js';
 
+/**
+ * Which compactions Jev could not do may go on to Claude Code's built-in
+ * summary: `auto` (default) only the engine's own, `always` every one,
+ * `never` none.
+ */
+export type BuiltinFallback = 'auto' | 'always' | 'never';
+
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
+  builtinFallback: 'auto' as BuiltinFallback,
 };
+
 
 export type HookFetchInit = {
   method?: string;
@@ -46,6 +55,7 @@ export type HookConfig = CompactOptions & {
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
+  builtinFallback: BuiltinFallback;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -56,6 +66,26 @@ function optionNumber(options: PluginOptions, key: string, fallback: number): nu
 function optionString(options: PluginOptions, key: string): string | undefined {
   const value = options[key];
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function optionFallback(options: PluginOptions): BuiltinFallback {
+  const value = options['builtinFallback'];
+  return value === 'auto' || value === 'always' || value === 'never'
+    ? value
+    : HOOK_DEFAULTS.builtinFallback;
+}
+
+/**
+ * Whether a compaction Jev could not do may be handed to the built-in summary.
+ * Only the engine's own `auto` compaction (its threshold, or a prompt too
+ * long) must shrink the conversation; `/compact` (`manual`), a plugin's
+ * request and a `precompute` can leave it as it is, which is free, where the
+ * summary is a long model call that rewrites the verbatim history.
+ */
+export function mayUseBuiltin(trigger: string | undefined, mode: BuiltinFallback): boolean {
+  if (mode === 'always') return true;
+  if (mode === 'never') return false;
+  return trigger === 'auto';
 }
 
 /** Reads the plugin's `userConfig` values; anything missing takes the defaults. */
@@ -80,6 +110,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       HOOK_DEFAULTS.minReductionRatio,
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
+    builtinFallback: optionFallback(options),
   };
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
@@ -311,6 +342,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) log($, line);
       if (reductionRatio(result) < config.minReductionRatio) {
+        if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
+          notify(
+            $,
+            `skipped (below ${percent(config.minReductionRatio)} minimum, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result)})`,
+          );
+          return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
+        }
         notify(
           $,
           `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
@@ -324,6 +362,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
       return { messages };
     } catch (error) {
       if (next.signal.aborted) return interrupted($);
+      if (!mayUseBuiltin(event.trigger, configured.builtinFallback)) {
+        notify(
+          $,
+          `skipped (builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${error instanceof Error ? error.message : String(error)})`,
+        );
+        return { skip: 'fast-jev-compaction: request failed, builtin fallback disabled' };
+      }
       notify(
         $,
         `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,

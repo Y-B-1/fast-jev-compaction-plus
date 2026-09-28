@@ -55,7 +55,12 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'typesafe/jev-1.13' });
+    expect(resolveHookConfig({})).toEqual({
+      compactAtPercent: 60,
+      minReductionRatio: 0.25,
+      model: 'typesafe/jev-1.13',
+      builtinFallback: 'auto',
+    });
     expect(
       resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
     ).toEqual({
@@ -66,7 +71,14 @@ describe('hook config', () => {
       goal: 'g',
       compactAtPercent: 60,
       minReductionRatio: 0.25,
+      builtinFallback: 'auto',
     });
+  });
+
+  it('reads builtinFallback from userConfig, ignoring an invalid value', () => {
+    expect(resolveHookConfig({ builtinFallback: 'always' }).builtinFallback).toBe('always');
+    expect(resolveHookConfig({ builtinFallback: 'never' }).builtinFallback).toBe('never');
+    expect(resolveHookConfig({ builtinFallback: 'sometimes' }).builtinFallback).toBe('auto');
   });
 });
 
@@ -302,7 +314,20 @@ describe('register', () => {
     });
   });
 
-  it('reports a real failure as a fallback when the dispatch was not interrupted', async () => {
+  it('reports a real failure as a fallback for the engine\'s own auto trigger', async () => {
+    const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 0 });
+    const e = engine(async () => ({ status: 500, ok: false, text: 'down' }));
+    const out = await hooks['session.compact']!(
+      e.$,
+      { trigger: 'auto', messages: transcript() },
+      next(),
+    );
+    expect(out).toEqual({ trigger: 'auto', messages: transcript() });
+    expect(e.toasts).toHaveLength(1);
+    expect(e.toasts[0]).toMatch(/fallback to built-in summary/);
+  });
+
+  it('skips instead of falling back to a summary for a manual /compact', async () => {
     const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 0 });
     const e = engine(async () => ({ status: 500, ok: false, text: 'down' }));
     const out = await hooks['session.compact']!(
@@ -310,8 +335,67 @@ describe('register', () => {
       { trigger: 'manual', messages: transcript() },
       next(),
     );
-    expect(out).toEqual({ trigger: 'manual', messages: transcript() });
+    expect(out).toEqual({ skip: 'fast-jev-compaction: request failed, builtin fallback disabled' });
     expect(e.toasts).toHaveLength(1);
-    expect(e.toasts[0]).toMatch(/fallback to built-in summary/);
+    expect(e.toasts[0]).toMatch(/builtin fallback disabled/);
+  });
+
+  it('skips a below-minimum reduction instead of falling back for a manual /compact', async () => {
+    const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 1 });
+    const e = engine(jevFetch(() => 1));
+    const out = await hooks['session.compact']!(
+      e.$,
+      { trigger: 'manual', messages: transcript() },
+      next(),
+    );
+    expect(out).toEqual({
+      skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled',
+    });
+  });
+
+  it('always falls back when builtinFallback is set to always', async () => {
+    const hooks = registered({
+      preserveRecentMessages: 1,
+      minReductionRatio: 0,
+      builtinFallback: 'always',
+    });
+    const e = engine(async () => ({ status: 500, ok: false, text: 'down' }));
+    const out = await hooks['session.compact']!(
+      e.$,
+      { trigger: 'manual', messages: transcript() },
+      next(),
+    );
+    expect(out).toEqual({ trigger: 'manual', messages: transcript() });
+  });
+
+  it('never falls back when builtinFallback is set to never, even for the auto trigger', async () => {
+    const hooks = registered({
+      preserveRecentMessages: 1,
+      minReductionRatio: 0,
+      builtinFallback: 'never',
+    });
+    const e = engine(async () => ({ status: 500, ok: false, text: 'down' }));
+    const out = await hooks['session.compact']!(
+      e.$,
+      { trigger: 'auto', messages: transcript() },
+      next(),
+    );
+    expect(out).toEqual({ skip: 'fast-jev-compaction: request failed, builtin fallback disabled' });
+  });
+
+  it('passes /compact instructions through as extra goal context', async () => {
+    const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 0, goal: 'base goal' });
+    let sentGoal: string | undefined;
+    const e = engine(async (url, init) => {
+      sentGoal = JSON.parse(String((init as RequestInit).body)).state.goal;
+      return { status: 200, ok: true, text: '{"answers":{}}' };
+    });
+    await hooks['session.compact']!(
+      e.$,
+      { trigger: 'manual', messages: transcript(), instructions: 'focus on the auth bug' },
+      next(),
+    );
+    expect(sentGoal).toContain('base goal');
+    expect(sentGoal).toContain('focus on the auth bug');
   });
 });
