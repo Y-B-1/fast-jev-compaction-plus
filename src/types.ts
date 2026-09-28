@@ -103,6 +103,15 @@ export interface CompactOptions {
    * confident "no longer needed" deletes.
    */
   keepThreshold?: number;
+  /**
+   * Minimum Jev probability for the call itself to stay, once its result is
+   * going. `keepCall` and `keepResult` are two independent nouls on different
+   * scales and different costs: a result runs to thousands of characters, its
+   * call to a few dozen, and losing the call erases the record that the work
+   * happened for savings that round to zero. Default 0.05, far below
+   * `keepThreshold`.
+   */
+  keepCallThreshold?: number;
   /** Newest messages never touched (the first message is always kept). Default 6. */
   preserveRecentMessages?: number;
   /** Estimated token ceiling for the state. Default 25000. */
@@ -119,6 +128,7 @@ export interface CompactOptions {
 export interface ResolvedCompactOptions {
   goal: string;
   keepThreshold: number;
+  keepCallThreshold: number;
   preserveRecentMessages: number;
   maxStateTokens: number;
   maxRequestTokens: number;

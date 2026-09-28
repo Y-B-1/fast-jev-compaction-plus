@@ -25,6 +25,8 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
    * https://docs.typesafe.ai/confidence.
    */
   keepThreshold: 0.15,
+  /** See `CompactOptions.keepCallThreshold`. */
+  keepCallThreshold: 0.05,
   preserveRecentMessages: 6,
   maxStateTokens: 25_000,
   maxRequestTokens: 60_000,
@@ -52,9 +54,14 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
   if (keepThreshold < 0 || keepThreshold > 1) {
     throw new RangeError('keepThreshold must be between 0 and 1');
   }
+  const keepCallThreshold = finite(options.keepCallThreshold, DEFAULT_OPTIONS.keepCallThreshold);
+  if (keepCallThreshold < 0 || keepCallThreshold > 1) {
+    throw new RangeError('keepCallThreshold must be between 0 and 1');
+  }
   return {
     goal: options.goal ?? DEFAULT_OPTIONS.goal,
     keepThreshold,
+    keepCallThreshold,
     preserveRecentMessages: Math.max(
       0,
       Math.floor(
@@ -144,7 +151,8 @@ export function batchCalls(
 export function decideCall(
   call: Pick<ToolCall, 'id' | 'tool' | 'pinned'>,
   answer: CallAnswer,
-  options: Pick<ResolvedCompactOptions, 'keepThreshold'>,
+  options: Pick<ResolvedCompactOptions, 'keepThreshold'> &
+    Partial<Pick<ResolvedCompactOptions, 'keepCallThreshold'>>,
 ): CallDecision {
   if (
     !Number.isFinite(options.keepThreshold) ||
@@ -152,6 +160,13 @@ export function decideCall(
     options.keepThreshold > 1
   ) {
     throw new RangeError('keepThreshold must be between 0 and 1');
+  }
+  // `keepCallThreshold` is newer than this exported function; a caller built
+  // against the old signature must not silently start comparing against
+  // `undefined` (which would drop every call), so it falls back to the default.
+  const keepCallThreshold = finite(options.keepCallThreshold, DEFAULT_OPTIONS.keepCallThreshold);
+  if (keepCallThreshold < 0 || keepCallThreshold > 1) {
+    throw new RangeError('keepCallThreshold must be between 0 and 1');
   }
   if (
     ![answer.keepCall, answer.keepResult].every(
@@ -165,7 +180,7 @@ export function decideCall(
   if (answer.keepResult >= options.keepThreshold) {
     return { ...base, action: 'keep', reason: 'kept' };
   }
-  if (answer.keepCall >= options.keepThreshold) {
+  if (answer.keepCall >= keepCallThreshold) {
     return { ...base, action: 'drop_result', reason: 'result_dropped' };
   }
   return { ...base, action: 'drop_call', reason: 'call_dropped' };

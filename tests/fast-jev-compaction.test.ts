@@ -293,11 +293,24 @@ describe('decisions', () => {
   it('keeps, drops the result, or drops the call based on the keep probabilities', () => {
     expect(decideCall(unpinned, { keepCall: 0.9, keepResult: 0.7 }, options).action).toBe('keep');
     expect(decideCall(unpinned, { keepCall: 0.9, keepResult: 0.2 }, options).action).toBe('drop_result');
-    expect(decideCall(unpinned, { keepCall: 0.1, keepResult: 0.2 }, options).action).toBe('drop_call');
+    expect(decideCall(unpinned, { keepCall: 0.01, keepResult: 0.2 }, options).action).toBe('drop_call');
     expect(decideCall({ ...unpinned, pinned: true }, { keepCall: 0, keepResult: 0 }, options)).toMatchObject({
       action: 'keep',
       reason: 'pinned',
     });
+  });
+
+  it('gates the call on its own, much lower threshold than the result', () => {
+    const gates = { keepThreshold: 0.5, keepCallThreshold: 0.2 };
+    // keepCall clears the call gate (0.2) but not the (unused-here) result gate:
+    // the call survives with its result truncated, not removed outright.
+    expect(decideCall(unpinned, { keepCall: 0.3, keepResult: 0.1 }, gates).action).toBe('drop_result');
+    // Below the call gate too: the call goes.
+    expect(decideCall(unpinned, { keepCall: 0.1, keepResult: 0.1 }, gates).action).toBe('drop_call');
+    // Omitting keepCallThreshold falls back to its own default (0.05), not keepThreshold.
+    expect(decideCall(unpinned, { keepCall: 0.1, keepResult: 0.1 }, { keepThreshold: 0.5 }).action).toBe(
+      'drop_result',
+    );
   });
 
   it('removes dropped calls and truncates dropped results', () => {
@@ -306,7 +319,7 @@ describe('decisions', () => {
     messages[5]!.toolResults![0]!.text = 'x'.repeat(2000);
     const calls = collectToolCalls(messages, 0);
     const decisions = [
-      decideCall(calls[0]!, { keepCall: 0.1, keepResult: 0.1 }, options),
+      decideCall(calls[0]!, { keepCall: 0.01, keepResult: 0.1 }, options),
       decideCall(calls[1]!, { keepCall: 0.9, keepResult: 0.1 }, options),
       decideCall(calls[2]!, { keepCall: 0.9, keepResult: 0.9 }, options),
     ];
@@ -790,7 +803,7 @@ describe('keep threshold', () => {
     expect(decideCall(call, { keepCall: 0.2, keepResult: 0.05 }, options).action).toBe(
       'drop_result',
     );
-    expect(decideCall(call, { keepCall: 0.05, keepResult: 0.03 }, options).action).toBe(
+    expect(decideCall(call, { keepCall: 0.01, keepResult: 0.03 }, options).action).toBe(
       'drop_call',
     );
   });
