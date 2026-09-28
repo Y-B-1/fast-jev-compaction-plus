@@ -394,6 +394,57 @@ describe('compact', () => {
     );
   });
 
+  it.each([
+    ['call_t1', -0.1],
+    ['call_t1', 1.1],
+    ['result_t1', -0.1],
+    ['result_t1', 1.1],
+  ])('rejects an out-of-range probability for %s: %s', async (name, probability) => {
+    await expect(
+      compact(transcript(), fakeJev((key) => (key === name ? probability : 0.5)), {
+        preserveRecentMessages: 1,
+      }),
+    ).rejects.toThrow(`Invalid Jev answer for ${name}`);
+  });
+
+  it('rejects an out-of-range keepThreshold', () => {
+    expect(() => resolveOptions({ keepThreshold: 1.5 })).toThrow(RangeError);
+    expect(() => resolveOptions({ keepThreshold: -0.1 })).toThrow(RangeError);
+  });
+
+  it('rejects an array-shaped answers map', () => {
+    expect(() => parseJevResponse(200, true, '{"answers":[]}')).toThrow(/missing answers/);
+  });
+
+  it('rejects a duplicate tool_use_id', () => {
+    const messages = [
+      call('dup', 'Read', { file_path: 'a.ts' }, ''),
+      call('dup', 'Read', { file_path: 'b.ts' }, ''),
+    ];
+    expect(() => collectToolCalls(messages, 0)).toThrow(/Duplicate tool_use_id/);
+  });
+
+  it('rejects a duplicate tool_result for the same id', () => {
+    const messages = [call('dup', 'Read', { file_path: 'a.ts' }, ''), result('dup', 'a'), result('dup', 'b')];
+    expect(() => collectToolCalls(messages, 0)).toThrow(/Duplicate tool_result/);
+  });
+
+  it('rejects a tool_result that precedes its call', () => {
+    const messages = [result('t1', 'too early'), call('t1', 'Read', {}, '')];
+    expect(() => collectToolCalls(messages, 0)).toThrow(/precedes its call/);
+  });
+
+  it('carries an unpaired tool_use as a pending call, never a deletion candidate', () => {
+    const messages = [...transcript(), call('tool-4', 'Bash', { command: 'still running' }, '')];
+    const calls = collectToolCalls(messages, 0);
+    expect(calls.some((c) => c.tool_use_id === 'tool-4')).toBe(false);
+    const state = fitState(messages, calls, fit);
+    const entry = state.state.history.find((e) => e.pending_calls?.some((p) => p.tool_use_id === 'tool-4'));
+    expect(entry?.pending_calls).toContainEqual(
+      expect.objectContaining({ tool_use_id: 'tool-4', tool: 'Bash' }),
+    );
+  });
+
   it('runs batches over a bounded pool of concurrent requests', async () => {
     let inFlight = 0;
     let maxInFlight = 0;
