@@ -244,6 +244,18 @@ function truncatedResultText(text: string, isError: boolean, headChars: number):
   }; re-run the tool if needed]`;
 }
 
+function isEmptyMessage(message: {
+  text: string;
+  toolUses: readonly unknown[];
+  toolResults?: readonly unknown[];
+}): boolean {
+  return (
+    message.text.trim().length === 0 &&
+    message.toolUses.length === 0 &&
+    (message.toolResults?.length ?? 0) === 0
+  );
+}
+
 /**
  * Rebuilds the conversation from the decisions. A dropped call disappears
  * together with its result; a dropped result keeps a bounded head and note.
@@ -268,6 +280,12 @@ export function applyDecisions(
       message.toolUses.some((tool) => actions.has(tool.tool_use_id)) ||
       (message.toolResults ?? []).some((result) => actions.has(result.tool_use_id));
     if (!touched) {
+      // An assistant message that came in already fully empty (no text, no
+      // tool call, no tool result) carries nothing for Jev's history and
+      // nothing to answer with later; a user or tool-carrier message is
+      // never dropped this way, since even an empty user turn is a real
+      // step in the conversation.
+      if (message.role === 'assistant' && isEmptyMessage(message)) continue;
       kept.push(message);
       continue;
     }
@@ -318,7 +336,7 @@ export function applyDecisions(
       kept.push(message);
       continue;
     }
-    if (message.text.trim().length === 0 && toolUses.length === 0 && toolResults.length === 0) {
+    if (isEmptyMessage({ text: message.text, toolUses, toolResults })) {
       continue;
     }
     const rebuilt: Message = { role: message.role, text: message.text, toolUses };
