@@ -82,6 +82,18 @@
       "description": "Characters of identifiers and error lines recovered from the dropped part of a tool result and kept alongside its truncation note; 0 disables.",
       "default": 300
     },
+    "jevPruneBashOutput": {
+      "type": "boolean",
+      "title": "Trim Bash output with Jev",
+      "description": "Opt-in: before a Bash tool result reaches the transcript, ask Jev to trim its stdout when it is long. A second Jev call site of its own, separate from compaction; off by default.",
+      "default": false
+    },
+    "jevPruneMinChars": {
+      "type": "number",
+      "title": "Minimum Bash output length to trim",
+      "description": "Stdout shorter than this is left alone even when jevPruneBashOutput is on.",
+      "default": 4000
+    },
     "model": {
       "type": "string",
       "title": "Jev model",

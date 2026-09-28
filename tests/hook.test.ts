@@ -63,6 +63,8 @@ describe('hook config', () => {
       minReductionRatio: 0.25,
       model: 'typesafe/jev-1.13',
       builtinFallback: 'auto',
+      jevPruneBashOutput: false,
+      jevPruneMinChars: 4_000,
     });
     expect(
       resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
@@ -77,7 +79,16 @@ describe('hook config', () => {
       compactCooldownTurns: 3,
       minReductionRatio: 0.25,
       builtinFallback: 'auto',
+      jevPruneBashOutput: false,
+      jevPruneMinChars: 4_000,
     });
+  });
+
+  it('reads jevPruneBashOutput from userConfig', () => {
+    expect(resolveHookConfig({}).jevPruneBashOutput).toBe(false);
+    expect(resolveHookConfig({ jevPruneBashOutput: true }).jevPruneBashOutput).toBe(true);
+    expect(resolveHookConfig({ jevPruneBashOutput: 'yes' }).jevPruneBashOutput).toBe(false);
+    expect(resolveHookConfig({ jevPruneMinChars: 500 }).jevPruneMinChars).toBe(500);
   });
 
   it('reads builtinFallback from userConfig, ignoring an invalid value', () => {
@@ -263,8 +274,8 @@ describe('register', () => {
   type Hook = (...args: any[]) => Promise<unknown>;
   function registered(options: Record<string, unknown> = {}) {
     const hooks: Record<string, Hook> = {};
-    (register as any)((event: string, hook: Hook) => {
-      hooks[event] = hook;
+    (register as any)((event: string, matcherOrHook: unknown, maybeHook?: Hook) => {
+      hooks[event] = typeof maybeHook === 'function' ? maybeHook : (matcherOrHook as Hook);
     }, { apiKey: 'k', ...options });
     return hooks;
   }
@@ -504,4 +515,112 @@ describe('register', () => {
     expect(sentGoal).toContain('base goal');
     expect(sentGoal).toContain('focus on the auth bug');
   });
+});
+
+describe('register: tool.call (Bash output trimming)', () => {
+  type Hook = (...args: any[]) => Promise<unknown>;
+  function registeredMatchers(options: Record<string, unknown> = {}) {
+    const hooks: Record<string, { matcher: unknown; hook: Hook }> = {};
+    (register as any)(
+      (event: string, matcherOrHook: unknown, maybeHook?: Hook) => {
+        hooks[event] =
+          typeof maybeHook === 'function'
+            ? { matcher: matcherOrHook, hook: maybeHook }
+            : { matcher: undefined, hook: matcherOrHook as Hook };
+      },
+      { apiKey: 'k', ...options },
+    );
+    return hooks;
+  }
+  function bashEngine(fetchFn: (url: string, init?: { body?: string }) => Promise<unknown>) {
+    return {
+      env: { get: async () => undefined },
+      settings: { read: async () => ({}) },
+      ui: { log: () => {}, toast: () => {} },
+      http: { fetch: fetchFn as any },
+    };
+  }
+
+  it('matches only the Bash tool', () => {
+    const { matcher } = registeredMatchers()['tool.call']!;
+    expect(matcher).toEqual({ tool: 'Bash' });
+  });
+
+  it('leaves output untouched when jevPruneBashOutput is off', async () => {
+    const { hook } = registeredMatchers({ jevPruneBashOutput: false })['tool.call']!;
+    let asked = false;
+    const $ = bashEngine(async () => {
+      asked = true;
+      return { status: 200, ok: true, text: '{"answers":{}}' };
+    });
+    const long = 'line\n'.repeat(2000);
+    const out = (await hook($, { command: 'npm test' }, next(async () => ({ result: { stdout: long } })))) as {
+      result: { stdout: string };
+    };
+    expect(out.result.stdout).toBe(long);
+    expect(asked).toBe(false);
+  });
+
+  it('trims long Bash stdout through Jev when opted in', async () => {
+    const { hook } = registeredMatchers({ jevPruneBashOutput: true, jevPruneMinChars: 10 })['tool.call']!;
+    const $ = bashEngine(async () => {
+      // 60 lines / 20 per chunk = 3 chunks (c1, c2, c3). The first and last
+      // are always kept regardless of score, so drop the middle one to make
+      // trimming observable and deterministic.
+      const answers = {
+        c1: { type: 'noul', noul: 1 },
+        c2: { type: 'noul', noul: 0 },
+        c3: { type: 'noul', noul: 1 },
+      };
+      return { status: 200, ok: true, text: JSON.stringify({ answers }) };
+    });
+    const long = Array.from({ length: 60 }, (_, i) => `line ${i}`).join('\n');
+    const out = (await hook(
+      $,
+      { command: 'npm test' },
+      next(async () => ({ result: { stdout: long } })),
+    )) as { result: { stdout: string } };
+    expect(out.result.stdout.length).toBeLessThan(long.length);
+    expect(out.result.stdout).toContain('fast-jev-compaction trimmed');
+  });
+
+  it('leaves a short Bash result untouched even when opted in', async () => {
+    const { hook } = registeredMatchers({ jevPruneBashOutput: true, jevPruneMinChars: 4000 })['tool.call']!;
+    let asked = false;
+    const $ = bashEngine(async () => {
+      asked = true;
+      return { status: 200, ok: true, text: '{"answers":{}}' };
+    });
+    const out = (await hook(
+      $,
+      { command: 'echo hi' },
+      next(async () => ({ result: { stdout: 'hi' } })),
+    )) as { result: { stdout: string } };
+    expect(out.result.stdout).toBe('hi');
+    expect(asked).toBe(false);
+  });
+
+  it('skips an image result, a background task, or output already persisted to disk', async () => {
+    const { hook } = registeredMatchers({ jevPruneBashOutput: true, jevPruneMinChars: 1 })['tool.call']!;
+    let asked = false;
+    const $ = bashEngine(async () => {
+      asked = true;
+      return { status: 200, ok: true, text: '{"answers":{}}' };
+    });
+    for (const result of [
+      { stdout: 'x'.repeat(50), isImage: true },
+      { stdout: 'x'.repeat(50), backgroundTaskId: 'bg-1' },
+      { stdout: 'x'.repeat(50), persistedOutputPath: '/tmp/out.txt' },
+    ]) {
+      const out = (await hook($, { command: 'x' }, next(async () => ({ result })))) as {
+        result: typeof result;
+      };
+      expect(out.result).toBe(result);
+    }
+    expect(asked).toBe(false);
+  });
+
+  function next(fn: () => Promise<unknown>) {
+    return Object.assign(fn, { signal: new AbortController().signal });
+  }
 });

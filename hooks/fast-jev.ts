@@ -9,6 +9,7 @@ import type {
 } from 'claude-code';
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
+import { trimOutput } from '../src/output.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
 import { redactCompactionState, redactText } from '../src/redact.js';
 import { goalFromMessages } from '../src/state.js';
@@ -42,6 +43,10 @@ const HOOK_DEFAULTS = {
    * call on every following turn while the window sits at the threshold.
    */
   compactCooldownTurns: 3,
+  /** Opt-in: trims a Bash command's stdout through Jev at tool.call time, before compaction ever sees it. Off by default — a second Jev call site of its own, see `jevPruneBashOutput`. */
+  jevPruneBashOutput: false,
+  /** stdout shorter than this is never sent to Jev for trimming. */
+  jevPruneMinChars: 4_000,
 };
 
 
@@ -68,6 +73,8 @@ export type HookConfig = CompactOptions & {
   model: string;
   builtinFallback: BuiltinFallback;
   compactCooldownTurns: number;
+  jevPruneBashOutput: boolean;
+  jevPruneMinChars: number;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -133,6 +140,14 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     compactCooldownTurns: Math.max(
       0,
       Math.floor(optionNumber(options, 'compactCooldownTurns', HOOK_DEFAULTS.compactCooldownTurns)),
+    ),
+    jevPruneBashOutput:
+      typeof options['jevPruneBashOutput'] === 'boolean'
+        ? options['jevPruneBashOutput']
+        : HOOK_DEFAULTS.jevPruneBashOutput,
+    jevPruneMinChars: Math.max(
+      0,
+      Math.floor(optionNumber(options, 'jevPruneMinChars', HOOK_DEFAULTS.jevPruneMinChars)),
     ),
   };
   const apiKey = optionString(options, 'apiKey');
@@ -488,6 +503,58 @@ export const register: Register = (on: On, options: PluginOptions) => {
       compacting = false;
     }
     return next(event);
+  });
+
+  // Opt-in (see HOOK_DEFAULTS.jevPruneBashOutput): trims a Bash command's
+  // stdout through Jev before the model ever sees it, the same idea as
+  // compaction applied at tool.call time to one result. A short-circuit on
+  // length runs before anything else, so a plugin left enabled costs nothing
+  // on the ordinary, short-output case.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const result = await next(e);
+    if (!configured.jevPruneBashOutput || result.deny || !result.result) return result;
+    const output = result.result as {
+      stdout?: string;
+      isImage?: boolean;
+      backgroundTaskId?: string;
+      persistedOutputPath?: string;
+      rawOutputPath?: string;
+    };
+    // Never touch an image result, a still-running background command, or an
+    // output the engine already moved to disk for being too large — trimming
+    // those would be either meaningless or redundant.
+    if (
+      output.isImage ||
+      output.backgroundTaskId ||
+      output.persistedOutputPath ||
+      output.rawOutputPath
+    ) {
+      return result;
+    }
+    const stdout = output.stdout ?? '';
+    if (stdout.length < configured.jevPruneMinChars) return result;
+    try {
+      const apiKey = await getApiKey($, configured);
+      if (!apiKey) return result;
+      const asker = jevAsker(
+        async (url, init) => {
+          const response = await $.http.fetch(url, init);
+          return { status: response.status, ok: response.ok, text: response.text };
+        },
+        apiKey,
+        configured.model,
+      );
+      const trimmed = await trimOutput(
+        { command: e.command, goal: configured.goal ?? '', output: stdout },
+        asker,
+        { minChars: configured.jevPruneMinChars },
+      );
+      if (!trimmed.trimmed) return result;
+      return { result: { ...output, stdout: trimmed.output }, context: result.context };
+    } catch (error) {
+      log($, `bash output trim skipped (${error instanceof Error ? error.message : String(error)})`);
+      return result;
+    }
   });
 };
 

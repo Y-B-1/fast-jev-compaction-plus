@@ -131,6 +131,8 @@ put it in a source file.
 | `archiveResults` | `true` | Write the full text of a dropped tool call or result to `.claude/fast-jev-compaction/` and cite the file in the marker left in its place, so it can be `Read` or grepped back later; text that looks like a credential is never written |
 | `resultPreviewChars` | `300` | Characters from each end of a tool result quoted in its keep question; `0` disables |
 | `salvageChars` | `300` | Characters of identifiers and error lines recovered from the dropped part of a tool result and kept next to its truncation note; `0` disables |
+| `jevPruneBashOutput` | `false` | Opt-in: before a Bash tool result reaches the transcript, trim its stdout through Jev when it is long (`src/output.ts`). A second, separate Jev call site from compaction — leave it off unless you want the extra cost |
+| `jevPruneMinChars` | `4000` | Stdout shorter than this is left untouched even when `jevPruneBashOutput` is on |
 
 `result.stats` reports message and character counts before and after, the
 per-reason decision counts, the state size in estimated tokens, which fitting
