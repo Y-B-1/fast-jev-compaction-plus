@@ -103,6 +103,24 @@ describe('token estimate', () => {
     const json = JSON.stringify({ file_path: '/Users/x/src/a.ts', old_string: 'a = 1;', n: 42 });
     expect(estimateTokens(json)).toBeGreaterThanOrEqual(Math.ceil(json.length / 3));
   });
+
+  it('charges dense alphanumeric runs (hex, UUIDs, base64, hashes) at their denser rate', () => {
+    // A mixed letters+digits run (a commit hash) tokenizes far denser than a
+    // six-letters-per-token word.
+    const hash = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0';
+    expect(estimateTokens(hash)).toBeGreaterThanOrEqual(Math.ceil(hash.length / 4));
+    // A long, low-vowel, all-letters run (e.g. a base64/opaque token) is
+    // charged the same way even without digits.
+    const opaque = 'xkcqzvfmtnbgwplshjdrqzxvbnmkcplsq';
+    expect(estimateTokens(opaque)).toBeGreaterThanOrEqual(Math.ceil(opaque.length / 4));
+    // An ordinary long English word is unaffected: still one token per six
+    // letters, not per four characters.
+    expect(estimateTokens('internationalization')).toBe(4);
+    // A UUID with hyphens: each hyphen-separated segment is still dense.
+    const uuid = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+    const alnumChars = uuid.replace(/-/g, '').length;
+    expect(estimateTokens(uuid)).toBeGreaterThanOrEqual(Math.ceil(alnumChars / 4));
+  });
 });
 
 describe('truncate', () => {
@@ -160,7 +178,7 @@ describe('state fitting', () => {
   it('truncates tool inputs before touching message text', () => {
     const messages = [
       message('user', 'start'),
-      call('w', 'Write', { file_path: 'x.ts', content: 'x'.repeat(5000) }, 'ok'),
+      call('w', 'Write', { file_path: 'x.ts', content: 'lorem ipsum '.repeat(400) }, 'ok'),
       result('w', 'ok'),
       message('assistant', 'written'),
     ];

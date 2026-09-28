@@ -17,23 +17,61 @@ const TEXT_HEAD = 400;
 const TEXT_TAIL = 150;
 
 const TOKEN_PIECES = /[A-Za-z]+|\d+|[^\sA-Za-z\d]/g;
+const ALNUM_RUN = /[A-Za-z0-9]+/g;
+const VOWELS = new Set('aeiouAEIOU');
+
+function legacyPieceCost(piece: string): number {
+  const first = piece.charCodeAt(0);
+  if (first >= 48 && first <= 57) return piece.length / 2;
+  if ((first >= 65 && first <= 90) || (first >= 97 && first <= 122)) {
+    return 1 + Math.floor((piece.length - 1) / 6);
+  }
+  return 0.9;
+}
+
+/**
+ * Whether an alphanumeric run reads as a hash, UUID, hex string, or base64
+ * blob rather than prose or an identifier: it mixes letters and digits, or
+ * it is long with few vowels or unusually many distinct characters. These
+ * tokenize far denser than English or a plain number (closer to one token
+ * per four characters than per six), so the per-piece word/digit cost below
+ * undercounts them.
+ */
+function isDenseRun(run: string): boolean {
+  if (/[A-Za-z]/.test(run) && /\d/.test(run)) return true;
+  if (run.length < 16) return false;
+  let vowels = 0;
+  for (const ch of run) if (VOWELS.has(ch)) vowels++;
+  if (vowels / run.length < 0.15) return true;
+  return new Set(run.toLowerCase()).size / run.length > 0.6;
+}
 
 /**
  * Estimates tokens without a tokenizer: a word costs one token per six
- * letters, a digit half a token, any other symbol nine tenths. Calibrated
+ * letters, a digit half a token, any other symbol nine tenths. A dense
+ * alphanumeric run (see `isDenseRun`) instead costs one token per four
+ * characters when that is higher than its letters-and-digits total, since a
+ * hex hash or a base64 blob tokenizes far denser than prose. Calibrated
  * against the usage Jev reports for real transcripts, where it lands 2–18%
  * above the true count; a plain characters-per-token ratio undercounts the
  * JSON-heavy states by up to 40%.
  */
 export function estimateTokens(text: string): number {
   let tokens = 0;
-  for (const [piece] of text.matchAll(TOKEN_PIECES)) {
-    const first = piece.charCodeAt(0);
-    if (first >= 48 && first <= 57) tokens += piece.length / 2;
-    else if ((first >= 65 && first <= 90) || (first >= 97 && first <= 122)) {
-      tokens += 1 + Math.floor((piece.length - 1) / 6);
-    } else tokens += 0.9;
+  let cursor = 0;
+  for (const match of text.matchAll(ALNUM_RUN)) {
+    const run = match[0];
+    const start = match.index;
+    // Non-alphanumeric text before this run: legacy piece cost as before.
+    for (const [piece] of text.slice(cursor, start).matchAll(TOKEN_PIECES)) {
+      tokens += legacyPieceCost(piece);
+    }
+    let legacyRunCost = 0;
+    for (const [piece] of run.matchAll(TOKEN_PIECES)) legacyRunCost += legacyPieceCost(piece);
+    tokens += isDenseRun(run) ? Math.max(legacyRunCost, run.length / 4) : legacyRunCost;
+    cursor = start + run.length;
   }
+  for (const [piece] of text.slice(cursor).matchAll(TOKEN_PIECES)) tokens += legacyPieceCost(piece);
   return Math.ceil(tokens);
 }
 
