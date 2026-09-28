@@ -11,6 +11,7 @@ import {
   fitState,
   JevClient,
   parseJevResponse,
+  questionsFor,
   reductionRatio,
   resolveOptions,
   type HistoryToolCall,
@@ -386,6 +387,123 @@ describe('compact', () => {
     await expect(compact(transcript(), broken, { preserveRecentMessages: 1 })).rejects.toThrow(
       /Invalid Jev answer/,
     );
+  });
+
+  it('runs batches over a bounded pool of concurrent requests', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const messages = transcript();
+    const stateTokens = fitState(messages, collectToolCalls(messages, 1), {
+      ...fit,
+      goal: '',
+      preserveRecentMessages: 1,
+    }).tokens;
+    const perCall = Math.max(
+      ...collectToolCalls(messages, 1).map((c) => estimateTokens(JSON.stringify(questionsFor(c)))),
+    );
+    const asker: JevAsker = {
+      async ask(_state, questions) {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight -= 1;
+        return {
+          answers: Object.fromEntries(
+            Object.keys(questions).map((key) => [key, { type: 'noul' as const, noul: 0.1 }]),
+          ),
+        };
+      },
+    };
+    const output = await compact(messages, asker, {
+      preserveRecentMessages: 1,
+      maxRequestTokens: stateTokens + perCall + 25,
+      maxConcurrentRequests: 2,
+    });
+    expect(output.stats.requests).toBeGreaterThan(2);
+    expect(maxInFlight).toBeLessThanOrEqual(2);
+  });
+
+  it('salvages the answers of the batches that succeeded when only some fail', async () => {
+    const messages = transcript();
+    const stateTokens = fitState(messages, collectToolCalls(messages, 1), {
+      ...fit,
+      goal: '',
+      preserveRecentMessages: 1,
+    }).tokens;
+    const perCall = Math.max(
+      ...collectToolCalls(messages, 1).map((c) => estimateTokens(JSON.stringify(questionsFor(c)))),
+    );
+    let call = 0;
+    const asker: JevAsker = {
+      async ask(_state, questions) {
+        call += 1;
+        if (call === 1) throw new Error('Jev request failed (503): boom');
+        return {
+          answers: Object.fromEntries(
+            Object.keys(questions).map((key) => [key, { type: 'noul' as const, noul: 0.9 }]),
+          ),
+        };
+      },
+    };
+    const output = await compact(messages, asker, {
+      preserveRecentMessages: 1,
+      maxRequestTokens: stateTokens + perCall + 25,
+      maxConcurrentRequests: 1,
+    });
+    expect(output.stats.failedRequests).toBe(1);
+    expect(output.stats.requests).toBeGreaterThan(1);
+    // The failed batch's calls fall back to the safe default (kept).
+    expect(output.decisions.some((d) => d.action === 'keep')).toBe(true);
+  });
+
+  it('throws when every batch fails, naming the underlying failure', async () => {
+    const asker: JevAsker = {
+      ask: async () => {
+        throw new Error('Jev request failed (500): boom');
+      },
+    };
+    await expect(
+      compact(transcript(), asker, { preserveRecentMessages: 1 }),
+    ).rejects.toThrow(/boom/);
+  });
+
+  it('reserves room for the largest question before fitting the state', async () => {
+    const input = [
+      message('user', 'start'),
+      call('x', 'Read', { file_path: 'a' }, 'x'),
+      result('x', 'x'),
+      message('assistant', 'word '.repeat(2000)),
+      message('user', 'finish'),
+    ];
+    let seenState = '';
+    const output = await compact(
+      input,
+      {
+        async ask(state, questions) {
+          seenState = JSON.stringify(state);
+          return {
+            answers: Object.fromEntries(
+              Object.keys(questions).map((key) => [key, { type: 'noul' as const, noul: 1 }]),
+            ),
+          };
+        },
+      },
+      { maxRequestTokens: 1000, maxStateTokens: 25_000, preserveRecentMessages: 1, goal: 'finish' },
+    );
+    expect(estimateTokens(seenState)).toBeLessThan(1000);
+    expect(output.stats.stateStage).not.toBe('full');
+    expect(output.messages).toHaveLength(input.length);
+  });
+
+  it('throws instead of sending anything when the request budget cannot fit state and questions', async () => {
+    const asker: JevAsker = {
+      ask: async () => {
+        throw new Error('unexpected');
+      },
+    };
+    await expect(
+      compact(transcript(), asker, { maxRequestTokens: 1, preserveRecentMessages: 0 }),
+    ).rejects.toThrow(/no room/);
   });
 });
 

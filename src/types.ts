@@ -103,6 +103,9 @@ export interface CompactOptions {
   maxStateTokens?: number;
   /** Estimated token ceiling for state plus one batch of questions. Default 30000. */
   maxRequestTokens?: number;
+  /** Maximum concurrent Jev requests. Default 4. A batch that still fails after
+   * the asker's own retries is salvaged: its calls are simply left unanswered. */
+  maxConcurrentRequests?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;
 }
@@ -113,6 +116,7 @@ export interface ResolvedCompactOptions {
   preserveRecentMessages: number;
   maxStateTokens: number;
   maxRequestTokens: number;
+  maxConcurrentRequests: number;
   truncateHeadChars: number;
 }
 
@@ -134,6 +138,8 @@ export interface CompactResult {
     /** Which fitting stage the state needed, '' when no request was made. */
     stateStage: string;
     requests: number;
+    /** Requests whose batch was salvaged (its calls left unanswered) after exhausting retries. */
+    failedRequests: number;
     ms: number;
   };
 }

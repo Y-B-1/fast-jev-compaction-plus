@@ -20,6 +20,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   preserveRecentMessages: 6,
   maxStateTokens: 25_000,
   maxRequestTokens: 30_000,
+  maxConcurrentRequests: 4,
   truncateHeadChars: 300,
 };
 
@@ -44,6 +45,10 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
     maxRequestTokens: Math.max(
       1,
       finite(options.maxRequestTokens, DEFAULT_OPTIONS.maxRequestTokens),
+    ),
+    maxConcurrentRequests: Math.max(
+      1,
+      Math.floor(finite(options.maxConcurrentRequests, DEFAULT_OPTIONS.maxConcurrentRequests)),
     ),
     truncateHeadChars: Math.max(
       0,
@@ -130,6 +135,42 @@ async function askBatch(
       },
     ]),
   );
+}
+
+/**
+ * Runs the batches over a bounded pool of concurrent requests. A batch that
+ * fails (after whatever retries the asker itself makes) is salvaged rather
+ * than sinking the whole compaction: its calls are simply left unanswered, so
+ * `compact` falls back to its safe default (keep) for them, and the other
+ * batches' answers still apply. Only when every batch fails is the last
+ * failure re-thrown, so a caller that can fall back to a built-in summary
+ * still learns why nothing was pruned.
+ */
+async function askBatches(
+  asker: JevAsker,
+  state: CompactionState,
+  batches: readonly ToolCall[][],
+  concurrency: number,
+): Promise<{ answered: Map<string, CallAnswer>[]; failed: number }> {
+  const answered: Map<string, CallAnswer>[] = new Array(batches.length);
+  let cursor = 0;
+  let failed = 0;
+  let lastFailure: unknown;
+  const worker = async (): Promise<void> => {
+    while (cursor < batches.length) {
+      const index = cursor++;
+      try {
+        answered[index] = await askBatch(asker, state, batches[index]!);
+      } catch (error) {
+        failed += 1;
+        lastFailure = error;
+        answered[index] = new Map();
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, batches.length) }, worker));
+  if (failed > 0 && failed === batches.length) throw lastFailure;
+  return { answered, failed };
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
@@ -267,14 +308,33 @@ export async function compact(
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let batches: ToolCall[][] = [];
+  let failedRequests = 0;
   const answers = new Map<string, CallAnswer>();
   if (candidates.length > 0) {
-    const state = fitState(messages, calls, resolved);
+    // Reserve room for the largest question before fitting the state, so a
+    // tight maxRequestTokens shrinks the state instead of batching down to a
+    // state that leaves no room for even one question.
+    const largestQuestion = candidates.reduce(
+      (largest, call) => Math.max(largest, estimateTokens(JSON.stringify(questionsFor(call)))),
+      0,
+    );
+    const stateBudget = resolved.maxRequestTokens - REQUEST_OVERHEAD_TOKENS - largestQuestion;
+    if (stateBudget < 1) {
+      throw new Error('request budget leaves no room for state and questions');
+    }
+    const state = fitState(messages, calls, {
+      ...resolved,
+      maxStateTokens: Math.min(resolved.maxStateTokens, stateBudget),
+    });
     fitted = state;
     batches = batchCalls(candidates, state.tokens, resolved);
-    const answered = await Promise.all(
-      batches.map((batch) => askBatch(asker, state.state, batch)),
+    const { answered, failed } = await askBatches(
+      asker,
+      state.state,
+      batches,
+      resolved.maxConcurrentRequests,
     );
+    failedRequests = failed;
     for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
   }
 
@@ -303,6 +363,7 @@ export async function compact(
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length,
+      failedRequests,
       ms: Date.now() - started,
     },
   };
