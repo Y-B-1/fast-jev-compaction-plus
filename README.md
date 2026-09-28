@@ -129,6 +129,7 @@ put it in a source file.
 | `compactAtPercent` | `60` | Context percentage at which `turn.complete` requests compaction |
 | `compactCooldownTurns` | `3` | Turns to wait after a compaction attempt that leaves the window still at or above `compactAtPercent`, before requesting another one |
 | `archiveResults` | `true` | Write the full text of a dropped tool call or result to `.claude/fast-jev-compaction/` and cite the file in the marker left in its place, so it can be `Read` or grepped back later; text that looks like a credential is never written |
+| `resultPreviewChars` | `300` | Characters from each end of a tool result quoted in its keep question; `0` disables |
 
 `result.stats` reports message and character counts before and after, the
 per-reason decision counts, the state size in estimated tokens, which fitting

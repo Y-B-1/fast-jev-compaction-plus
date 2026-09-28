@@ -81,6 +81,7 @@ describe('options', () => {
       maxStateTokens: 25_000,
       maxRequestTokens: 60_000,
       truncateHeadChars: 300,
+      resultPreviewChars: 300,
     });
     expect(resolveOptions({
       keepThreshold: Number.NaN,
@@ -429,7 +430,11 @@ describe('compact', () => {
     const output = await compact(
       messages,
       fakeJev((name) => (name.startsWith('call_') ? 0.9 : 0.1), seen),
-      { preserveRecentMessages: 1, maxRequestTokens: stateTokens + perCall + 25 },
+      {
+        preserveRecentMessages: 1,
+        maxRequestTokens: stateTokens + perCall + 25,
+        resultPreviewChars: 0,
+      },
     );
 
     expect(output.stats.requests).toBe(seen.length);
@@ -806,5 +811,24 @@ describe('keep threshold', () => {
     expect(decideCall(call, { keepCall: 0.01, keepResult: 0.03 }, options).action).toBe(
       'drop_call',
     );
+  });
+});
+
+describe('result preview', () => {
+  it('quotes the head and tail of a result in its keep question', () => {
+    const long = `START ${'x '.repeat(500)}END`;
+    const messages = [message('user', 'hi'), call('a', 'Bash', { command: 'ls' }, ''), result('a', long)];
+    const [withPreview] = collectToolCalls(messages, 0, 20);
+    expect(withPreview!.resultPreview).toMatch(/^START .* … .*END$/);
+    const q = Object.values(questionsFor(withPreview!))[1]!.instructions;
+    expect(q).toContain('Output preview: START');
+    expect(q).toContain('END');
+  });
+
+  it('adds nothing when disabled', () => {
+    const messages = [message('user', 'hi'), call('a', 'Bash', { command: 'ls' }, ''), result('a', 'plain output')];
+    const [plain] = collectToolCalls(messages, 0);
+    expect(plain!.resultPreview).toBeUndefined();
+    expect(Object.values(questionsFor(plain!))[1]!.instructions).not.toContain('preview');
   });
 });
