@@ -161,10 +161,14 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
 export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
   return {
     async ask(state, questions) {
-      // The state carries transcript text and tool inputs verbatim; a
-      // command, an env var, or a pasted key in there must not leave the
-      // machine before every request is sent.
-      const request = buildJevRequest({ apiKey, model }, redactCompactionState(state, apiKey), questions);
+      // The state carries transcript text and tool inputs verbatim, and each
+      // keep question quotes a head and tail of its tool result; a command,
+      // an env var, or a pasted key in either must not leave the machine.
+      const request = buildJevRequest(
+        { apiKey, model },
+        redactCompactionState(state, apiKey),
+        redactCompactionState(questions, apiKey),
+      );
       const response = await fetchFn(request.url, {
         method: request.method,
         headers: request.headers,

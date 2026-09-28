@@ -177,6 +177,25 @@ describe('compactSession', () => {
     ).rejects.toThrow(/500/);
   });
 
+  it('redacts secrets in tool results out of the whole request body, keep questions included', async () => {
+    const bodies: string[] = [];
+    const secret = 'sk-abcdefghijklmnopqrstuvwxyz123456';
+    const messages = transcript();
+    messages.splice(
+      5,
+      0,
+      call('tool-3', 'Bash', { command: 'cat .env' }, 'env'),
+      result('tool-3', `API_KEY=${secret} DB_PASSWORD=hunter2hunter2\n${'filler line\n'.repeat(200)}`),
+    );
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    await compactSession(messages, config, jevFetch(() => 0.9, bodies));
+    expect(bodies.length).toBeGreaterThan(0);
+    const all = bodies.join('\n');
+    expect(all).toContain('result_t3');
+    expect(all).not.toContain(secret);
+    expect(all).not.toContain('hunter2hunter2');
+  });
+
   it('archives a dropped call and cites the file in the note left behind, when an archive writer is given', async () => {
     const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
     const files = new Map<string, string>();
