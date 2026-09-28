@@ -58,5 +58,8 @@
       "description": "TypeSafe Jev model name.",
       "default": "typesafe/jev-1.13"
     }
+  },
+  "author": {
+    "name": "Y-B-1"
   }
 }
