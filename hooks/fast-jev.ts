@@ -10,6 +10,7 @@ import type {
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import { redactCompactionState } from '../src/redact.js';
 import { goalFromMessages } from '../src/state.js';
 import type {
   CompactOptions,
@@ -123,7 +124,10 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
 export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
   return {
     async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model }, state, questions);
+      // The state carries transcript text and tool inputs verbatim; a
+      // command, an env var, or a pasted key in there must not leave the
+      // machine before every request is sent.
+      const request = buildJevRequest({ apiKey, model }, redactCompactionState(state, apiKey), questions);
       const response = await fetchFn(request.url, {
         method: request.method,
         headers: request.headers,
