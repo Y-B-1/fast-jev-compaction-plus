@@ -363,10 +363,13 @@ export async function getApiKey(
 ): Promise<string | undefined> {
   if (config.apiKey) return config.apiKey;
   const settings = await $.settings.read();
-  for (const name of ['OPENROUTER_API_KEY', 'TYPESAFE_API_KEY'] as const) {
-    const key = (await $.env.get(name)) || settingsEnv(settings, name);
-    if (key) return key;
-  }
+  // $.env.get needs a literal name at each call site so the plugin's env
+  // reads can be listed statically; a loop over a name array (however
+  // narrowly typed) does not satisfy that, hence the two calls spelled out.
+  const openRouterKey = (await $.env.get('OPENROUTER_API_KEY')) || settingsEnv(settings, 'OPENROUTER_API_KEY');
+  if (openRouterKey) return openRouterKey;
+  const typesafeKey = (await $.env.get('TYPESAFE_API_KEY')) || settingsEnv(settings, 'TYPESAFE_API_KEY');
+  if (typesafeKey) return typesafeKey;
   return undefined;
 }
 
