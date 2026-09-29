@@ -1,0 +1,83 @@
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+spec = importlib.util.spec_from_file_location("installer", Path(__file__).resolve().parents[1] / "scripts/install-codex.py")
+installer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(installer)
+
+
+class InstallerTests(unittest.TestCase):
+    def runtime(self, root):
+        (root / "bin").mkdir()
+        (root / "bin/codex").write_bytes(b"test runtime")
+        (root / "codex-package.json").write_text(json.dumps({"layoutVersion": 1, "version": "0.159.0-jev.0", "target": "aarch64-apple-darwin", "entrypoint": "bin/codex"}))
+        digest = hashlib.sha256(b"test runtime").hexdigest()
+        (root / "SHA256SUMS").write_text(digest + "  codex-runtime/bin/codex\n")
+
+    def test_runtime_rejects_tampering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.runtime(root)
+            self.assertEqual(installer.check_runtime(root), root / "bin/codex")
+            (root / "bin/codex").write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                installer.check_runtime(root)
+
+    def test_runtime_rejects_wrong_architecture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.runtime(root)
+            (root / "codex-package.json").write_text('{"layoutVersion":1,"target":"x86_64-apple-darwin","entrypoint":"bin/codex"}')
+            with self.assertRaisesRegex(ValueError, "ARM64"):
+                installer.check_runtime(root)
+
+    def test_credentials_private_and_only_openrouter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, target = root / "source", root / "target"
+            source.write_text('{"provider":"openrouter","apiKey":"synthetic-test-key"}')
+            target.write_text("old")
+            target.chmod(0o644)
+            installer.copy_credentials(source, target)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(target.read_text())["apiKey"], "synthetic-test-key")
+            source.write_text('{"provider":"typesafe","apiKey":"synthetic-test-key"}')
+            with self.assertRaises(ValueError):
+                installer.copy_credentials(source, target)
+
+    def test_link_preserves_regular_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            target.write_text("user work")
+            with self.assertRaises(ValueError):
+                installer.link(root / "source", target)
+            self.assertEqual(target.read_text(), "user work")
+
+    def test_trust_only_reviewed_plugin_hooks(self):
+        class Server:
+            def __init__(self):
+                self.calls = []
+                self.hooks = [{"pluginId": "fast-jev-compaction@fast-jev-compaction", "eventName": event, "handlerType": "command", "command": '"${PLUGIN_ROOT}/bin/codex-hook"', "key": event + '."key"', "currentHash": "sha256:test"} for event in installer.EVENTS]
+                self.hooks.append({"pluginId": "unrelated", "eventName": "stop"})
+            def request(self, method, params):
+                self.calls.append((method, params))
+                return {"data": [{"hooks": self.hooks, "errors": []}]} if method == "hooks/list" else {}
+        server = Server()
+        installer.trust_hooks(server)
+        writes = [params for method, params in server.calls if method == "config/value/write"]
+        self.assertEqual(len(writes), 7)
+        self.assertTrue(all("unrelated" not in item["keyPath"] for item in writes))
+        server.hooks[0]["command"] = "unexpected"
+        server.calls.clear()
+        with self.assertRaises(ValueError):
+            installer.trust_hooks(server)
+        self.assertEqual(len(server.calls), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

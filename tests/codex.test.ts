@@ -4,7 +4,7 @@ import type { JevAsker } from '../src/types.js';
 
 const discardResults: JevAsker = {
   async ask(_state, questions) {
-    return { answers: Object.fromEntries(Object.keys(questions).map((key) => [key, { noul: key.endsWith('_call') ? 1 : 0 }])) };
+    return { answers: Object.fromEntries(Object.keys(questions).map((key) => [key, { noul: key.startsWith('call_') ? 1 : 0 }])) };
   },
 };
 

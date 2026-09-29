@@ -67,9 +67,10 @@ export async function compactCodexItems(
   const bytesAfter = Buffer.byteLength(JSON.stringify(replacement));
   const minimum = options.minReductionRatio ?? 0.25;
   if (!Number.isFinite(minimum) || minimum < 0 || minimum > 1) throw new RangeError('minReductionRatio must be between 0 and 1');
+  const accepted = bytesBefore > 0 && (bytesBefore - bytesAfter) / bytesBefore >= minimum;
   return {
     version: 1,
-    edits: bytesBefore > 0 && (bytesBefore - bytesAfter) / bytesBefore >= minimum ? edits : [],
-    stats: { bytesBefore, bytesAfter, requests: result.stats.requests, failedRequests: result.stats.failedRequests },
+    edits: accepted ? edits : [],
+    stats: { bytesBefore, bytesAfter: accepted ? bytesAfter : bytesBefore, requests: result.stats.requests, failedRequests: result.stats.failedRequests },
   };
 }

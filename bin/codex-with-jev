@@ -2,5 +2,6 @@
 set -eu
 plugin_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 export FAST_JEV_COMPACTION_ADAPTER="$plugin_root/bin/codex-adapter"
-export FAST_JEV_NODE="${FAST_JEV_NODE:-node}"
-exec "$plugin_root/runtime/codex-runtime/bin/codex" "$@"
+data_root="${FAST_JEV_DATA:-$HOME/.codex/fast-jev-compaction}"
+export FAST_JEV_NODE="${FAST_JEV_NODE:-$data_root/runtime/node}"
+exec "$data_root/runtime/codex-runtime/bin/codex" "$@"

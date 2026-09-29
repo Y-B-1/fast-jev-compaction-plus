@@ -1,9 +1,11 @@
 # fast-jev-compaction
 
-Claude Code plugin that replaces the compaction summary with Jev decisions:
+Claude Code and Codex plugin for Jev-guided selective compaction. Claude Code
+replaces the compaction summary with Jev decisions:
 every tool call and result is scored in one fast request, stale ones are
 dropped or truncated, everything kept stays verbatim. Also usable as an npm
-library.
+library. Codex uses a version-pinned native runtime bridge; see
+[Codex installation](docs/codex-install.md).
 
 ## What and why
 
