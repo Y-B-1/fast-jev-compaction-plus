@@ -1,3 +1,19 @@
+diff --git a/codex-rs/core/BUILD.bazel b/codex-rs/core/BUILD.bazel
+index cb35952..0b4a8da 100644
+--- a/codex-rs/core/BUILD.bazel
++++ b/codex-rs/core/BUILD.bazel
+@@ -18,7 +18,10 @@ codex_rust_crate(
+         "//codex-rs/windows-sandbox-rs:codex-windows-managed-deny-probe",
+         "//codex-rs/windows-sandbox-rs:codex-windows-sandbox-setup",
+     ],
+-    integration_compile_data_extra = glob(["assets/**"]),
++    integration_compile_data_extra = glob(["assets/**"]) + [
++        "src/compact_jev/edits.rs",
++        "src/compact_jev_tests.rs",
++    ],
+     integration_test_timeout = "long",
+     run_tests_with_wine_exec = True,
+     rustc_env = {
 diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
 index a937b39..cfd5781 100644
 --- a/codex-rs/core/src/compact.rs
@@ -47,12 +63,11 @@ index a937b39..cfd5781 100644
              compaction_response_id: Some(compaction_response.response_id),
 diff --git a/codex-rs/core/src/compact_jev.rs b/codex-rs/core/src/compact_jev.rs
 new file mode 100644
-index 0000000..ebf30a3
+index 0000000..4040775
 --- /dev/null
 +++ b/codex-rs/core/src/compact_jev.rs
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,128 @@
 +//! Optional selective tool-output compaction. The adapter cannot replace conversation items.
-+use std::collections::HashSet;
 +use std::path::Path;
 +use std::process::Stdio;
 +use std::sync::Arc;
@@ -62,14 +77,10 @@ index 0000000..ebf30a3
 +use crate::session::session::Session;
 +use crate::session::turn_context::TurnContext;
 +use codex_analytics::CompactionTrigger;
-+use codex_history::ResponseItemEnvelope;
 +use codex_protocol::error::CodexErr;
 +use codex_protocol::error::Result as CodexResult;
 +use codex_protocol::items::ContextCompactionItem;
 +use codex_protocol::items::TurnItem;
-+use codex_protocol::models::FunctionCallOutputBody;
-+use codex_protocol::models::ResponseItem;
-+use serde::Deserialize;
 +use serde_json::json;
 +use tokio::io::AsyncReadExt;
 +use tokio::io::AsyncWriteExt;
@@ -77,77 +88,10 @@ index 0000000..ebf30a3
 +
 +const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 +const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-+const MAX_OUTPUT_BYTES: usize = 40_000;
-+const RECENT_ITEMS: usize = 6;
-+
-+#[derive(Deserialize)]
-+struct AdapterResponse {
-+    version: u32,
-+    #[serde(default)]
-+    skip: bool,
-+    #[serde(default)]
-+    edits: Vec<OutputEdit>,
-+}
-+
-+#[derive(Deserialize)]
-+#[serde(deny_unknown_fields)]
-+struct OutputEdit {
-+    index: usize,
-+    output: String,
-+}
-+
-+/// Validates every edit before changing any item, preserving all IDs and metadata.
-+fn apply_edits(items: &mut [ResponseItemEnvelope], response: AdapterResponse) -> bool {
-+    if response.version != 1 || response.skip || response.edits.is_empty() {
-+        return false;
-+    }
-+    let mut seen = HashSet::new();
-+    for edit in &response.edits {
-+        if edit.index == 0
-+            || edit.index >= items.len().saturating_sub(RECENT_ITEMS)
-+            || !seen.insert(edit.index)
-+            || edit.output.len() > MAX_OUTPUT_BYTES
-+        {
-+            return false;
-+        }
-+        let (call_id, original, custom) = match &items[edit.index].item {
-+            ResponseItem::FunctionCallOutput {
-+                call_id: Some(call_id), output, ..
-+            } => (call_id, &output.body, false),
-+            ResponseItem::CustomToolCallOutput { call_id, output, .. } => {
-+                (call_id, &output.body, true)
-+            }
-+            _ => return false,
-+        };
-+        let FunctionCallOutputBody::Text(original) = original else {
-+            return false;
-+        };
-+        if edit.output.len() >= original.len()
-+            || !items[..edit.index].iter().any(|envelope| match &envelope.item {
-+                ResponseItem::FunctionCall { call_id: earlier, .. } => {
-+                    !custom && earlier == call_id
-+                }
-+                ResponseItem::CustomToolCall { call_id: earlier, status, .. } => {
-+                    custom && earlier == call_id
-+                        && status.as_deref().is_none_or(|status| status == "completed")
-+                }
-+                _ => false,
-+            })
-+        {
-+            return false;
-+        }
-+    }
-+    for edit in response.edits {
-+        match &mut items[edit.index].item {
-+            ResponseItem::FunctionCallOutput { output, .. }
-+            | ResponseItem::CustomToolCallOutput { output, .. } => {
-+                output.body = FunctionCallOutputBody::Text(edit.output);
-+            }
-+            _ => unreachable!("all edits were validated"),
-+        }
-+    }
-+    true
-+}
++#[path = "compact_jev/edits.rs"]
++mod edits;
++use edits::AdapterResponse;
++use edits::apply_edits;
 +
 +async fn call_adapter(path: &Path, request: Vec<u8>) -> Option<AdapterResponse> {
 +    if request.len() > MAX_REQUEST_BYTES {
@@ -213,10 +157,10 @@ index 0000000..ebf30a3
 +        response = call_adapter(path, request) => response,
 +        _ = cancellation.cancelled() => return Err(CodexErr::TurnAborted),
 +    };
-+    let Some(response) = response else { return Ok(false) };
 +    if cancellation.is_cancelled() {
 +        return Err(CodexErr::TurnAborted);
 +    }
++    let Some(response) = response else { return Ok(false) };
 +    let before_bytes = serde_json::to_vec(&raw).map(|bytes| bytes.len()).unwrap_or_default();
 +    if !apply_edits(&mut items, response) {
 +        return Ok(false);
@@ -225,13 +169,22 @@ index 0000000..ebf30a3
 +        .map(|bytes| bytes.len()).unwrap_or_default();
 +    // Steering or another accepted update during the subprocess invalidates its indices.
 +    let current = sess.clone_history().await;
++    if cancellation.is_cancelled() {
++        return Err(CodexErr::TurnAborted);
++    }
 +    if current.annotated_items() != history.annotated_items() {
 +        return Ok(false);
 +    }
 +    let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
 +    sess.emit_turn_item_started(turn, &compaction_item).await;
 +    let reference = sess.reference_context_item().await;
++    if cancellation.is_cancelled() {
++        return Err(CodexErr::TurnAborted);
++    }
 +    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
++    if cancellation.is_cancelled() {
++        return Err(CodexErr::TurnAborted);
++    }
 +    sess.replace_compacted_history(items, reference, None, CompactedHistoryMetadata {
 +        message: String::new(), preserve_world_state: true, window_number, window_ids,
 +        compaction_response_id: None, compaction_model_hash: turn.model_info().comp_hash.clone(),
@@ -242,18 +195,103 @@ index 0000000..ebf30a3
 +    tracing::info!(before_bytes, after_bytes, "Jev selective compaction installed");
 +    Ok(true)
 +}
+diff --git a/codex-rs/core/src/compact_jev/edits.rs b/codex-rs/core/src/compact_jev/edits.rs
+new file mode 100644
+index 0000000..0d2fc72
+--- /dev/null
++++ b/codex-rs/core/src/compact_jev/edits.rs
+@@ -0,0 +1,82 @@
++//! Validates selective scalar-output edits without access to runtime state.
++use std::collections::HashSet;
++use codex_history::ResponseItemEnvelope;
++use codex_protocol::models::FunctionCallOutputBody;
++use codex_protocol::models::ResponseItem;
++use serde::Deserialize;
++
++const MAX_OUTPUT_BYTES: usize = 40_000;
++const RECENT_ITEMS: usize = 6;
++
++#[derive(Deserialize)]
++pub(crate) struct AdapterResponse {
++    version: u32,
++    #[serde(default)]
++    skip: bool,
++    #[serde(default)]
++    edits: Vec<OutputEdit>,
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct OutputEdit {
++    index: usize,
++    output: String,
++}
++
++/// Validates every edit before changing any item, preserving all IDs and metadata.
++pub(crate) fn apply_edits(items: &mut [ResponseItemEnvelope], response: AdapterResponse) -> bool {
++    if response.version != 1 || response.skip || response.edits.is_empty() {
++        return false;
++    }
++    let mut seen = HashSet::new();
++    for edit in &response.edits {
++        if edit.index == 0
++            || edit.index >= items.len().saturating_sub(RECENT_ITEMS)
++            || !seen.insert(edit.index)
++            || edit.output.len() > MAX_OUTPUT_BYTES
++        {
++            return false;
++        }
++        let (call_id, original, custom) = match &items[edit.index].item {
++            ResponseItem::FunctionCallOutput {
++                call_id: Some(call_id), output, ..
++            } => (call_id, &output.body, false),
++            ResponseItem::CustomToolCallOutput { call_id, output, .. } => {
++                (call_id, &output.body, true)
++            }
++            _ => return false,
++        };
++        let FunctionCallOutputBody::Text(original) = original else {
++            return false;
++        };
++        if edit.output.len() >= original.len()
++            || !items[..edit.index].iter().any(|envelope| match &envelope.item {
++                ResponseItem::FunctionCall { call_id: earlier, .. } => {
++                    !custom && earlier == call_id
++                }
++                ResponseItem::CustomToolCall { call_id: earlier, status, .. } => {
++                    custom && earlier == call_id
++                        && status.as_deref().is_none_or(|status| status == "completed")
++                }
++                _ => false,
++            })
++        {
++            return false;
++        }
++    }
++    for edit in response.edits {
++        match &mut items[edit.index].item {
++            ResponseItem::FunctionCallOutput { output, .. }
++            | ResponseItem::CustomToolCallOutput { output, .. } => {
++                output.body = FunctionCallOutputBody::Text(edit.output);
++            }
++            _ => unreachable!("all edits were validated"),
++        }
++    }
++    true
++}
 +
 +#[cfg(test)]
-+#[path = "compact_jev_tests.rs"]
++#[path = "../compact_jev_tests.rs"]
 +mod tests;
 diff --git a/codex-rs/core/src/compact_jev_tests.rs b/codex-rs/core/src/compact_jev_tests.rs
 new file mode 100644
-index 0000000..a0dd0a8
+index 0000000..87d26c2
 --- /dev/null
 +++ b/codex-rs/core/src/compact_jev_tests.rs
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,85 @@
 +use super::*;
 +use pretty_assertions::assert_eq;
++use serde_json::json;
 +
 +fn item(value: serde_json::Value) -> ResponseItemEnvelope {
 +    ResponseItemEnvelope::new(serde_json::from_value(value).unwrap())
@@ -516,14 +554,42 @@ index 0000000..41331bf
 +        and len(item["output"]) > 10
 +    ]
 +    print(json.dumps({"version": 1, "edits": edits}))
-diff --git a/codex-rs/core/tests/suite/compact_remote.rs b/codex-rs/core/tests/suite/compact_remote.rs
-index 76032f3..d51bf96 100644
---- a/codex-rs/core/tests/suite/compact_remote.rs
-+++ b/codex-rs/core/tests/suite/compact_remote.rs
-@@ -1696,3 +1696,56 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<
-     server.shutdown().await;
-     Ok(())
- }
+diff --git a/codex-rs/core/tests/jev_compaction.rs b/codex-rs/core/tests/jev_compaction.rs
+new file mode 100644
+index 0000000..8959fb5
+--- /dev/null
++++ b/codex-rs/core/tests/jev_compaction.rs
+@@ -0,0 +1,83 @@
++//! Focused native Jev compaction behavior and production edit-validation tests.
++#![allow(clippy::expect_used)]
++
++use anyhow::Result;
++use codex_login::CodexAuth;
++use codex_protocol::models::ResponseItem;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::Op;
++use core_test_support::responses;
++use core_test_support::responses::mount_sse_once;
++use core_test_support::responses::sse;
++use core_test_support::skip_if_no_network;
++use core_test_support::test_codex::TestCodexHarness;
++use core_test_support::test_codex::test_codex;
++use core_test_support::wait_for_event_with_timeout;
++use pretty_assertions::assert_eq;
++use serde_json::json;
++use std::time::Duration;
++
++// Compile the production validator itself, including its four behavior tests.
++#[path = "../src/compact_jev/edits.rs"]
++mod edits;
++
++async fn wait_for_turn_complete(codex: &codex_core::CodexThread) {
++    wait_for_event_with_timeout(
++        codex,
++        |event| matches!(event, EventMsg::TurnComplete(_)),
++        Duration::from_secs(30),
++    ).await;
++}
 +
 +// Run these fixture-backed integration tests with FAST_JEV_COMPACTION_ADAPTER set to
 +// the absolute executable tests/fixtures/jev_compaction_adapter.py path.

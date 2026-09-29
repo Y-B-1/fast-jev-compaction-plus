@@ -62,7 +62,7 @@ class InstallerTests(unittest.TestCase):
         class Server:
             def __init__(self):
                 self.calls = []
-                self.hooks = [{"pluginId": "fast-jev-compaction@fast-jev-compaction", "eventName": event, "handlerType": "command", "command": '"${PLUGIN_ROOT}/bin/codex-hook"', "key": event + '."key"', "currentHash": "sha256:test"} for event in installer.EVENTS]
+                self.hooks = [{"pluginId": "fast-jev-compaction@fast-jev-compaction", "eventName": event, "handlerType": "command", "sourcePath": "/fixture/plugin/hooks/codex.json", "command": '"/fixture/plugin/bin/codex-hook"', "key": event + '."key"', "currentHash": "sha256:test"} for event in installer.EVENTS]
                 self.hooks.append({"pluginId": "unrelated", "eventName": "stop"})
             def request(self, method, params):
                 self.calls.append((method, params))

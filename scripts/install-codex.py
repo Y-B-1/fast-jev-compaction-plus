@@ -104,7 +104,8 @@ def trust_hooks(server):
     if len(hooks) != 3 or {hook.get("eventName") for hook in hooks} != EVENTS:
         raise ValueError("Expected exactly the three reviewed fast-jev-compaction hooks")
     for hook in hooks:
-        if hook.get("handlerType") != "command" or hook.get("command") != '"${PLUGIN_ROOT}/bin/codex-hook"' or not hook.get("currentHash"):
+        expected = '"' + str(Path(hook.get("sourcePath", "")).parent.parent / "bin/codex-hook") + '"'
+        if hook.get("handlerType") != "command" or hook.get("command") != expected or not hook.get("currentHash"):
             raise ValueError("Unexpected fast-jev-compaction hook definition")
     for hook in hooks:
         prefix = "hooks.state." + json.dumps(hook["key"])
