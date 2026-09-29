@@ -1,0 +1,579 @@
+diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
+index a937b39..cfd5781 100644
+--- a/codex-rs/core/src/compact.rs
++++ b/codex-rs/core/src/compact.rs
+@@ -77,6 +77,7 @@ pub(crate) enum InitialContextInjection {
+ /// `CompactedItem`, ensuring the live and persisted histories remain identical.
+ pub(crate) struct CompactedHistoryMetadata {
+     pub(crate) message: String,
++    pub(crate) preserve_world_state: bool,
+     pub(crate) window_number: u64,
+     pub(crate) window_ids: AutoCompactWindowIds,
+     pub(crate) compaction_response_id: Option<String>,
+@@ -193,14 +194,18 @@ async fn run_compact_task_inner(
+             return Err(error);
+         }
+     }
+-    let result = run_compact_task_inner_impl(
+-        Arc::clone(&sess),
+-        Arc::clone(&turn_context),
+-        input,
+-        initial_context_injection,
+-        compaction_metadata,
+-    )
+-    .await;
++    let result = if crate::compact_jev::try_compact(&sess, &turn_context, trigger).await? {
++        Ok(String::new())
++    } else {
++        run_compact_task_inner_impl(
++            Arc::clone(&sess),
++            Arc::clone(&turn_context),
++            input,
++            initial_context_injection,
++            compaction_metadata,
++        )
++        .await
++    };
+     let status = compaction_status_from_result(&result);
+     let codex_error = result.as_ref().err();
+     if result.is_ok() {
+@@ -382,6 +387,7 @@ async fn run_compact_task_inner_impl(
+         world_state_baseline,
+         CompactedHistoryMetadata {
+             message: summary_text,
++            preserve_world_state: false,
+             window_number,
+             window_ids,
+             compaction_response_id: Some(compaction_response.response_id),
+diff --git a/codex-rs/core/src/compact_jev.rs b/codex-rs/core/src/compact_jev.rs
+new file mode 100644
+index 0000000..ebf30a3
+--- /dev/null
++++ b/codex-rs/core/src/compact_jev.rs
+@@ -0,0 +1,195 @@
++//! Optional selective tool-output compaction. The adapter cannot replace conversation items.
++use std::collections::HashSet;
++use std::path::Path;
++use std::process::Stdio;
++use std::sync::Arc;
++use std::time::Duration;
++
++use crate::compact::CompactedHistoryMetadata;
++use crate::session::session::Session;
++use crate::session::turn_context::TurnContext;
++use codex_analytics::CompactionTrigger;
++use codex_history::ResponseItemEnvelope;
++use codex_protocol::error::CodexErr;
++use codex_protocol::error::Result as CodexResult;
++use codex_protocol::items::ContextCompactionItem;
++use codex_protocol::items::TurnItem;
++use codex_protocol::models::FunctionCallOutputBody;
++use codex_protocol::models::ResponseItem;
++use serde::Deserialize;
++use serde_json::json;
++use tokio::io::AsyncReadExt;
++use tokio::io::AsyncWriteExt;
++use tokio::process::Command;
++
++const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
++const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
++const MAX_OUTPUT_BYTES: usize = 40_000;
++const RECENT_ITEMS: usize = 6;
++
++#[derive(Deserialize)]
++struct AdapterResponse {
++    version: u32,
++    #[serde(default)]
++    skip: bool,
++    #[serde(default)]
++    edits: Vec<OutputEdit>,
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct OutputEdit {
++    index: usize,
++    output: String,
++}
++
++/// Validates every edit before changing any item, preserving all IDs and metadata.
++fn apply_edits(items: &mut [ResponseItemEnvelope], response: AdapterResponse) -> bool {
++    if response.version != 1 || response.skip || response.edits.is_empty() {
++        return false;
++    }
++    let mut seen = HashSet::new();
++    for edit in &response.edits {
++        if edit.index == 0
++            || edit.index >= items.len().saturating_sub(RECENT_ITEMS)
++            || !seen.insert(edit.index)
++            || edit.output.len() > MAX_OUTPUT_BYTES
++        {
++            return false;
++        }
++        let (call_id, original, custom) = match &items[edit.index].item {
++            ResponseItem::FunctionCallOutput {
++                call_id: Some(call_id), output, ..
++            } => (call_id, &output.body, false),
++            ResponseItem::CustomToolCallOutput { call_id, output, .. } => {
++                (call_id, &output.body, true)
++            }
++            _ => return false,
++        };
++        let FunctionCallOutputBody::Text(original) = original else {
++            return false;
++        };
++        if edit.output.len() >= original.len()
++            || !items[..edit.index].iter().any(|envelope| match &envelope.item {
++                ResponseItem::FunctionCall { call_id: earlier, .. } => {
++                    !custom && earlier == call_id
++                }
++                ResponseItem::CustomToolCall { call_id: earlier, status, .. } => {
++                    custom && earlier == call_id
++                        && status.as_deref().is_none_or(|status| status == "completed")
++                }
++                _ => false,
++            })
++        {
++            return false;
++        }
++    }
++    for edit in response.edits {
++        match &mut items[edit.index].item {
++            ResponseItem::FunctionCallOutput { output, .. }
++            | ResponseItem::CustomToolCallOutput { output, .. } => {
++                output.body = FunctionCallOutputBody::Text(edit.output);
++            }
++            _ => unreachable!("all edits were validated"),
++        }
++    }
++    true
++}
++
++async fn call_adapter(path: &Path, request: Vec<u8>) -> Option<AdapterResponse> {
++    if request.len() > MAX_REQUEST_BYTES {
++        return None;
++    }
++    let mut child = Command::new(path)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .kill_on_drop(true)
++        .spawn().ok()?;
++    let mut stdin = child.stdin.take()?;
++    let stdout = child.stdout.take()?;
++    let output = async {
++        let write = async move {
++            stdin.write_all(&request).await?;
++            stdin.shutdown().await
++        };
++        let read = async {
++            let mut bytes = Vec::new();
++            stdout.take((MAX_RESPONSE_BYTES + 1) as u64).read_to_end(&mut bytes).await?;
++            Ok::<_, std::io::Error>(bytes)
++        };
++        let (_, bytes) = tokio::try_join!(write, read).ok()?;
++        if bytes.len() > MAX_RESPONSE_BYTES || !child.wait().await.ok()?.success() {
++            return None;
++        }
++        serde_json::from_slice(&bytes).ok()
++    };
++    tokio::time::timeout(Duration::from_secs(90), output).await.ok().flatten()
++}
++
++/// Returns false on unavailable/invalid adapters so the native compactor remains the fallback.
++pub(crate) async fn try_compact(
++    sess: &Arc<Session>,
++    turn: &Arc<TurnContext>,
++    trigger: CompactionTrigger,
++) -> CodexResult<bool> {
++    let Some(path) = std::env::var_os("FAST_JEV_COMPACTION_ADAPTER") else {
++        return Ok(false);
++    };
++    let path = Path::new(&path);
++    if !path.is_absolute() {
++        return Ok(false);
++    }
++    let history = sess.clone_history().await;
++    let mut items = history.annotated_items().to_vec();
++    let raw = items.iter().map(|item| &item.item).collect::<Vec<_>>();
++    let Ok(request) = serde_json::to_vec(&json!({
++        "version": 1, "session_id": sess.thread_id.to_string(),
++        "turn_id": turn.sub_id, "cwd": turn.cwd,
++        "model": turn.model_info().slug,
++        "trigger": match trigger { CompactionTrigger::Manual => "manual", CompactionTrigger::Auto => "auto" },
++        "items": raw,
++    })) else { return Ok(false) };
++    let cancellation = {
++        let active = sess.active_turn.lock().await;
++        active.as_ref().and_then(|active| active.task.as_ref())
++            .map(|task| task.cancellation_token.child_token())
++            .unwrap_or_default()
++    };
++    let response = tokio::select! {
++        response = call_adapter(path, request) => response,
++        _ = cancellation.cancelled() => return Err(CodexErr::TurnAborted),
++    };
++    let Some(response) = response else { return Ok(false) };
++    if cancellation.is_cancelled() {
++        return Err(CodexErr::TurnAborted);
++    }
++    let before_bytes = serde_json::to_vec(&raw).map(|bytes| bytes.len()).unwrap_or_default();
++    if !apply_edits(&mut items, response) {
++        return Ok(false);
++    }
++    let after_bytes = serde_json::to_vec(&items.iter().map(|item| &item.item).collect::<Vec<_>>())
++        .map(|bytes| bytes.len()).unwrap_or_default();
++    // Steering or another accepted update during the subprocess invalidates its indices.
++    let current = sess.clone_history().await;
++    if current.annotated_items() != history.annotated_items() {
++        return Ok(false);
++    }
++    let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
++    sess.emit_turn_item_started(turn, &compaction_item).await;
++    let reference = sess.reference_context_item().await;
++    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
++    sess.replace_compacted_history(items, reference, None, CompactedHistoryMetadata {
++        message: String::new(), preserve_world_state: true, window_number, window_ids,
++        compaction_response_id: None, compaction_model_hash: turn.model_info().comp_hash.clone(),
++        reviewer_compaction_hash: None,
++    }).await;
++    sess.recompute_token_usage(turn).await;
++    sess.emit_turn_item_completed(turn, compaction_item).await;
++    tracing::info!(before_bytes, after_bytes, "Jev selective compaction installed");
++    Ok(true)
++}
++
++#[cfg(test)]
++#[path = "compact_jev_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/compact_jev_tests.rs b/codex-rs/core/src/compact_jev_tests.rs
+new file mode 100644
+index 0000000..a0dd0a8
+--- /dev/null
++++ b/codex-rs/core/src/compact_jev_tests.rs
+@@ -0,0 +1,84 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++fn item(value: serde_json::Value) -> ResponseItemEnvelope {
++    ResponseItemEnvelope::new(serde_json::from_value(value).unwrap())
++}
++
++fn history() -> Vec<ResponseItemEnvelope> {
++    let mut items = vec![
++        item(json!({"type":"message","role":"user","content":[{"type":"input_text","text":"preserve user"}]})),
++        item(json!({"type":"function_call","call_id":"old","name":"shell","arguments":"{}"})),
++        item(json!({"type":"function_call_output","call_id":"old","output":"original tool output"})),
++    ];
++    items.extend((0..6).map(|_| item(json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"preserve assistant"}]}))));
++    items
++}
++
++fn response(edits: serde_json::Value) -> AdapterResponse {
++    serde_json::from_value(json!({"version":1,"edits":edits})).unwrap()
++}
++
++#[test]
++fn edits_preserve_calls_prose_and_metadata() {
++    let mut items = history();
++    items[2].metadata = Some(codex_history::CodexHarnessMetadata {
++        compaction_output: true,
++        ..Default::default()
++    });
++    let original = items.clone();
++    assert!(apply_edits(&mut items, response(json!([{"index":2,"output":"pruned"}]))));
++    let mut expected = original;
++    if let ResponseItem::FunctionCallOutput { output, .. } = &mut expected[2].item {
++        output.body = FunctionCallOutputBody::Text("pruned".to_string());
++    }
++    assert_eq!(items, expected);
++}
++
++#[test]
++fn invalid_edits_are_atomic() {
++    for edits in [
++        json!([{"index":2,"output":"short"},{"index":1,"output":"invalid"}]),
++        json!([{"index":2,"output":"short"},{"index":2,"output":"other"}]),
++        json!([{"index":999,"output":"invalid"}]),
++        json!([{"index":3,"output":"recent"}]),
++        json!([{"index":2,"output":"replacement longer than the original tool output"}]),
++    ] {
++        let mut items = history();
++        let original = items.clone();
++        assert!(!apply_edits(&mut items, response(edits)));
++        assert_eq!(items, original);
++    }
++}
++
++#[test]
++fn orphan_and_structured_outputs_are_rejected() {
++    for replacement in [
++        json!({"type":"function_call_output","call_id":"orphan","output":"original tool output"}),
++        json!({"type":"function_call_output","call_id":"old","output":[{"type":"input_text","text":"structured"}]}),
++    ] {
++        let mut items = history();
++        items[2] = item(replacement);
++        assert!(!apply_edits(&mut items, response(json!([{"index":2,"output":"short"}]))));
++    }
++}
++
++#[test]
++fn custom_outputs_keep_success_and_require_completed_calls() {
++    let mut items = history();
++    items[1] = item(json!({"type":"custom_tool_call","call_id":"old","name":"apply_patch","input":"patch","status":"completed"}));
++    items[2] = item(json!({"type":"custom_tool_call_output","call_id":"old","output":"original custom output"}));
++    if let ResponseItem::CustomToolCallOutput { output, .. } = &mut items[2].item {
++        output.success = Some(true);
++    }
++    let mut expected = items.clone();
++    if let ResponseItem::CustomToolCallOutput { output, .. } = &mut expected[2].item {
++        output.body = FunctionCallOutputBody::Text("short".to_string());
++    }
++    assert!(apply_edits(&mut items, response(json!([{"index":2,"output":"short"}]))));
++    assert_eq!(items, expected);
++    if let ResponseItem::CustomToolCall { status, .. } = &mut items[1].item {
++        *status = Some("in_progress".to_string());
++    }
++    assert!(!apply_edits(&mut items, response(json!([{"index":2,"output":"x"}]))));
++}
+diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_remote_v2.rs
+index fcc6064..499c9a8 100644
+--- a/codex-rs/core/src/compact_remote_v2.rs
++++ b/codex-rs/core/src/compact_remote_v2.rs
+@@ -173,16 +173,20 @@ async fn run_remote_compact_task_inner(
+             return Err(error);
+         }
+     }
+-    let result = run_remote_compact_task_inner_impl(
+-        sess,
+-        step_context,
+-        fallback_step_context,
+-        client_session,
+-        initial_context_injection,
+-        compaction_metadata,
+-        &mut analytics_details,
+-    )
+-    .await;
++    let result = if crate::compact_jev::try_compact(sess, turn_context, trigger).await? {
++        Ok(())
++    } else {
++        run_remote_compact_task_inner_impl(
++            sess,
++            step_context,
++            fallback_step_context,
++            client_session,
++            initial_context_injection,
++            compaction_metadata,
++            &mut analytics_details,
++        )
++        .await
++    };
+     let status = compaction_status_from_result(&result);
+     let codex_error = result.as_ref().err();
+     if result.is_ok() {
+@@ -362,6 +366,7 @@ async fn run_remote_compact_task_inner_impl(
+         world_state_baseline,
+         CompactedHistoryMetadata {
+             message: String::new(),
++            preserve_world_state: false,
+             window_number: new_window_number,
+             window_ids: new_window_ids,
+             compaction_response_id: Some(compaction_response_id),
+diff --git a/codex-rs/core/src/compact_token_budget.rs b/codex-rs/core/src/compact_token_budget.rs
+index 3e6ce1b..5c18421 100644
+--- a/codex-rs/core/src/compact_token_budget.rs
++++ b/codex-rs/core/src/compact_token_budget.rs
+@@ -67,13 +67,16 @@ async fn run_compact_task_inner(
+         PreCompactHookOutcome::Stopped => return Err(CodexErr::TurnAborted),
+     }
+ 
+-    let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+-    sess.emit_turn_item_started(turn_context, &compaction_item)
+-        .await;
+-    sess.start_new_context_window(step_context, world_state)
+-        .await;
+-    sess.emit_turn_item_completed(turn_context, compaction_item)
+-        .await;
++    if !crate::compact_jev::try_compact(sess, turn_context, trigger).await? {
++        let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
++        sess.emit_turn_item_started(turn_context, &compaction_item)
++            .await;
++        sess.start_new_context_window(step_context, world_state)
++            .await;
++        sess.emit_turn_item_completed(turn_context, compaction_item)
++            .await;
++
++    }
+ 
+     let post_compact_outcome = run_post_compact_hooks(sess, turn_context, trigger).await;
+     if let PostCompactHookOutcome::Stopped = post_compact_outcome {
+diff --git a/codex-rs/core/src/guardian/review_session_tests.rs b/codex-rs/core/src/guardian/review_session_tests.rs
+index 0a2eaf9..9fa2f21 100644
+--- a/codex-rs/core/src/guardian/review_session_tests.rs
++++ b/codex-rs/core/src/guardian/review_session_tests.rs
+@@ -86,6 +86,7 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
+             /*world_state_baseline*/ None,
+             crate::compact::CompactedHistoryMetadata {
+                 message: String::new(),
++                preserve_world_state: false,
+                 window_number,
+                 window_ids,
+                 compaction_response_id: None,
+diff --git a/codex-rs/core/src/guardian/tests.rs b/codex-rs/core/src/guardian/tests.rs
+index 621d951..bb558ae 100644
+--- a/codex-rs/core/src/guardian/tests.rs
++++ b/codex-rs/core/src/guardian/tests.rs
+@@ -2651,6 +2651,7 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
+             /*world_state_baseline*/ None,
+             crate::compact::CompactedHistoryMetadata {
+                 message: String::new(),
++                preserve_world_state: false,
+                 window_number,
+                 window_ids,
+                 compaction_response_id: None,
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index 2595ce5..c850b80 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -238,6 +238,7 @@ pub use exec_policy::format_exec_policy_error_with_source;
+ pub use exec_policy::load_exec_policy;
+ pub use installation_id::resolve_installation_id;
+ pub mod compact;
++mod compact_jev;
+ mod memory_usage;
+ pub mod otel_init;
+ 
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 902d183..fbc7dba 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -4140,6 +4140,9 @@ impl Session {
+                 .map(|world_state| world_state.snapshot())
+                 .or_else(|| {
+                     let previous = state.history.world_state_checkpoint()?;
++                    if metadata.preserve_world_state {
++                        return Some(WorldStateSnapshot::from(&previous.state));
++                    }
+                     let mut retained = serde_json::Map::new();
+                     for contributor in self.services.extensions.context_contributors() {
+                         retained.extend(
+@@ -4638,6 +4641,7 @@ impl Session {
+             Some(world_state),
+             CompactedHistoryMetadata {
+                 message: String::new(),
++                preserve_world_state: false,
+                 window_number,
+                 window_ids,
+                 compaction_response_id: None,
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index 1562257..a7be76e 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -5689,6 +5689,7 @@ async fn settings_checkpoint_waits_for_accepted_settings_persistence() {
+             /*world_state_baseline*/ None,
+             CompactedHistoryMetadata {
+                 message: "summary".to_string(),
++                preserve_world_state: false,
+                 window_number,
+                 window_ids,
+                 compaction_response_id: None,
+@@ -5822,6 +5823,7 @@ async fn mcp_attribution_checkpoints_cover_batch_prefixes_compaction_and_restore
+             /*world_state_baseline*/ None,
+             CompactedHistoryMetadata {
+                 message: "summary".to_string(),
++                preserve_world_state: false,
+                 window_number,
+                 window_ids,
+                 compaction_response_id: None,
+@@ -5953,6 +5955,7 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
+                 with_baselines.then_some(Arc::clone(&world_state)),
+                 CompactedHistoryMetadata {
+                     message: String::new(),
++                    preserve_world_state: false,
+                     window_number,
+                     window_ids,
+                     compaction_response_id: None,
+diff --git a/codex-rs/core/tests/fixtures/jev_compaction_adapter.py b/codex-rs/core/tests/fixtures/jev_compaction_adapter.py
+new file mode 100755
+index 0000000..41331bf
+--- /dev/null
++++ b/codex-rs/core/tests/fixtures/jev_compaction_adapter.py
+@@ -0,0 +1,17 @@
++#!/usr/bin/env python3
++"""Native-compaction fixture: selected by the test runner, never changes process environment."""
++import json
++import sys
++request = json.load(sys.stdin)
++items = request["items"]
++if any("JEV_FALLBACK" in json.dumps(item) for item in items):
++    print(json.dumps({"version": 1, "skip": True}))
++else:
++    edits = [
++        {"index": index, "output": "JEV_PRUNED"}
++        for index, item in enumerate(items[:-6])
++        if item.get("type") == "function_call_output"
++        and isinstance(item.get("output"), str)
++        and len(item["output"]) > 10
++    ]
++    print(json.dumps({"version": 1, "edits": edits}))
+diff --git a/codex-rs/core/tests/suite/compact_remote.rs b/codex-rs/core/tests/suite/compact_remote.rs
+index 76032f3..d51bf96 100644
+--- a/codex-rs/core/tests/suite/compact_remote.rs
++++ b/codex-rs/core/tests/suite/compact_remote.rs
+@@ -1696,3 +1696,56 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<
+     server.shutdown().await;
+     Ok(())
+ }
++
++// Run these fixture-backed integration tests with FAST_JEV_COMPACTION_ADAPTER set to
++// the absolute executable tests/fixtures/jev_compaction_adapter.py path.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn jev_native_compaction_preserves_history_without_model_request() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    if std::env::var_os("FAST_JEV_COMPACTION_ADAPTER").is_none() {
++        return Ok(());
++    }
++    let harness = TestCodexHarness::with_builder(
++        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
++    ).await?;
++    let codex = harness.test().codex.clone();
++    let mut history = vec![
++        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"JEV_USER_PROSE"}]}),
++        json!({"type":"function_call","call_id":"jev-old","name":"exec_command","arguments":"{}"}),
++        json!({"type":"function_call_output","call_id":"jev-old","output":"old large tool output that Jev can shorten"}),
++    ];
++    history.extend((0..6).map(|_| json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"JEV_ASSISTANT_PROSE"}]})));
++    codex.inject_response_items(history.into_iter().map(serde_json::from_value).collect::<serde_json::Result<Vec<ResponseItem>>>()?).await?;
++    let model = mount_sse_once(harness.server(), responses::sse_completed("after-jev")).await;
++    codex.submit(Op::Compact).await?;
++    wait_for_turn_complete(&codex).await;
++    assert!(model.requests().is_empty(), "selective compaction must not call the model");
++    harness.test().submit_turn("continue after Jev").await?;
++    let request = model.single_request();
++    assert!(request.body_contains_text("JEV_USER_PROSE"));
++    assert!(request.body_contains_text("JEV_ASSISTANT_PROSE"));
++    assert_eq!(request.function_call_output_text("jev-old"), Some("JEV_PRUNED".to_string()));
++    assert_eq!(request.inputs_of_type("function_call").len(), 1);
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn jev_native_compaction_skip_uses_builtin_fallback() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    if std::env::var_os("FAST_JEV_COMPACTION_ADAPTER").is_none() {
++        return Ok(());
++    }
++    let harness = TestCodexHarness::with_builder(
++        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
++    ).await?;
++    let codex = harness.test().codex.clone();
++    codex.inject_response_items(vec![serde_json::from_value(json!({"type":"message","role":"user","content":[{"type":"input_text","text":"JEV_FALLBACK"}]}))?]).await?;
++    let model = mount_sse_once(harness.server(), sse(vec![
++        json!({"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"NATIVE_FALLBACK"}}),
++        responses::ev_completed("jev-fallback"),
++    ])).await;
++    codex.submit(Op::Compact).await?;
++    wait_for_turn_complete(&codex).await;
++    assert_eq!(model.single_request().inputs_of_type("compaction_trigger").len(), 1);
++    Ok(())
++}
