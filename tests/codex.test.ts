@@ -50,4 +50,25 @@ describe('Codex compaction adapter', () => {
     expect(result.edits[0]?.index).toBe(2);
     expect(original[2]).toHaveProperty('success', false);
   });
+
+  it('reports unchanged bytes when savings fall below the configured minimum', async () => {
+    const result = await compactCodexItems(items(), discardResults, { minReductionRatio: 1 });
+    expect(result.edits).toEqual([]);
+    expect(result.stats.bytesAfter).toBe(result.stats.bytesBefore);
+  });
+
+  it('rejects an invalid minimum before making a Jev request', async () => {
+    let requested = false;
+    const jev: JevAsker = { async ask() { requested = true; throw new Error('must not request'); } };
+    await expect(compactCodexItems(items(), jev, { minReductionRatio: 2 })).rejects.toThrow(RangeError);
+    expect(requested).toBe(false);
+  });
+
+  it('preserves output from an unfinished custom call', async () => {
+    const original = items();
+    original[1] = { type: 'custom_tool_call', call_id: 'old', name: 'apply_patch', input: 'fixture patch', status: 'in_progress' } as never;
+    original[2] = { type: 'custom_tool_call_output', call_id: 'old', output: 'partial result'.repeat(3000) } as never;
+    expect((await compactCodexItems(original, discardResults)).edits).toEqual([]);
+  });
+
 });

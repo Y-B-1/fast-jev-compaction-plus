@@ -21,6 +21,8 @@ export async function compactCodexItems(
   jev: JevAsker,
   options: CompactOptions & { minReductionRatio?: number } = {},
 ): Promise<CodexResult> {
+  const minimum = options.minReductionRatio ?? 0.25;
+  if (!Number.isFinite(minimum) || minimum < 0 || minimum > 1) throw new RangeError('minReductionRatio must be between 0 and 1');
   const messages: Message[] = items.map((item) => ({ role: item.role === 'user' ? 'user' : 'assistant', text: text(item), toolUses: [] }));
   const calls = new Map<string, number>();
   const outputs = new Map<string, number>();
@@ -41,6 +43,7 @@ export async function compactCodexItems(
     if (callIndex === undefined || callIndex >= outputIndex || ambiguous.has(id) || typeof output.output !== 'string') continue;
     const call = items[callIndex];
     if ((call.type === 'custom_tool_call') !== (output.type === 'custom_tool_call_output')) continue;
+    if (call.type === 'custom_tool_call' && call.status !== undefined && call.status !== null && call.status !== 'completed') continue;
     // Preserve raw arguments as context rather than guessing an argument schema.
     messages[callIndex].toolUses = [{ tool_use_id: id, tool: String(call.name ?? 'tool'), input: { arguments: call.arguments ?? call.input }, text: output.output, isError: output.success === false }];
     messages[outputIndex].toolResults = [{ tool_use_id: id, text: output.output, isError: output.success === false }];
@@ -65,8 +68,6 @@ export async function compactCodexItems(
   const replacement = items.map((item) => ({ ...item }));
   for (const edit of edits) replacement[edit.index].output = edit.output;
   const bytesAfter = Buffer.byteLength(JSON.stringify(replacement));
-  const minimum = options.minReductionRatio ?? 0.25;
-  if (!Number.isFinite(minimum) || minimum < 0 || minimum > 1) throw new RangeError('minReductionRatio must be between 0 and 1');
   const accepted = bytesBefore > 0 && (bytesBefore - bytesAfter) / bytesBefore >= minimum;
   return {
     version: 1,

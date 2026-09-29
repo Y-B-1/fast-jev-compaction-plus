@@ -62,3 +62,6 @@ To remove the custom runtime, exit the desktop app, run `launchctl bootout gui/$
 `~/Library/LaunchAgents/ai.fast-jev.codex-runtime.plist`, run
 `launchctl unsetenv CODEX_CLI_PATH`, and launch the signed app normally. Existing sessions remain readable
 by stock Codex because the bridge stores native response items.
+
+The adapter retains the repository MIT license. The derived Codex runtime
+retains upstream Apache-2.0 licensing and notices, included with the runtime.
