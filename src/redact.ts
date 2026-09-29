@@ -28,8 +28,12 @@ const PATTERNS: RegExp[] = [
   // NAME=value env-style assignment where NAME looks like a secret and the
   // value is a plausible opaque token (avoids matching e.g. `MODE=production`).
   /\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)S?=\S{6,}/g,
-  // Opaque base64-looking runs long enough to be a secret rather than prose.
-  /\b(?=[A-Za-z0-9+/=]{32,}\b)(?=[A-Za-z0-9+/=]*[A-Za-z])(?=[A-Za-z0-9+/=]*[0-9])[A-Za-z0-9+/]{32,}={0,2}\b/g,
+  // Opaque base64-looking runs long enough to be a secret rather than prose:
+  // 40+ chars with upper case, lower case and a digit. Single-case runs (git
+  // SHAs, hex digests), anything touching a `/` (file paths), and a lockfile's
+  // `sha512-` integrity value are left alone, so ordinary tool output is not
+  // blanked (and still archived verbatim).
+  /(?<![A-Za-z0-9+/])(?<!sha(?:1|256|384|512)-)(?=[A-Za-z0-9+]*[a-z])(?=[A-Za-z0-9+]*[A-Z])(?=[A-Za-z0-9+]*[0-9])[A-Za-z0-9+]{40,}={0,2}(?![A-Za-z0-9+/=])/g,
 ];
 
 /** Replaces credential-shaped substrings in `text` with a fixed placeholder. */

@@ -46,6 +46,23 @@ describe('redactText', () => {
     expect(redactText(text, undefined)).toBe(text);
   });
 
+  it('leaves git SHAs, hex digests, paths and lockfile integrity hashes untouched', () => {
+    for (const text of [
+      'commit 3bfad06e1c2d4f5a6b7c8d9e0f1a2b3c4d5e6f7a',
+      'sha256 E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855',
+      '/Users/yusri/Documents/Claude/Orchestra2/notes/Session2026Log/Entry42.md',
+      '"integrity": "sha512-Xk1pQmZ3v9Lr4TtY8wBn2Hc6Jd0Fs5Ga7Ke1Mu3Nq9Rp4Sx8Vy2Wz6AbCdEfGhIjKlMnOpQrStUvWx12+AbCd=="',
+    ]) {
+      expect(redactText(text, undefined)).toBe(text);
+    }
+  });
+
+  it('still redacts a long mixed-case opaque token', () => {
+    expect(redactText('token=Xk1pQmZ3v9Lr4TtY8wBn2Hc6Jd0Fs5Ga7Ke1Mu3Nq9R end', undefined)).toBe(
+      'token=[REDACTED] end',
+    );
+  });
+
   it('redacts an exact match of the hook\'s own API key even in a non-standard shape', () => {
     expect(redactText('using key myCustom.key-42', 'myCustom.key-42')).toBe('using key [REDACTED]');
   });

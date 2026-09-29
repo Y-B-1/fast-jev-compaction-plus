@@ -263,12 +263,21 @@ describe('archiveWriter', () => {
     expect(stub.files.get(path!)?.length).toBe(5000);
   });
 
-  it('never archives text that looks like a credential', async () => {
+  it('archives text with credentials redacted, rather than skipping it', async () => {
     const stub = fsStub();
     const writer = archiveWriter(stub);
-    expect(writer.cite('toolu_2', 'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI7K7MDENG')).toBeUndefined();
+    const path = writer.cite('toolu_2', 'ok\nAWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI7K7MDENG\ndone');
     await writer.flush();
-    expect(stub.files.size).toBe(0);
+    expect(stub.files.get(path!)).toBe('ok\n[REDACTED]\ndone');
+  });
+
+  it('archives git output and paths verbatim', async () => {
+    const stub = fsStub();
+    const writer = archiveWriter(stub);
+    const text = 'commit 3bfad06e1c2d4f5a6b7c8d9e0f1a2b3c4d5e6f7a\n/Users/yusri/Documents/Claude/Orchestra2/notes';
+    const path = writer.cite('toolu_3', text);
+    await writer.flush();
+    expect(stub.files.get(path!)).toBe(text);
   });
 
   it('writes nothing when nothing was cited', async () => {

@@ -330,9 +330,9 @@ export type ArchiveWriter = {
 
 /**
  * Saves what compaction drops to `.claude/fast-jev-compaction/`, so a detail
- * buried in a dropped call or result can still be read back later. Text that
- * looks like a credential is never written, matching what the Jev request
- * itself redacts.
+ * buried in a dropped call or result can still be read back later. The text is
+ * written with the same redaction the Jev request applies, so a credential in
+ * it is replaced by `[REDACTED]` rather than stored, and the rest is kept.
  */
 export function archiveWriter($: {
   fs: {
@@ -343,9 +343,9 @@ export function archiveWriter($: {
   const pending = new Map<string, string>();
   return {
     cite(toolUseId, text) {
-      if (!text || redactText(text, undefined) !== text) return undefined;
+      if (!text) return undefined;
       const path = `${ARCHIVE_DIR}/${toolUseId}.txt`;
-      pending.set(path, text);
+      pending.set(path, redactText(text, undefined));
       return path;
     },
     async flush() {
