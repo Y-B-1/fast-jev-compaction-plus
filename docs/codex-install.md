@@ -53,9 +53,11 @@ six recent items, regardless of library options.
 ## Runtime maintenance
 
 The patch is `runtime/codex-0.159.0.patch`, based on upstream commit
-`687a119f0fcaace47e1f1abcc77cec6c813fd6da`. GitHub Actions checks plugin tests,
-formats the native patch, runs focused native compaction tests, and builds
-the ARM64 runtime. Updating Codex needs a new checked patch and runtime;
+`687a119f0fcaace47e1f1abcc77cec6c813fd6da`. Build and check the patch locally
+with Rust 1.95.0. In the patched Codex checkout, run `just fmt`, then
+`FAST_JEV_COMPACTION_ADAPTER="$PWD/codex-rs/core/tests/fixtures/jev_compaction_adapter.py" just test -p codex-core --test jev_compaction --cargo-profile release`.
+In `codex-rs`, build with `cargo build --locked --release -p codex-cli --bin codex`.
+The repository has no GitHub Actions workflow. Updating Codex needs a new checked patch and runtime;
 the custom launcher does not silently switch to a stock binary.
 
 To remove the custom runtime, exit the desktop app, run `launchctl bootout gui/$(id -u)/ai.fast-jev.codex-runtime`, remove

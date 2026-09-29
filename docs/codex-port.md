@@ -18,6 +18,7 @@ Completion needs:
 - Native live-session compaction proof and enabled, trusted lifecycle hooks.
 - Honest distinction between current app process and configured next launch.
 
-Build cap: use GitHub Actions for Rust builds because the local host has no Rust
-toolchain and only about 8 GiB free. Preserve the installed signed application
-and all unrelated active sessions. Do not edit stored rollout files.
+Build cap: run all builds and checks locally. The user explicitly stopped cloud
+builds. Do not create pull requests or GitHub Actions workflows. Preserve the
+installed signed application and all unrelated active sessions. Do not edit
+stored rollout files.
