@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
-plugin_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+script_path=$0
+while test -L "$script_path"; do
+  target=$(readlink "$script_path")
+  case "$target" in
+    /*) script_path=$target ;;
+    *) script_path=$(dirname "$script_path")/$target ;;
+  esac
+done
+plugin_root=$(CDPATH= cd -- "$(dirname -- "$script_path")/.." && pwd)
 export FAST_JEV_COMPACTION_ADAPTER="$plugin_root/bin/codex-adapter"
 data_root="${FAST_JEV_DATA:-$HOME/.codex/fast-jev-compaction}"
 export FAST_JEV_NODE="${FAST_JEV_NODE:-$data_root/runtime/node}"

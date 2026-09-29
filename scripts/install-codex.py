@@ -93,6 +93,8 @@ class AppServer:
 
 
 def trust_hooks(server):
+    for feature in ("hooks", "plugins"):
+        server.request("config/value/write", {"keyPath": "features." + feature, "value": True, "mergeStrategy": "replace"})
     listed = server.request("hooks/list", {})
     entries = listed.get("data", [])
     if any(entry.get("errors") for entry in entries):
@@ -107,7 +109,6 @@ def trust_hooks(server):
         prefix = "hooks.state." + json.dumps(hook["key"])
         for field, value in (("trusted_hash", hook["currentHash"]), ("enabled", True)):
             server.request("config/value/write", {"keyPath": prefix + "." + field, "value": value, "mergeStrategy": "replace"})
-    server.request("config/value/write", {"keyPath": "features.hooks", "value": True, "mergeStrategy": "replace"})
 
 
 def install(args):
@@ -136,6 +137,7 @@ def install(args):
     for name in ("dist", "bin", "hooks", ".codex-plugin", ".agents", "runtime"):
         if not (source / name).is_dir():
             raise ValueError(f"Build or supply plugin directory first: {name}")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
     plugin.mkdir(parents=True, exist_ok=True)
     for name in ("dist", "bin", "hooks", ".codex-plugin", ".agents", "runtime"):
         shutil.copytree(source / name, plugin / name, dirs_exist_ok=True)

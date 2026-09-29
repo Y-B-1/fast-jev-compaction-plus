@@ -70,13 +70,13 @@ class InstallerTests(unittest.TestCase):
         server = Server()
         installer.trust_hooks(server)
         writes = [params for method, params in server.calls if method == "config/value/write"]
-        self.assertEqual(len(writes), 7)
+        self.assertEqual(len(writes), 8)
         self.assertTrue(all("unrelated" not in item["keyPath"] for item in writes))
         server.hooks[0]["command"] = "unexpected"
         server.calls.clear()
         with self.assertRaises(ValueError):
             installer.trust_hooks(server)
-        self.assertEqual(len(server.calls), 1)
+        self.assertEqual(len(server.calls), 3)
 
 
 if __name__ == "__main__":
