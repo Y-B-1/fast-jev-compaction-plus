@@ -52,3 +52,16 @@ The installer reuses private OpenRouter credentials, checks the binary SHA256
 and exact package version/architecture, uses native plugin/config APIs, and
 trusts only the three reviewed lifecycle hooks. Its runtime links to the
 signed desktop's helper resources without changing the signed bundle.
+
+## Local build boundary
+
+The release tag declares workspace version `0.159.0`, but its Cargo lockfile
+records 158 workspace packages as `0.0.0`. The patch normalizes only those
+internal version entries. Third-party versions, sources, and checksums stay
+unchanged. The locked ARM64 dependency fetch and Bazel lock metadata check
+then pass locally; the Bazel lockfile needs no change.
+
+All final builds and checks run locally. The GitHub Actions workflow was
+removed at the user's request. Native config APIs accept a 150,000-token
+automatic compaction limit while preserving the selected model. The installer
+retains any existing stricter limit.

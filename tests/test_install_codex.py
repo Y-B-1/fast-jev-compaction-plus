@@ -11,6 +11,24 @@ spec.loader.exec_module(installer)
 
 
 class InstallerTests(unittest.TestCase):
+    def test_early_compaction_preserves_a_stricter_limit(self):
+        class Server:
+            def __init__(self, limit):
+                self.limit = limit
+                self.writes = []
+            def request(self, method, params):
+                if method == "config/read":
+                    return {"config": {"model_auto_compact_token_limit": self.limit}}
+                self.writes.append(params)
+                self.limit = params["value"]
+                return {}
+        for initial, expected in ((None, 150000), (200000, 150000), (90000, 90000)):
+            with self.subTest(initial=initial):
+                server = Server(initial)
+                installer.early_compaction(server)
+                self.assertEqual(server.limit, expected)
+                self.assertEqual(len(server.writes), int(initial != expected))
+
     def runtime(self, root):
         (root / "bin").mkdir()
         (root / "bin/codex").write_bytes(b"test runtime")

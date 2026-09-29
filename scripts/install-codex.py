@@ -113,6 +113,12 @@ def trust_hooks(server):
             server.request("config/value/write", {"keyPath": prefix + "." + field, "value": value, "mergeStrategy": "replace"})
 
 
+def early_compaction(server):
+    current = server.request("config/read", {})["config"].get("model_auto_compact_token_limit")
+    if current is None or current > 150000:
+        server.request("config/value/write", {"keyPath": "model_auto_compact_token_limit", "value": 150000, "mergeStrategy": "replace"})
+
+
 def desktop_environment(home, launcher):
     label = "ai.fast-jev.codex-runtime"
     path = home / "Library/LaunchAgents" / (label + ".plist")
@@ -184,6 +190,7 @@ def install(args):
     server = AppServer(binary, env)
     try:
         trust_hooks(server)
+        early_compaction(server)
     finally:
         server.close()
     launcher = args.home / ".codex/bin/codex-jev"

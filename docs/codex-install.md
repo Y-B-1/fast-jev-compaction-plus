@@ -33,6 +33,9 @@ The signed application bundle stays unchanged.
 They record events in `~/.codex/fast-jev-compaction/hooks.jsonl`. Actual selective
 compaction runs inside the patched runtime after trusted `PreCompact` hooks.
 Automatic and manual compaction use the same adapter.
+The installer sets automatic compaction to 150,000 tokens, retaining any existing
+stricter limit. That is about 55% of the current 272,000-token model window;
+the setting controls compaction timing, not the provider's context capacity.
 
 The adapter proposes shorter strings for old completed tool outputs only.
 Codex checks every edit before installing the history. Calls, ordinary
