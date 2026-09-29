@@ -9,8 +9,8 @@ Claude Code keeps its existing plugin and hook configuration.
 
 1. Download the plugin and `codex-0.159.0-jev-macos-arm64` runtime from the same
    GitHub release. Extract both archives.
-2. Build the adapter in the plugin checkout with Node 22 or newer:
-   `npm ci --ignore-scripts && npm run build`.
+2. The release plugin archive includes the built adapter. For a Git checkout,
+   build it with Node 22: `npm ci --ignore-scripts && npm run build`.
 3. Run `python3 scripts/install-codex.py --runtime-dir /absolute/path/to/runtime`.
    The installer checks the runtime checksum, installs the native plugin,
    enables its three reviewed hooks, and creates `~/.codex/bin/codex-jev`.
@@ -57,9 +57,18 @@ six recent items, regardless of library options.
 
 The patch is `runtime/codex-0.159.0.patch`, based on upstream commit
 `687a119f0fcaace47e1f1abcc77cec6c813fd6da`. Build and check the patch locally
-with Rust 1.95.0. In the patched Codex checkout, run `just fmt`, then
-`FAST_JEV_COMPACTION_ADAPTER="$PWD/codex-rs/core/tests/fixtures/jev_compaction_adapter.py" just test -p codex-core --test jev_compaction --cargo-profile release`.
-In `codex-rs`, build with `cargo build --locked --release -p codex-cli --bin codex`.
+with Rust 1.95.0. The checked local build uses these settings to keep the
+first build within the laptop memory budget. In the patched Codex checkout:
+
+```bash
+export CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=3 RUST_MIN_STACK=8388608
+export CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_LTO=false
+export CARGO_PROFILE_RELEASE_STRIP=debuginfo CARGO_PROFILE_RELEASE_OPT_LEVEL=1
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+FAST_JEV_COMPACTION_ADAPTER="$PWD/codex-rs/core/tests/fixtures/jev_compaction_adapter.py" just test -p codex-core --test jev_compaction --cargo-profile release
+cd codex-rs
+cargo build --locked --release -p codex-cli --bin codex
+```
 The repository has no GitHub Actions workflow. Updating Codex needs a new checked patch and runtime;
 the custom launcher does not silently switch to a stock binary.
 
