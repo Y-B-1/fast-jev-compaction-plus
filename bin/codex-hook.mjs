@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 async function main() {
-  const chunks: Buffer[] = [];
+  const chunks = [];
   let bytes = 0;
   for await (const chunk of process.stdin) {
     bytes += chunk.length;

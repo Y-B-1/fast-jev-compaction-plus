@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import plistlib
 from pathlib import Path
 import selectors
 import shutil
@@ -111,6 +112,21 @@ def trust_hooks(server):
             server.request("config/value/write", {"keyPath": prefix + "." + field, "value": value, "mergeStrategy": "replace"})
 
 
+def desktop_environment(home, launcher):
+    label = "ai.fast-jev.codex-runtime"
+    path = home / "Library/LaunchAgents" / (label + ".plist")
+    payload = {"Label": label, "ProgramArguments": ["/bin/launchctl", "setenv", "CODEX_CLI_PATH", str(launcher)], "RunAtLoad": True}
+    if path.exists() and plistlib.loads(path.read_bytes()) != payload:
+        raise ValueError("Existing Jev desktop launch configuration differs; preserve it before reinstalling")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(plistlib.dumps(payload))
+    subprocess.run(payload["ProgramArguments"], check=True)
+    domain = "gui/" + str(os.getuid())
+    loaded = subprocess.run(["/bin/launchctl", "print", domain + "/" + label], capture_output=True)
+    if loaded.returncode:
+        subprocess.run(["/bin/launchctl", "bootstrap", domain, str(path)], check=True)
+
+
 def install(args):
     source = Path(__file__).resolve().parents[1]
     runtime = args.runtime_dir.resolve()
@@ -169,7 +185,9 @@ def install(args):
         trust_hooks(server)
     finally:
         server.close()
-    link(plugin / "bin/codex-with-jev", args.home / ".codex/bin/codex-jev")
+    launcher = args.home / ".codex/bin/codex-jev"
+    link(plugin / "bin/codex-with-jev", launcher)
+    desktop_environment(args.home, launcher)
     print(f"Installed fast-jev-compaction at {plugin}")
 
 

@@ -20,8 +20,10 @@ printing it. Otherwise configure `OPENROUTER_API_KEY` or create
 `~/.codex/fast-jev-compaction/credentials.json` with provider `openrouter` and
 an `apiKey` value. Keep that file private with mode `0600`.
 
-Use `~/.codex/bin/codex-jev` for CLI sessions. For the desktop app, launch the
-app with `CODEX_CLI_PATH` set to that launcher. The existing desktop process
+Use `~/.codex/bin/codex-jev` for CLI sessions. The installer sets
+`CODEX_CLI_PATH` for future desktop launches and restores it at login with
+`~/Library/LaunchAgents/ai.fast-jev.codex-runtime.plist`.
+`scripts/launch-codex.command` also starts the app with that launcher. The existing desktop process
 needs a normal exit and relaunch before it can use a different runtime.
 The signed application bundle stays unchanged.
 
@@ -56,6 +58,7 @@ formats the native patch, runs focused native compaction tests, and builds
 the ARM64 runtime. Updating Codex needs a new checked patch and runtime;
 the custom launcher does not silently switch to a stock binary.
 
-To remove the custom runtime, exit the desktop app, remove its custom launch
-setting, and launch the signed app normally. Existing sessions remain readable
+To remove the custom runtime, exit the desktop app, run `launchctl bootout gui/$(id -u)/ai.fast-jev.codex-runtime`, remove
+`~/Library/LaunchAgents/ai.fast-jev.codex-runtime.plist`, run
+`launchctl unsetenv CODEX_CLI_PATH`, and launch the signed app normally. Existing sessions remain readable
 by stock Codex because the bridge stores native response items.
