@@ -165,11 +165,20 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   return config;
 }
 
+/** Resolves after `ms`; rejects with the signal's reason when `signal` aborts. */
+export type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
+
 export type JevAskerOptions = {
   /** Deadline for each attempt. Default 20000 ms. */
   timeoutMs?: number;
   /** The hook's `next.signal`: ends a pending request when the dispatch ends. */
   signal?: AbortSignal;
+  /**
+   * The timer behind the deadline and the retry delay. The hook passes
+   * `$.clock.sleep`: its runtime has no `setTimeout`, `AbortSignal.timeout`
+   * or `AbortSignal.any`. Defaults to `setTimeout`, for use outside a hook.
+   */
+  sleep?: Sleep;
 };
 
 const JEV_TIMEOUT_MS = 20_000;
@@ -178,45 +187,63 @@ function abortReason(signal: AbortSignal | undefined): unknown {
   return signal?.reason ?? new Error('Jev request aborted');
 }
 
+type Timers = {
+  setTimeout: (fn: () => void, ms: number) => unknown;
+  clearTimeout: (timer: unknown) => void;
+};
+
+const timerSleep: Sleep = (ms, signal) =>
+  new Promise((resolve, reject) => {
+    // Not in the hook runtime's globals; only reached outside a hook.
+    const { setTimeout, clearTimeout } = globalThis as unknown as Timers;
+    if (signal?.aborted) return reject(abortReason(signal));
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortReason(signal));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+
 /**
  * Races `promise` against `timeoutMs` and `signal`. `$.http.fetch` takes no
  * signal of its own, so a hung call is abandoned rather than cancelled; what
- * matters is that the hook stops waiting on it. The hook runtime has no
- * `setTimeout`, so the deadline is an `AbortSignal.timeout`.
+ * matters is that the hook stops waiting on it. Once the race settles, the
+ * deadline's wait is cancelled too.
  */
-function bounded<T>(
+async function bounded<T>(
   promise: Promise<T>,
   timeoutMs: number,
   signal: AbortSignal | undefined,
   what: string,
+  sleep: Sleep,
 ): Promise<T> {
   // A call abandoned by a lost race may still reject later; that is expected.
   promise.catch(() => {});
-  const deadline = AbortSignal.timeout(timeoutMs);
-  const either = signal ? AbortSignal.any([signal, deadline]) : deadline;
-  let onAbort = () => {};
-  const cancelled = new Promise<never>((_resolve, reject) => {
-    onAbort = () => {
-      if (signal?.aborted) return reject(abortReason(signal));
+  if (signal?.aborted) throw abortReason(signal);
+  const stop = new AbortController();
+  const forward = () => stop.abort(abortReason(signal));
+  signal?.addEventListener('abort', forward, { once: true });
+  const deadline = sleep(timeoutMs, stop.signal).then(
+    () => {
       const error = new Error(`${what} timed out after ${timeoutMs} ms`);
       error.name = 'TimeoutError';
-      reject(error);
-    };
-    if (either.aborted) onAbort();
-    else either.addEventListener('abort', onAbort, { once: true });
-  });
-  return Promise.race([promise, cancelled]).finally(() => either.removeEventListener('abort', onAbort));
-}
-
-/** Waits `ms`, or rejects as soon as `signal` aborts. */
-function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
-  const done = AbortSignal.timeout(ms);
-  const either = signal ? AbortSignal.any([signal, done]) : done;
-  return new Promise((resolve, reject) => {
-    const onAbort = () => (signal?.aborted ? reject(abortReason(signal)) : resolve());
-    if (either.aborted) onAbort();
-    else either.addEventListener('abort', onAbort, { once: true });
-  });
+      throw error;
+    },
+    () => {
+      throw abortReason(signal);
+    },
+  );
+  deadline.catch(() => {});
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    signal?.removeEventListener('abort', forward);
+    if (!stop.signal.aborted) stop.abort();
+  }
 }
 
 /**
@@ -232,6 +259,7 @@ export function jevAsker(
 ): JevAsker {
   const timeoutMs = options.timeoutMs ?? JEV_TIMEOUT_MS;
   const { signal } = options;
+  const sleep = options.sleep ?? timerSleep;
   return {
     async ask(state, questions) {
       // The state carries transcript text and tool inputs verbatim, and each
@@ -248,6 +276,7 @@ export function jevAsker(
           timeoutMs,
           signal,
           'Jev request',
+          sleep,
         );
       let response = await attempt();
       if (!response.ok && isRetryableStatus(response.status)) {
@@ -459,6 +488,13 @@ export async function getApiKey(
   return undefined;
 }
 
+/** `$.clock.sleep` as a `Sleep`: the hook runtime's only timer. */
+function clockSleep($: {
+  clock: { sleep: (ms: number, options?: { signal?: AbortSignal }) => Promise<void> };
+}): Sleep {
+  return (ms, signal) => $.clock.sleep(ms, signal ? { signal } : undefined);
+}
+
 function log($: { ui: { log: (text: string) => void } }, text: string): void {
   try {
     $.ui.log(text);
@@ -523,7 +559,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
           return { status: response.status, ok: response.ok, text: response.text, headers: response.headers };
         },
         config.archiveResults ? archiveWriter($) : undefined,
-        { signal: next.signal },
+        { signal: next.signal, sleep: clockSleep($) },
       );
       if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) log($, line);
@@ -633,7 +669,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         },
         apiKey,
         configured.model,
-        { signal: next.signal },
+        { signal: next.signal, sleep: clockSleep($) },
       );
       const trimmed = await trimOutput(
         { command: e.command, goal: configured.goal ?? '', output: stdout },

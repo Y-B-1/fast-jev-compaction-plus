@@ -14,6 +14,14 @@ import { applyDecisions, collectToolCalls, decideCall, type Message } from '../s
 
 type SessionMessage = Message & { handle?: string };
 
+/** The engine's `$.clock`: a sleep that never elapses, only aborts. */
+const clock = {
+  sleep: (_ms: number, options?: { signal?: AbortSignal }) =>
+    new Promise<void>((_resolve, reject) =>
+      options?.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true }),
+    ),
+};
+
 function message(role: Message['role'], text: string, extra: Partial<SessionMessage> = {}): SessionMessage {
   return { role, text, toolUses: [], ...extra };
 }
@@ -208,6 +216,35 @@ describe('compactSession', () => {
     await expect(pending).rejects.toThrow(/dispatch ended/);
   });
 
+  it('bounds a Jev call with the injected sleep when the runtime has no AbortSignal.timeout or .any', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    const never = () => new Promise<never>(() => {});
+    const { timeout, any } = AbortSignal;
+    // The hook runtime (JavaScriptCore) has neither, nor setTimeout.
+    Object.assign(AbortSignal, { timeout: undefined, any: undefined });
+    const sleeps: number[] = [];
+    // Elapses at once for the 30 ms deadline; otherwise waits for the signal.
+    const sleep = (ms: number, signal?: AbortSignal) => {
+      sleeps.push(ms);
+      if (ms === 30) return Promise.resolve();
+      return new Promise<void>((_resolve, reject) =>
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true }),
+      );
+    };
+    try {
+      await expect(
+        compactSession(transcript(), config, never, undefined, { timeoutMs: 30, sleep }),
+      ).rejects.toThrow(/timed out after 30 ms/);
+      expect(sleeps).toContain(30);
+      const controller = new AbortController();
+      const aborted = compactSession(transcript(), config, never, undefined, { signal: controller.signal, sleep });
+      controller.abort(new Error('dispatch ended'));
+      await expect(aborted).rejects.toThrow(/dispatch ended/);
+    } finally {
+      Object.assign(AbortSignal, { timeout, any });
+    }
+  });
+
   it('retries a 429 or 5xx once, and not a 4xx', async () => {
     const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
     const ok = jevFetch(() => 0.01);
@@ -338,6 +375,7 @@ describe('register', () => {
     const logs: string[] = [];
     const toasts: string[] = [];
     const $ = {
+      clock,
       http: {
         fetch: async (url: string, init?: { body?: string }) => fetchFn(url, init),
       },
@@ -593,6 +631,7 @@ describe('register: tool.call (Bash output trimming)', () => {
       settings: { read: async () => ({}) },
       ui: { log: () => {}, toast: () => {} },
       http: { fetch: fetchFn as any },
+      clock,
     };
   }
 
