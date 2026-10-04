@@ -247,6 +247,36 @@ describe('compactSession', () => {
     }
   });
 
+  it('skips a retry whose wait the hook budget cannot afford', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    let calls = 0;
+    const busy = async () => (++calls, { status: 429, ok: false, text: 'slow down', headers: { 'retry-after': '15' } });
+    const sleeps: number[] = [];
+    const sleep = async (ms: number) => void sleeps.push(ms);
+    await expect(
+      compactSession(transcript(), config, busy, undefined, { sleep, remainingMs: () => 9_000 }),
+    ).rejects.toThrow(/429/);
+    expect(calls).toBe(1);
+    expect(sleeps).not.toContain(15_000);
+    calls = 0;
+    await expect(
+      compactSession(transcript(), config, busy, undefined, { sleep, remainingMs: () => 60_000 }),
+    ).rejects.toThrow(/429/);
+    expect(calls).toBe(2);
+    expect(sleeps).toContain(15_000);
+  });
+
+  it('reports a failed deadline timer as itself, not as an abort', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    const never = () => new Promise<never>(() => {});
+    const sleep = async () => {
+      throw new Error('clock.sleep refused');
+    };
+    await expect(compactSession(transcript(), config, never, undefined, { sleep })).rejects.toThrow(
+      /clock.sleep refused/,
+    );
+  });
+
   it('retries a 429 or 5xx once, and not a 4xx', async () => {
     const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
     const ok = jevFetch(() => 0.01);
@@ -393,7 +423,7 @@ describe('register', () => {
     return { $, logs, toasts };
   }
   function next(signal: AbortSignal = new AbortController().signal) {
-    return Object.assign(async (e: unknown) => e, { signal });
+    return Object.assign(async (e: unknown) => e, { signal, budget: { ms: 10_000, remainingMs: 10_000 } });
   }
 
   it('does not request compaction from a subagent turn', async () => {
@@ -722,6 +752,6 @@ describe('register: tool.call (Bash output trimming)', () => {
   });
 
   function next(fn: () => Promise<unknown>) {
-    return Object.assign(fn, { signal: new AbortController().signal });
+    return Object.assign(fn, { signal: new AbortController().signal, budget: { ms: 10_000, remainingMs: 10_000 } });
   }
 });

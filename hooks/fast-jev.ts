@@ -179,9 +179,17 @@ export type JevAskerOptions = {
    * or `AbortSignal.any`. Defaults to `setTimeout`, for use outside a hook.
    */
   sleep?: Sleep;
+  /**
+   * The hook's remaining budget (`next.budget.remainingMs`). A `$.clock` wait
+   * is the one `$` call that spends it, so a retry delay it cannot afford is
+   * skipped rather than overrunning the hook.
+   */
+  remainingMs?: () => number;
 };
 
 const JEV_TIMEOUT_MS = 20_000;
+/** Budget a retry must leave for its own request and the hook's work after it. */
+const RETRY_MARGIN_MS = 2_000;
 
 function abortReason(signal: AbortSignal | undefined): unknown {
   return signal?.reason ?? new Error('Jev request aborted');
@@ -233,8 +241,8 @@ async function bounded<T>(
       error.name = 'TimeoutError';
       throw error;
     },
-    () => {
-      throw abortReason(signal);
+    (error: unknown) => {
+      throw signal?.aborted ? abortReason(signal) : error;
     },
   );
   deadline.catch(() => {});
@@ -260,6 +268,7 @@ export function jevAsker(
   const timeoutMs = options.timeoutMs ?? JEV_TIMEOUT_MS;
   const { signal } = options;
   const sleep = options.sleep ?? timerSleep;
+  const remainingMs = options.remainingMs ?? (() => Infinity);
   return {
     async ask(state, questions) {
       // The state carries transcript text and tool inputs verbatim, and each
@@ -281,8 +290,10 @@ export function jevAsker(
       let response = await attempt();
       if (!response.ok && isRetryableStatus(response.status)) {
         const delay = retryDelayMs(response.headers?.['retry-after']);
-        if (delay > 0) await sleep(delay, signal);
-        response = await attempt();
+        if (delay < remainingMs() - RETRY_MARGIN_MS) {
+          if (delay > 0) await sleep(delay, signal);
+          response = await attempt();
+        }
       }
       return parseJevResponse(response.status, response.ok, response.text);
     },
@@ -559,7 +570,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
           return { status: response.status, ok: response.ok, text: response.text, headers: response.headers };
         },
         config.archiveResults ? archiveWriter($) : undefined,
-        { signal: next.signal, sleep: clockSleep($) },
+        { signal: next.signal, sleep: clockSleep($), remainingMs: () => next.budget.remainingMs },
       );
       if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) log($, line);
@@ -669,10 +680,10 @@ export const register: Register = (on: On, options: PluginOptions) => {
         },
         apiKey,
         configured.model,
-        { signal: next.signal, sleep: clockSleep($) },
+        { signal: next.signal, sleep: clockSleep($), remainingMs: () => next.budget.remainingMs },
       );
       const trimmed = await trimOutput(
-        { command: e.command, goal: configured.goal ?? '', output: stdout },
+        { command: typeof e.command === 'string' ? e.command : '', goal: configured.goal ?? '', output: stdout },
         asker,
         { minChars: configured.jevPruneMinChars },
       );
