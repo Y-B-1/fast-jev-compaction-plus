@@ -53,7 +53,7 @@ class AppServer:
         self.process = subprocess.Popen([str(binary), "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, bufsize=0)
         self.sequence = 0
         self.buffer = b""
-        self.request("initialize", {"clientInfo": {"name": "fast-jev-installer", "version": "0.5.0"}, "capabilities": {"experimentalApi": True}})
+        self.request("initialize", {"clientInfo": {"name": "fast-jev-installer", "version": "0.5.1"}, "capabilities": {"experimentalApi": True}})
         self.send({"method": "initialized"})
 
     def send(self, message):
