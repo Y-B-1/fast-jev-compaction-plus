@@ -16,7 +16,9 @@ type SessionMessage = Message & { handle?: string };
 
 /** The engine's `$.clock`: a sleep that never elapses, only aborts. */
 const clock = {
+  calls: 0,
   sleep: (_ms: number, options?: { signal?: AbortSignal }) =>
+    ++clock.calls &&
     new Promise<void>((_resolve, reject) =>
       options?.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true }),
     ),
@@ -553,6 +555,8 @@ describe('register', () => {
   it('skips a below-minimum reduction instead of falling back for a manual /compact', async () => {
     const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 1 });
     const e = engine(jevFetch(() => 1));
+    // The runtime has no setTimeout: each Jev call must be timed by $.clock.
+    const before = clock.calls;
     const out = await hooks['session.compact']!(
       e.$,
       { trigger: 'manual', messages: transcript() },
@@ -561,6 +565,7 @@ describe('register', () => {
     expect(out).toEqual({
       skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled',
     });
+    expect(clock.calls).toBeGreaterThan(before);
   });
 
   it('always falls back when builtinFallback is set to always', async () => {
@@ -669,6 +674,7 @@ describe('register: tool.call (Bash output trimming)', () => {
       return { status: 200, ok: true, text: JSON.stringify({ answers }) };
     });
     const long = Array.from({ length: 60 }, (_, i) => `line ${i}`).join('\n');
+    const before = clock.calls;
     const out = (await hook(
       $,
       { command: 'npm test' },
@@ -676,6 +682,7 @@ describe('register: tool.call (Bash output trimming)', () => {
     )) as { result: { stdout: string } };
     expect(out.result.stdout.length).toBeLessThan(long.length);
     expect(out.result.stdout).toContain('fast-jev-compaction trimmed');
+    expect(clock.calls).toBeGreaterThan(before);
   });
 
   it('leaves a short Bash result untouched even when opted in', async () => {
