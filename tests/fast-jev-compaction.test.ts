@@ -689,7 +689,7 @@ describe('HTTP client', () => {
     expect(request.url).toBe('https://api.typesafe.ai/v1/systemone');
     expect(request.headers.authorization).toBe('Bearer k');
     expect(JSON.parse(request.body)).toEqual({
-      model: 'jev-1.13',
+      model: 'jev-latest',
       state: { a: 1 },
       questions: { q: { type: 'noul', instructions: 'x' } },
     });

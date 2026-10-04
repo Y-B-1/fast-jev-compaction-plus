@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
@@ -85,8 +85,8 @@
     "model": {
       "type": "string",
       "title": "Jev model",
-      "description": "TypeSafe Jev model name (default jev-1.13).",
-      "default": "jev-1.13"
+      "description": "TypeSafe Jev model name (default jev-latest).",
+      "default": "jev-latest"
     }
   },
   "author": {

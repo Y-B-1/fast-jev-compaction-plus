@@ -118,7 +118,7 @@ put it in a source file.
 | Option | Default | Description |
 | --- | --- | --- |
 | `apiKey` | `TYPESAFE_API_KEY` | TypeSafe API key (`compactMessages`/`JevClient`) |
-| `model` | `jev-1.13` | Jev model name |
+| `model` | `jev-latest` | Jev model name |
 | `baseUrl` | `https://api.typesafe.ai/v1/systemone` | System One endpoint |
 | `fetch` | native `fetch` | Injectable fetch implementation for tests |
 | `goal` | last 3 user prompts | Ongoing task description included in the state |

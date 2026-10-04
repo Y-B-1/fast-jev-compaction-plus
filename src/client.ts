@@ -9,7 +9,7 @@ function apiKeyFromEnv(): string {
 export interface JevClientOptions {
   /** Defaults to `TYPESAFE_API_KEY`. */
   apiKey?: string;
-  /** Defaults to `jev-1.13`. */
+  /** Defaults to `jev-latest`. */
   model?: string;
   /** Defaults to the System One endpoint. */
   baseUrl?: string;

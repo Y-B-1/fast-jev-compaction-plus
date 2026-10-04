@@ -69,7 +69,7 @@ describe('hook config', () => {
     expect(resolveHookConfig({})).toEqual({
       archiveResults: true,
       minReductionRatio: 0.25,
-      model: 'jev-1.13',
+      model: 'jev-latest',
       builtinFallback: 'auto',
       jevPruneBashOutput: false,
       jevPruneMinChars: 4_000,
