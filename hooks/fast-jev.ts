@@ -5,7 +5,6 @@ import type {
   SessionMessage,
   ToolResultSummary,
   ToolUseSummary,
-  TurnCompleteInput,
 } from 'claude-code';
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
@@ -37,18 +36,9 @@ export type BuiltinFallback = 'auto' | 'always' | 'never';
 
 const HOOK_DEFAULTS = {
   archiveResults: true,
-  compactAtPercent: 60,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
   builtinFallback: 'auto' as BuiltinFallback,
-  /**
-   * Turns to wait, after a compaction attempt that leaves the window still at
-   * or above `compactAtPercent`, before requesting another one. Without a
-   * cooldown, a round that Jev cannot usefully shrink (nothing left to prune,
-   * or a result too small to clear `minReductionRatio`) re-fires a paid Jev
-   * call on every following turn while the window sits at the threshold.
-   */
-  compactCooldownTurns: 3,
   /** Opt-in: trims a Bash command's stdout through Jev at tool.call time, before compaction ever sees it. Off by default — a second Jev call site of its own, see `jevPruneBashOutput`. */
   jevPruneBashOutput: false,
   /** stdout shorter than this is never sent to Jev for trimming. */
@@ -76,11 +66,9 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 export type HookConfig = CompactOptions & {
   apiKey?: string;
   archiveResults: boolean;
-  compactAtPercent: number;
   minReductionRatio: number;
   model: string;
   builtinFallback: BuiltinFallback;
-  compactCooldownTurns: number;
   jevPruneBashOutput: boolean;
   jevPruneMinChars: number;
 };
@@ -137,7 +125,6 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       typeof options['archiveResults'] === 'boolean'
         ? options['archiveResults']
         : HOOK_DEFAULTS.archiveResults,
-    compactAtPercent: optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent),
     minReductionRatio: optionNumber(
       options,
       'minReductionRatio',
@@ -145,10 +132,6 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
     builtinFallback: optionFallback(options),
-    compactCooldownTurns: Math.max(
-      0,
-      Math.floor(optionNumber(options, 'compactCooldownTurns', HOOK_DEFAULTS.compactCooldownTurns)),
-    ),
     jevPruneBashOutput:
       typeof options['jevPruneBashOutput'] === 'boolean'
         ? options['jevPruneBashOutput']
@@ -539,13 +522,6 @@ function notify(
 
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
-  let compacting = false;
-  // Turn index (not wall-clock time) a next compaction attempt may run at,
-  // set after an attempt that left the window at or above compactAtPercent.
-  // The usage check below still runs every turn, so a window that drops
-  // below the threshold on its own is not held back by the cooldown.
-  let nextAttemptAtTurn = 0;
-  let turnIndex = 0;
 
   on('session.compact', async ($, event, next) => {
     // A subagent's or a fork's own transcript is not the main conversation
@@ -608,38 +584,6 @@ export const register: Register = (on: On, options: PluginOptions) => {
       );
       return next(event);
     }
-  });
-
-  on('turn.complete', async ($, event: TurnCompleteInput, next) => {
-    // A subagent's turn is not the main conversation; requesting the main
-    // loop's compaction from it would target the wrong loop while the
-    // subagent's own turn still runs. Only a turn that actually answered
-    // should trigger auto-compaction: an aborted, refused or errored turn
-    // is not a point where the context has settled into something worth
-    // scoring speculatively.
-    const turn = ++turnIndex;
-    if (event.agentId || event.reason !== 'answer' || compacting) return next(event);
-    // Locked before the first await: two turns completing back to back must
-    // not both read `compacting` as false and both dispatch a compaction.
-    compacting = true;
-    try {
-      const { context } = await $.session.usage();
-      if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
-      // A previous attempt already ran and left the window at or above the
-      // threshold (nothing left to prune, or a reduction too small to keep);
-      // wait out the cooldown instead of re-asking Jev every single turn.
-      if (turn < nextAttemptAtTurn) return next(event);
-      nextAttemptAtTurn = turn + configured.compactCooldownTurns;
-      await $.session.compact();
-    } catch (error) {
-      log(
-        $,
-        `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`,
-      );
-    } finally {
-      compacting = false;
-    }
-    return next(event);
   });
 
   // Opt-in (see HOOK_DEFAULTS.jevPruneBashOutput): trims a Bash command's

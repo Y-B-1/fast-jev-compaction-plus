@@ -48,31 +48,36 @@ The plugin declares these `userConfig` values in
 
 | Option | Default |
 | --- | ---: |
-| `keepThreshold` | `0.5` |
+| `keepThreshold` | `0.15` |
+| `keepCallThreshold` | `0.05` |
 | `preserveRecentMessages` | `6` |
-| `compactAtPercent` | `60` |
+| `archiveResults` | `true` |
 | `minReductionRatio` | `0.25` |
 | `maxStateTokens` | `25000` |
-| `maxRequestTokens` | `30000` |
+| `maxRequestTokens` | `60000` |
 | `truncateHeadChars` | `300` |
-| `model` | `jev-latest` |
+| `resultPreviewChars` | `300` |
+| `salvageChars` | `300` |
+| `jevPruneBashOutput` | `false` |
+| `jevPruneMinChars` | `4000` |
+| `model` | `typesafe/jev-1.13` |
 
 The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
 through `TYPESAFE_API_KEY`. The environment variable is the recommended
 development setup.
 
-Every option except `apiKey`, `compactAtPercent`, `minReductionRatio` and
-`model` is passed straight to the library; see the root README for what they
-do. The `session.compact` hook runs the Jev requests concurrently. If Jev fails,
+Every option except `apiKey`, `archiveResults`, `minReductionRatio`,
+`jevPruneBashOutput`, `jevPruneMinChars` and `model` is passed straight to the
+library; see the root README for what they do. The `session.compact` hook runs the Jev requests concurrently. If Jev fails,
 the response is malformed, the key is unavailable, the history cannot be
 fitted into the state budget, or the estimated reduction is below
 `minReductionRatio`, the hook logs a fallback and delegates to Claude Code's
 built-in compaction. The outcome is shown as a toast and logged with the
 reduction, per-reason counts, state size and request count; a per-call
-`decisions:` line with both probabilities is logged for diagnosis. The
-`turn.complete` hook requests
-compaction when `context.percent` reaches `compactAtPercent`, with an
-in-flight guard.
+`decisions:` line with both probabilities is logged for diagnosis.
+The plugin installs no compaction trigger of its own: compaction runs whenever
+Claude Code compacts (its built-in auto-compact or a manual `/compact`), both
+of which go through the `session.compact` hook.
 
 ## Scope and caveat
 

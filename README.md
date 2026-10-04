@@ -128,8 +128,6 @@ put it in a source file.
 | `maxStateTokens` | `25000` | Estimated token ceiling for the state |
 | `maxRequestTokens` | `60000` | Estimated ceiling for state plus one batch of questions (Jev allows 64k) |
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
-| `compactAtPercent` | `60` | Context percentage at which `turn.complete` requests compaction |
-| `compactCooldownTurns` | `3` | Turns to wait after a compaction attempt that leaves the window still at or above `compactAtPercent`, before requesting another one |
 | `archiveResults` | `true` | Write the full text of a dropped tool call or result to `.claude/fast-jev-compaction/` and cite the file in the marker left in its place, so it can be `Read` or grepped back later; text that looks like a credential is never written |
 | `resultPreviewChars` | `300` | Characters from each end of a tool result quoted in its keep question; `0` disables |
 | `salvageChars` | `300` | Characters of identifiers and error lines recovered from the dropped part of a tool result and kept next to its truncation note; `0` disables |
@@ -179,7 +177,8 @@ claude plugin install fast-jev-compaction@fast-jev-compaction
 The install prompts for the plugin options (API key, thresholds, `truncateHeadChars`,
 …); leave them at their defaults to use `TYPESAFE_API_KEY` from the environment.
 Restart Claude Code or run `/reload-plugins`. From then on `/compact` (and
-auto-compaction) goes through Jev: the toast reads
+auto-compaction) goes through Jev. The plugin never starts a compaction itself; it
+runs whenever Claude Code compacts: the toast reads
 `fast-jev-compaction: kept N/M messages, no summary (…)` when the pruned history
 replaced the built-in summary, or `fallback to built-in summary (…)` when Jev
 could not remove enough (short sessions, or when it fails).

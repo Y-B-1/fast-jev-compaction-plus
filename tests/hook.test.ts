@@ -68,8 +68,6 @@ describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
     expect(resolveHookConfig({})).toEqual({
       archiveResults: true,
-      compactAtPercent: 60,
-      compactCooldownTurns: 3,
       minReductionRatio: 0.25,
       model: 'typesafe/jev-1.13',
       builtinFallback: 'auto',
@@ -77,7 +75,7 @@ describe('hook config', () => {
       jevPruneMinChars: 4_000,
     });
     expect(
-      resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
+      resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g' }),
     ).toEqual({
       apiKey: 'k',
       keepThreshold: 0.3,
@@ -85,8 +83,6 @@ describe('hook config', () => {
       model: 'jev-x',
       goal: 'g',
       archiveResults: true,
-      compactAtPercent: 60,
-      compactCooldownTurns: 3,
       minReductionRatio: 0.25,
       builtinFallback: 'auto',
       jevPruneBashOutput: false,
@@ -426,94 +422,31 @@ describe('register', () => {
     return Object.assign(async (e: unknown) => e, { signal, budget: { ms: 10_000, remainingMs: 10_000 } });
   }
 
-  it('does not request compaction from a subagent turn', async () => {
-    const hooks = registered({ compactAtPercent: 0 });
-    let compactCalls = 0;
-    const $ = {
-      session: {
-        usage: async () => ({ context: { percent: 100 } }),
-        compact: async () => {
-          compactCalls++;
-          return { messages: [] };
-        },
-      },
-      ui: { log: () => {} },
-    };
-    const n = next();
-    await hooks['turn.complete']!($, { agentId: 'sub-1', reason: 'answer' }, n);
-    expect(compactCalls).toBe(0);
-
-    await hooks['turn.complete']!($, { reason: 'answer' }, n);
-    expect(compactCalls).toBe(1);
+  it('installs no turn.complete hook, so compaction only runs when Claude Code compacts', () => {
+    expect(Object.keys(registered()).sort()).toEqual(['session.compact', 'tool.call']);
   });
 
-  it('does not request compaction from a turn that did not answer', async () => {
-    const hooks = registered({ compactAtPercent: 0 });
-    let compactCalls = 0;
-    const $ = {
-      session: {
-        usage: async () => ({ context: { percent: 100 } }),
-        compact: async () => {
-          compactCalls++;
-          return { messages: [] };
-        },
-      },
-      ui: { log: () => {} },
+  it('skips a 429 retry the hook budget from next.budget cannot afford', async () => {
+    const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 0 });
+    const run = async (remainingMs: number) => {
+      let calls = 0;
+      const e = engine(async () => (++calls, {
+        status: 429,
+        ok: false,
+        text: 'slow down',
+        headers: { 'retry-after': '0' },
+      }));
+      const n = Object.assign(async (x: unknown) => x, {
+        signal: new AbortController().signal,
+        budget: { ms: 10_000, remainingMs },
+      });
+      await hooks['session.compact']!(e.$, { trigger: 'manual', messages: transcript() }, n);
+      return calls;
     };
-    const n = next();
-    await hooks['turn.complete']!($, { reason: 'aborted' }, n);
-    await hooks['turn.complete']!($, { reason: 'error' }, n);
-    expect(compactCalls).toBe(0);
-
-    await hooks['turn.complete']!($, { reason: 'answer' }, n);
-    expect(compactCalls).toBe(1);
-  });
-
-  it('does not re-request compaction every turn while the window stays at the threshold', async () => {
-    const hooks = registered({ compactAtPercent: 0, compactCooldownTurns: 2 });
-    let compactCalls = 0;
-    const $ = {
-      session: {
-        usage: async () => ({ context: { percent: 100 } }),
-        compact: async () => {
-          compactCalls++;
-          return { messages: [] };
-        },
-      },
-      ui: { log: () => {} },
-    };
-    const n = next();
-    await hooks['turn.complete']!($, { reason: 'answer' }, n);
-    expect(compactCalls).toBe(1);
-    // Next turn while the window is still at the threshold: held off by the cooldown.
-    await hooks['turn.complete']!($, { reason: 'answer' }, n);
-    expect(compactCalls).toBe(1);
-    // Cooldown elapsed: the next turn may attempt again.
-    await hooks['turn.complete']!($, { reason: 'answer' }, n);
-    expect(compactCalls).toBe(2);
-  });
-
-  it('does not wait out the cooldown once the window drops below the threshold', async () => {
-    const hooks = registered({ compactAtPercent: 50, compactCooldownTurns: 5 });
-    let compactCalls = 0;
-    let percent = 100;
-    const $ = {
-      session: {
-        usage: async () => ({ context: { percent } }),
-        compact: async () => {
-          compactCalls++;
-          return { messages: [] };
-        },
-      },
-      ui: { log: () => {} },
-    };
-    const n = next();
-    await hooks['turn.complete']!($, { reason: 'answer' }, n);
-    expect(compactCalls).toBe(1);
-    percent = 20;
-    // Below compactAtPercent: the usage check itself skips, cooldown never consulted.
-    await hooks['turn.complete']!($, { reason: 'answer' }, n);
-    expect(compactCalls).toBe(1);
+    const roomy = await run(10_000);
+    expect(roomy).toBeGreaterThan(1);
+    // Same 429, but too little budget left to afford a retry: each Jev request is attempted once.
+    expect(await run(1_000)).toBeLessThan(roomy);
   });
 
   it('vetoes an interrupted dispatch instead of falling back to a summary', async () => {

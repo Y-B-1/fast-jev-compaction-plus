@@ -28,23 +28,11 @@
       "description": "Number of newest messages pinned from compaction.",
       "default": 6
     },
-    "compactAtPercent": {
-      "type": "number",
-      "title": "Compaction percentage",
-      "description": "Context percentage at which turn.complete requests compaction.",
-      "default": 60
-    },
     "archiveResults": {
       "type": "boolean",
       "title": "Archive dropped tool output",
       "description": "Write the full text of dropped tool calls and results to .claude/fast-jev-compaction/ and cite the file in the marker left in their place, so it can be read back.",
       "default": true
-    },
-    "compactCooldownTurns": {
-      "type": "number",
-      "title": "Compaction cooldown (turns)",
-      "description": "Turns to wait after a compaction attempt that leaves the window still at or above the compaction percentage, before requesting another one.",
-      "default": 3
     },
     "minReductionRatio": {
       "type": "number",
