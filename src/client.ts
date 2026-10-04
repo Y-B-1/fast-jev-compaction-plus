@@ -1,15 +1,15 @@
 import { buildJevRequest, isRetryableStatus, parseJevResponse, retryDelayMs } from './request.js';
 import type { JevAsker, JevQuestions, JevResponse, JevState } from './types.js';
 
-/** `OPENROUTER_API_KEY`, falling back to `TYPESAFE_API_KEY`; an empty string counts as unset. */
+/** `TYPESAFE_API_KEY`; an empty string counts as unset. */
 function apiKeyFromEnv(): string {
-  return process.env.OPENROUTER_API_KEY || process.env.TYPESAFE_API_KEY || '';
+  return process.env.TYPESAFE_API_KEY || '';
 }
 
 export interface JevClientOptions {
-  /** Defaults to `OPENROUTER_API_KEY`, falling back to `TYPESAFE_API_KEY`. */
+  /** Defaults to `TYPESAFE_API_KEY`. */
   apiKey?: string;
-  /** Defaults to `jev-latest`. */
+  /** Defaults to `jev-1.13`. */
   model?: string;
   /** Defaults to the System One endpoint. */
   baseUrl?: string;
@@ -91,7 +91,7 @@ export class JevClient implements JevAsker {
   }
 
   async ask(state: JevState, questions: JevQuestions): Promise<JevResponse> {
-    if (!this.apiKey) throw new Error('OPENROUTER_API_KEY (or TYPESAFE_API_KEY) is not configured');
+    if (!this.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
     const request = buildJevRequest(
       { apiKey: this.apiKey, model: this.model, baseUrl: this.baseUrl },
       state,

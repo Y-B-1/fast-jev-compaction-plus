@@ -69,7 +69,7 @@ describe('hook config', () => {
     expect(resolveHookConfig({})).toEqual({
       archiveResults: true,
       minReductionRatio: 0.25,
-      model: 'typesafe/jev-1.13',
+      model: 'jev-1.13',
       builtinFallback: 'auto',
       jevPruneBashOutput: false,
       jevPruneMinChars: 4_000,
@@ -358,35 +358,41 @@ describe('getApiKey', () => {
     settings: { read: async () => ({ env: settingsEnv }) },
   });
 
-  it('prefers config.apiKey, then OPENROUTER_API_KEY, then TYPESAFE_API_KEY', async () => {
-    expect(await getApiKey(engine(), { ...resolveHookConfig({}), apiKey: 'configured' })).toBe(
-      'configured',
-    );
+  it('prefers config.apiKey, then TYPESAFE_API_KEY from the environment, then the settings env block', async () => {
     expect(
-      await getApiKey(engine({ OPENROUTER_API_KEY: 'router', TYPESAFE_API_KEY: 'typesafe' }), resolveHookConfig({})),
-    ).toBe('router');
-    expect(await getApiKey(engine({ TYPESAFE_API_KEY: 'typesafe' }), resolveHookConfig({}))).toBe(
-      'typesafe',
+      await getApiKey(engine({ TYPESAFE_API_KEY: 'typesafe' }), { ...resolveHookConfig({}), apiKey: 'configured' }),
+    ).toBe('configured');
+    expect(
+      await getApiKey(engine({ TYPESAFE_API_KEY: 'from-env' }, { TYPESAFE_API_KEY: 'from-settings' }), resolveHookConfig({})),
+    ).toBe('from-env');
+    expect(await getApiKey(engine({}, { TYPESAFE_API_KEY: 'from-settings' }), resolveHookConfig({}))).toBe(
+      'from-settings',
     );
     expect(await getApiKey(engine(), resolveHookConfig({}))).toBeUndefined();
   });
 
-  it('treats an empty-string OPENROUTER_API_KEY as unset instead of blocking the fallback', async () => {
+  it('treats an empty-string TYPESAFE_API_KEY in the environment as unset', async () => {
     expect(
-      await getApiKey(engine({ OPENROUTER_API_KEY: '', TYPESAFE_API_KEY: 'typesafe' }), resolveHookConfig({})),
-    ).toBe('typesafe');
-    expect(
-      await getApiKey(
-        engine({}, { OPENROUTER_API_KEY: '', TYPESAFE_API_KEY: 'typesafe' }),
-        resolveHookConfig({}),
-      ),
-    ).toBe('typesafe');
+      await getApiKey(engine({ TYPESAFE_API_KEY: '' }, { TYPESAFE_API_KEY: 'from-settings' }), resolveHookConfig({})),
+    ).toBe('from-settings');
   });
 
-  it('falls back to the settings env block when the process environment has nothing', async () => {
-    expect(
-      await getApiKey(engine({}, { OPENROUTER_API_KEY: 'from-settings' }), resolveHookConfig({})),
-    ).toBe('from-settings');
+  it('ignores OPENROUTER_API_KEY entirely', async () => {
+    expect(await getApiKey(engine({ OPENROUTER_API_KEY: 'router' }), resolveHookConfig({}))).toBeUndefined();
+    expect(await getApiKey(engine({}, { OPENROUTER_API_KEY: 'router' }), resolveHookConfig({}))).toBeUndefined();
+  });
+
+  it('refuses an OpenRouter sk-or- key from any source', async () => {
+    const refusal = 'an OpenRouter key is configured; fast-jev now uses TypeSafe: set TYPESAFE_API_KEY';
+    await expect(
+      getApiKey(engine(), { ...resolveHookConfig({}), apiKey: 'sk-or-v1-abc' }),
+    ).rejects.toThrow(refusal);
+    await expect(getApiKey(engine({ TYPESAFE_API_KEY: 'sk-or-v1-abc' }), resolveHookConfig({}))).rejects.toThrow(
+      refusal,
+    );
+    await expect(
+      getApiKey(engine({}, { TYPESAFE_API_KEY: 'sk-or-v1-abc' }), resolveHookConfig({})),
+    ).rejects.toThrow(refusal);
   });
 });
 
@@ -513,6 +519,19 @@ describe('register', () => {
     expect(out).toEqual({ skip: 'fast-jev-compaction: request failed, builtin fallback disabled' });
     expect(e.toasts).toHaveLength(1);
     expect(e.toasts[0]).toMatch(/builtin fallback disabled/);
+  });
+
+  it('sends nothing to the network when the configured key is an OpenRouter key', async () => {
+    const hooks = registered({ apiKey: 'sk-or-v1-abc', preserveRecentMessages: 1, minReductionRatio: 0 });
+    let calls = 0;
+    const e = engine(async () => (++calls, { status: 200, ok: true, text: '{}' }));
+    const out = await hooks['session.compact']!(
+      e.$,
+      { trigger: 'manual', messages: transcript() },
+      next(),
+    );
+    expect(calls).toBe(0);
+    expect(out).toEqual({ skip: 'fast-jev-compaction: request failed, builtin fallback disabled' });
   });
 
   it('skips a below-minimum reduction instead of falling back for a manual /compact', async () => {

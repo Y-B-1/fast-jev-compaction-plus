@@ -1,7 +1,7 @@
 import type { JevAnswer, JevQuestions, JevResponse, JevState } from './types.js';
 
-export const SYSTEM_ONE_URL = 'https://openrouter.ai/api/alpha/decisions';
-export const DEFAULT_MODEL = 'typesafe/jev-1.13';
+export const SYSTEM_ONE_URL = 'https://api.typesafe.ai/v1/systemone';
+export const DEFAULT_MODEL = 'jev-1.13';
 
 export interface JevRequest {
   url: string;

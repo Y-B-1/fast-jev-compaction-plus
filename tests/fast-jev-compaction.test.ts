@@ -686,10 +686,10 @@ describe('HTTP client', () => {
     const request = buildJevRequest({ apiKey: 'k' }, { a: 1 }, {
       q: { type: 'noul', instructions: 'x' },
     });
-    expect(request.url).toBe('https://openrouter.ai/api/alpha/decisions');
+    expect(request.url).toBe('https://api.typesafe.ai/v1/systemone');
     expect(request.headers.authorization).toBe('Bearer k');
     expect(JSON.parse(request.body)).toEqual({
-      model: 'typesafe/jev-1.13',
+      model: 'jev-1.13',
       state: { a: 1 },
       questions: { q: { type: 'noul', instructions: 'x' } },
     });
@@ -723,32 +723,29 @@ describe('HTTP client', () => {
     expect(JSON.parse(bodies[0]!).model).toBe('jev-test');
 
     const keyless = new JevClient({ apiKey: '' });
-    await expect(keyless.ask('s', {})).rejects.toThrow(/OPENROUTER_API_KEY/);
+    await expect(keyless.ask('s', {})).rejects.toThrow(/TYPESAFE_API_KEY is not configured/);
     await expect(
       compactMessages(transcript(), { apiKey: '', preserveRecentMessages: 1 }),
-    ).rejects.toThrow(/OPENROUTER_API_KEY/);
+    ).rejects.toThrow(/TYPESAFE_API_KEY is not configured/);
   });
 
-  it('reads OPENROUTER_API_KEY first, falling back to TYPESAFE_API_KEY, treating an empty string as unset', () => {
+  it('reads only TYPESAFE_API_KEY from the environment, ignoring OPENROUTER_API_KEY', async () => {
     const original = { or: process.env.OPENROUTER_API_KEY, ts: process.env.TYPESAFE_API_KEY };
     try {
       process.env.OPENROUTER_API_KEY = 'router-key';
       process.env.TYPESAFE_API_KEY = 'typesafe-key';
-      expect(new JevClient().ask).toBeInstanceOf(Function);
-      const request = buildJevRequest(
-        { apiKey: process.env.OPENROUTER_API_KEY || process.env.TYPESAFE_API_KEY || '' },
-        {},
-        {},
-      );
-      expect(request.headers.authorization).toBe('Bearer router-key');
+      const bodies: Array<Record<string, string>> = [];
+      const fetchFn = (async (_url: string | URL | Request, init?: RequestInit) => {
+        bodies.push(init?.headers as Record<string, string>);
+        return new Response(JSON.stringify({ answers: {} }), { status: 200 });
+      }) as typeof fetch;
+      await new JevClient({ fetch: fetchFn }).ask('s', {});
+      expect(bodies[0]!.authorization).toBe('Bearer typesafe-key');
 
-      process.env.OPENROUTER_API_KEY = '';
-      const fallback = buildJevRequest(
-        { apiKey: process.env.OPENROUTER_API_KEY || process.env.TYPESAFE_API_KEY || '' },
-        {},
-        {},
+      process.env.TYPESAFE_API_KEY = '';
+      await expect(new JevClient({ fetch: fetchFn }).ask('s', {})).rejects.toThrow(
+        /TYPESAFE_API_KEY is not configured/,
       );
-      expect(fallback.headers.authorization).toBe('Bearer typesafe-key');
     } finally {
       if (original.or === undefined) delete process.env.OPENROUTER_API_KEY;
       else process.env.OPENROUTER_API_KEY = original.or;

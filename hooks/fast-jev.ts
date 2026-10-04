@@ -389,7 +389,7 @@ export async function compactSession(
   archive?: ArchiveWriter,
   askerOptions: JevAskerOptions = {},
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('OPENROUTER_API_KEY (or TYPESAFE_API_KEY) is not configured');
+  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
   const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model, askerOptions), {
     ...config,
     ...(archive ? { archive: archive.cite } : {}),
@@ -458,10 +458,9 @@ function settingsEnv(settings: Readonly<Record<string, unknown>>, name: string):
 }
 
 /**
- * OPENROUTER_API_KEY, falling back to TYPESAFE_API_KEY, each checked in the
- * environment and then in the settings' `env` block; an empty string counts
- * as unset at every step, so it falls through to the next source instead of
- * blocking the fallback chain.
+ * The `apiKey` option, then TYPESAFE_API_KEY from the environment and then
+ * the settings' `env` block; an empty string counts as unset at every step.
+ * An OpenRouter key (`sk-or-`) is refused, never sent to TypeSafe.
  */
 export async function getApiKey(
   $: {
@@ -470,16 +469,17 @@ export async function getApiKey(
   },
   config: HookConfig,
 ): Promise<string | undefined> {
-  if (config.apiKey) return config.apiKey;
-  const settings = await $.settings.read();
-  // $.env.get needs a literal name at each call site so the plugin's env
-  // reads can be listed statically; a loop over a name array (however
-  // narrowly typed) does not satisfy that, hence the two calls spelled out.
-  const openRouterKey = (await $.env.get('OPENROUTER_API_KEY')) || settingsEnv(settings, 'OPENROUTER_API_KEY');
-  if (openRouterKey) return openRouterKey;
-  const typesafeKey = (await $.env.get('TYPESAFE_API_KEY')) || settingsEnv(settings, 'TYPESAFE_API_KEY');
-  if (typesafeKey) return typesafeKey;
-  return undefined;
+  let key = config.apiKey;
+  if (!key) {
+    const settings = await $.settings.read();
+    // $.env.get needs a literal name at each call site so the plugin's env
+    // reads can be listed statically.
+    key = (await $.env.get('TYPESAFE_API_KEY')) || settingsEnv(settings, 'TYPESAFE_API_KEY');
+  }
+  if (key?.startsWith('sk-or-')) {
+    throw new Error('an OpenRouter key is configured; fast-jev now uses TypeSafe: set TYPESAFE_API_KEY');
+  }
+  return key || undefined;
 }
 
 /** `$.clock.sleep` as a `Sleep`: the hook runtime's only timer. */

@@ -60,7 +60,7 @@ The plugin declares these `userConfig` values in
 | `salvageChars` | `300` |
 | `jevPruneBashOutput` | `false` |
 | `jevPruneMinChars` | `4000` |
-| `model` | `typesafe/jev-1.13` |
+| `model` | `jev-1.13` |
 
 The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
 through `TYPESAFE_API_KEY`. The environment variable is the recommended

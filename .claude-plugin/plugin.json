@@ -1,13 +1,13 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
     "apiKey": {
       "type": "string",
-      "title": "OpenRouter API key",
-      "description": "OpenRouter API key. Leave unset to use OPENROUTER_API_KEY.",
+      "title": "TypeSafe API key",
+      "description": "TypeSafe API key. Leave unset to use TYPESAFE_API_KEY.",
       "sensitive": true
     },
     "keepThreshold": {
@@ -85,8 +85,8 @@
     "model": {
       "type": "string",
       "title": "Jev model",
-      "description": "TypeSafe Jev model name.",
-      "default": "typesafe/jev-1.13"
+      "description": "TypeSafe Jev model name (default jev-1.13).",
+      "default": "jev-1.13"
     }
   },
   "author": {
