@@ -81,6 +81,13 @@ describe('questions', () => {
     const r = parseQuestions('c9', '```json\n' + reply + '\n```');
     expect(r.questions.map((x) => x.id)).toEqual(['c9:0']);
     expect(r.invalid).toBe(2);
+    const empty = parseQuestions('c9', JSON.stringify([
+      { question: 'q', gold: '', evidence: 'x', category: 'path', tag: 'tool-result' },
+      { question: 'q', gold: '  ', evidence: 'x', category: 'number', tag: 'tool-result' },
+      { question: 'q', gold: 'a.ts', evidence: 'x', category: 'path', tag: 'tool-result' },
+    ]));
+    expect(empty.questions.map((x) => x.id)).toEqual(['c9:2']);
+    expect(empty.invalid).toBe(2);
     expect(parseQuestions('c9', 'not json')).toEqual({ questions: [], invalid: 0, malformed: true });
   });
 
@@ -127,6 +134,30 @@ describe('score', () => {
   it('token questions pass when the normalized answer contains the normalized gold', () => {
     expect(scoreAnswer(q(), 'It was `SRC/state.ts`.')).toEqual({ outcome: 'pass' });
     expect(scoreAnswer(q(), 'src/other.ts')).toEqual({ outcome: 'wrong' });
+  });
+
+  it('token golds match as whole tokens, not substrings', () => {
+    const t = (gold: string, answer: string, category: Question['category'] = 'path') => scoreAnswer(q({ gold, category }), answer).outcome;
+    expect(t('5', '15 retries', 'number')).toBe('wrong');
+    expect(t('3000', '30000', 'number')).toBe('wrong');
+    expect(t('5', '1.5', 'number')).toBe('wrong');
+    expect(t('src/a.ts', 'src/a.tsx')).toBe('wrong');
+    expect(t('a.ts', 'src/a.ts')).toBe('wrong');
+    expect(t('a.ts', 'src/b.ts or a.ts or c.ts')).toBe('wrong');
+    expect(t('a.ts', 'a.ts, b.ts')).toBe('wrong');
+    expect(t('', 'anything')).toBe('wrong');
+    expect(t('src/a.ts', 'The file is src/a.ts in the repo')).toBe('pass');
+    expect(t('src/a.ts', 'It is `src/a.ts`')).toBe('pass');
+    expect(t('src/a.ts', 'src/a.ts.')).toBe('pass');
+    expect(t('src/a.ts', 'It was src/a.ts, I think')).toBe('pass');
+    expect(t('5', 'There were 5 retries.', 'number')).toBe('pass');
+    expect(t('ENOENT', 'Error: ENOENT', 'error')).toBe('pass');
+  });
+
+  it('an answer starting with UNKNOWN is unknown', () => {
+    expect(scoreAnswer(q(), 'UNKNOWN (perhaps src/state.ts)')).toEqual({ outcome: 'unknown' });
+    expect(scoreAnswer(q({ category: 'decision' }), 'unknown, maybe X', () => 'CORRECT')).toEqual({ outcome: 'unknown' });
+    expect(scoreAnswer(q(), 'Unknownword src/state.ts')).toEqual({ outcome: 'pass' });
   });
 
   it('UNKNOWN never passes, even when the gold is UNKNOWN or the answer also contains the gold', () => {

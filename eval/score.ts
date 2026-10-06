@@ -29,12 +29,29 @@ ${answer}`;
 export const normalize = (s: string): string =>
   s.toLowerCase().replace(/\s+/g, ' ').trim().replace(/^[`'"]+/, '').replace(/[`'",.;]+$/, '').trim();
 
-const isUnknown = (s: string): boolean => normalize(s).replace(/[.!]+$/, '') === 'unknown';
+const isUnknown = (s: string): boolean => /^unknown(?![\w])/.test(normalize(s));
 
-/** UNKNOWN never passes. Token questions: normalized answer contains normalized gold. Others: the judge sees only gold and answer. */
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\\/-]/g, '\\$&');
+/** A character that continues a path, number or identifier; a dot only when a word character follows. */
+const CONT = '[\\w/\\\\-]';
+
+/** Whole-token match, and no second value-shaped token in a list ("a.ts or b.ts"). */
+function tokenMatch(answer: string, gold: string): boolean {
+  const g = normalize(gold);
+  if (!g) return false;
+  const a = normalize(answer);
+  const re = new RegExp(`(?<!${CONT}|\\w[.])${escapeRe(g)}(?!${CONT}|[.]\\w)`);
+  if (!re.test(a)) return false;
+  const others = (a.match(/[\w][\w./\\:-]*/g) ?? [])
+    .map((t) => t.replace(/[.:]+$/, ''))
+    .filter((t) => /[/.\d]/.test(t) && t !== g && !g.includes(t));
+  return !(others.length > 0 && /\bor\b|\band\b|[,;|\n]/.test(a));
+}
+
+/** UNKNOWN never passes. Token questions: the gold must appear as a whole token and the answer must not list other candidates. Others: the judge sees only gold and answer. */
 export function scoreAnswer(q: Question, answer: string, judge?: (prompt: string) => string): { outcome: Outcome } {
   if (isUnknown(answer)) return { outcome: 'unknown' };
-  if (tokenKind(q.category)) return { outcome: normalize(answer).includes(normalize(q.gold)) ? 'pass' : 'wrong' };
+  if (tokenKind(q.category)) return { outcome: tokenMatch(answer, q.gold) ? 'pass' : 'wrong' };
   if (!judge) throw new Error('judge required for a non-token question');
   return { outcome: /^\s*CORRECT\b/i.test(judge(judgePrompt(q.gold, answer))) ? 'pass' : 'wrong' };
 }

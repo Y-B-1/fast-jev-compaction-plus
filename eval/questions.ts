@@ -42,7 +42,7 @@ HISTORY
 ${history}`;
 }
 
-/** Tolerates a code fence. Drops entries with a bad category or tag and counts them. */
+/** Tolerates a code fence. Drops entries with a bad category or tag or an empty gold and counts them. */
 export function parseQuestions(caseId: string, reply: string): { questions: Question[]; invalid: number; malformed?: true } {
   const body = reply.replace(/^\s*```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '');
   let arr: unknown;
@@ -56,7 +56,7 @@ export function parseQuestions(caseId: string, reply: string): { questions: Ques
   let invalid = 0;
   arr.forEach((o: any, i) => {
     const ok =
-      o && typeof o.question === 'string' && typeof o.gold === 'string' && typeof o.evidence === 'string' &&
+      o && typeof o.question === 'string' && typeof o.gold === 'string' && o.gold.trim() !== '' && typeof o.evidence === 'string' &&
       (CATEGORIES as readonly string[]).includes(o.category) && (TAGS as readonly string[]).includes(o.tag);
     if (!ok) return void invalid++;
     const qn: Question = { id: `${caseId}:${i}`, caseId, question: o.question, gold: o.gold, evidence: o.evidence, category: o.category, tag: o.tag };
