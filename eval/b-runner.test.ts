@@ -229,11 +229,35 @@ describe('runHeadless', () => {
     const copied = readFileSync(join(s.evalDir, 'live', 'tidy', 'hooks', 'fast-jev.ts'), 'utf8');
     const markerLines = copied.split('\n').filter((l) => l.includes(join(s.evalDir, 'live', `marker-${id}.txt`)));
     expect(markerLines).toHaveLength(1);
-    expect(markerLines[0]).toContain('.fs?.write?.');
+    expect(markerLines[0]).toContain('.fs.write(');
+    expect(markerLines[0]).not.toContain('?.');
+    expect(copied).not.toContain('?.(');
     const notify = copied.slice(copied.indexOf('function notify('));
     expect(notify.slice(0, notify.indexOf('\n}\n'))).toContain(markerLines[0]);
     expect(notify.indexOf('  log($, text);\n' + markerLines[0])).toBeGreaterThan(0);
     expect(readFileSync(join(REPO, 'hooks', 'fast-jev.ts'), 'utf8')).not.toContain('marker-');
+  });
+
+  it('is headless when a fork shorter than the source (sidechain and uuid-less records dropped) has a new boundary and the marker', async () => {
+    const side = Array.from({ length: 8 }, (_, i) => user(`side ${i}`, { isSidechain: true }));
+    const s = setup('synthetic', [...side, JSON.stringify({ type: 'summary', summary: 'meta' }), JSON.stringify({ type: 'file-history-snapshot' })]);
+    const spawn: BSpawn = (a) => {
+      writeFileSync(join(s.folder, `${idOf(a)}.jsonl`), [s.sourceLines[0], ...compacted('NEW'), JSON.stringify({ type: 'summary', summary: 'meta2' })].join('\n') + '\n');
+      writeFileSync(markerOf(s, a), 'prose: 3 scored');
+      return { status: 0, stdout: 'done', stderr: '' };
+    };
+    await runHeadless(baseOpts(s, spawn, async () => true));
+    expect(s.sourceLines.length).toBeGreaterThan(readFileSync(modeOf(s).forkPath, 'utf8').split('\n').filter(Boolean).length);
+    expect(modeOf(s).headless).toBe(true);
+    expect(modeOf(s).evidence).toMatch(/trim succeeded/);
+  });
+
+  it('is not headless when the fork only copies a boundary already in the source, even with the marker', async () => {
+    const hist = compacted('OLD');
+    const s = setup('synthetic', hist);
+    await runHeadless(baseOpts(s, forkMarker(s, [], 'prose: 3 scored'), async () => true));
+    expect(modeOf(s).headless).toBe(false);
+    expect(modeOf(s).evidence).toMatch(/no new compact boundary/);
   });
 
   it('does not spawn when the copy has no notify anchor', async () => {
