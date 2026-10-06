@@ -33,6 +33,8 @@ export interface Case {
   chars: number;
   estTokens: number;
   builtinSummary?: string;
+  /** Main-thread record uuids of the whole transcript; split() groups transcripts that share any. */
+  uuids?: string[];
 }
 export interface LoadedTranscript {
   messages: Message[];
@@ -40,6 +42,8 @@ export interface LoadedTranscript {
   boundaries: { at: number; summary?: string }[];
   /** Unparseable lines (a cut-off last line). */
   skipped: number;
+  /** uuid of every main-thread (non-sidechain) record, in file order. Kept out of Message. */
+  uuids: string[];
 }
 
 const sha256 = (path: string) => createHash('sha256').update(readFileSync(path)).digest('hex');
@@ -76,6 +80,7 @@ export function loadTranscript(file: ManifestFile): LoadedTranscript {
   if (sha256(file.path) !== file.sha256) throw new Error(`Transcript hash mismatch: ${file.path}`);
   const messages: Message[] = [];
   const boundaries: LoadedTranscript['boundaries'] = [];
+  const uuids: string[] = [];
   let skipped = 0;
   let lastAssistantId: string | undefined;
   let awaitingSummary = false;
@@ -89,6 +94,7 @@ export function loadTranscript(file: ManifestFile): LoadedTranscript {
       continue;
     }
     if (o.isSidechain) continue;
+    if (typeof o.uuid === 'string') uuids.push(o.uuid);
     if (o.type === 'system' && o.subtype === 'compact_boundary') {
       boundaries.push({ at: messages.length });
       awaitingSummary = true;
@@ -128,7 +134,7 @@ export function loadTranscript(file: ManifestFile): LoadedTranscript {
     }
     lastAssistantId = id;
   }
-  return { messages, boundaries, skipped };
+  return { messages, boundaries, skipped, uuids };
 }
 
 function makeCase(file: ManifestFile, t: LoadedTranscript, start: number, end: number, summary?: string): Case {
@@ -140,24 +146,34 @@ function makeCase(file: ManifestFile, t: LoadedTranscript, start: number, end: n
     0,
   );
   const estTokens = slice.reduce((s, m) => s + estimateTokens(JSON.stringify(m)), 0);
-  const c: Case = { id: `${basename(file.path, '.jsonl')}#${start}-${end}`, transcript: file.path, start, end, chars, estTokens };
+  const c: Case = { id: `${basename(file.path, '.jsonl')}#${start}-${end}`, transcript: file.path, start, end, chars, estTokens, uuids: t.uuids };
   if (summary !== undefined) c.builtinSummary = summary;
   return c;
 }
 
-/** One case per window ending at a compaction boundary, or the whole transcript when it has none and is over 50k tokens. */
+/**
+ * One case per window ending at a compaction boundary, or the whole transcript when it has none and is over 50k tokens.
+ * Resumed or forked transcripts copy history: a case whose messages equal an earlier emitted case is dropped (files in manifest order).
+ */
 export function cases(manifest: Manifest): Case[] {
   const out: Case[] = [];
+  const seen = new Set<string>();
   for (const file of manifest.files) {
     const t = loadTranscript(file);
+    const add = (c: Case) => {
+      const key = createHash('sha256').update(JSON.stringify(t.messages.slice(c.start, c.end))).digest('hex');
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(c);
+    };
     if (t.boundaries.length === 0) {
       const whole = makeCase(file, t, 0, t.messages.length);
-      if (whole.estTokens > WHOLE_TRANSCRIPT_MIN_TOKENS) out.push(whole);
+      if (whole.estTokens > WHOLE_TRANSCRIPT_MIN_TOKENS) add(whole);
       continue;
     }
     let start = 0;
     for (const b of t.boundaries) {
-      if (b.at > start) out.push(makeCase(file, t, start, b.at, b.summary));
+      if (b.at > start) add(makeCase(file, t, start, b.at, b.summary));
       start = b.at;
     }
   }
@@ -184,15 +200,45 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-/** Splits by transcript (one third dev, two thirds test); only cases under `cap` tokens count toward the minimums. */
-export function split(all: Case[], cap: number, seed = DEFAULT_SEED): Split {
-  const transcripts = [...new Set(all.map((c) => c.transcript))].sort();
-  const rand = mulberry32(seed);
-  for (let i = transcripts.length - 1; i > 0; i--) {
-    const j = Math.floor(rand() * (i + 1));
-    [transcripts[i], transcripts[j]] = [transcripts[j], transcripts[i]];
+/** Transcripts that share any main-thread uuid form one unit (union-find); units sorted by smallest path. */
+function units(all: Case[]): string[][] {
+  const uuidsOf = new Map<string, Set<string>>();
+  for (const c of all) {
+    const set = uuidsOf.get(c.transcript) ?? new Set<string>();
+    for (const u of c.uuids ?? []) set.add(u);
+    uuidsOf.set(c.transcript, set);
   }
-  const dev = new Set(transcripts.slice(0, Math.round(transcripts.length / 3)));
+  const transcripts = [...uuidsOf.keys()].sort();
+  const parent = new Map(transcripts.map((t) => [t, t]));
+  const find = (t: string): string => {
+    while (parent.get(t) !== t) {
+      parent.set(t, parent.get(parent.get(t)!)!);
+      t = parent.get(t)!;
+    }
+    return t;
+  };
+  const owner = new Map<string, string>();
+  for (const t of transcripts) {
+    for (const u of uuidsOf.get(t)!) {
+      const o = owner.get(u);
+      if (o === undefined) owner.set(u, t);
+      else parent.set(find(t), find(o));
+    }
+  }
+  const groups = new Map<string, string[]>();
+  for (const t of transcripts) groups.set(find(t), [...(groups.get(find(t)) ?? []), t]);
+  return [...groups.values()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+}
+
+/** Splits by shared-history unit (one third dev, two thirds test, by unit count); only cases under `cap` tokens count toward the minimums. */
+export function split(all: Case[], cap: number, seed = DEFAULT_SEED): Split {
+  const groups = units(all);
+  const rand = mulberry32(seed);
+  for (let i = groups.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [groups[i], groups[j]] = [groups[j], groups[i]];
+  }
+  const dev = new Set(groups.slice(0, Math.round(groups.length / 3)).flat());
   const devCases = all.filter((c) => dev.has(c.transcript));
   const testCases = all.filter((c) => !dev.has(c.transcript));
   const under = (cs: Case[]) => cs.filter((c) => c.estTokens < cap).length;

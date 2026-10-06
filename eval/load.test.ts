@@ -155,6 +155,34 @@ describe('cases', () => {
   });
 });
 
+describe('shared history', () => {
+  const body = (k: string) => 'x'.repeat(40) + k;
+  it('emits an identical case once and tags cases with the transcript main-thread uuids', () => {
+    const prefix = [user(body('a')), asst([text(body('b'))]), boundary(), summary('S')];
+    const a = write('h1', [...prefix, user(body('only-a')), boundary(), summary('S2')]);
+    const b = write('h1', [...prefix, user(body('only-b')), boundary(), summary('S3')]);
+    const cs = cases(freeze(join(root, 'h1'), CUT));
+    expect(cs.filter((c) => c.start === 0 && c.end === 2)).toHaveLength(1);
+    expect(cs).toHaveLength(3);
+    expect(cs.find((c) => c.transcript === a && c.start === 2)).toBeDefined();
+    expect(cs.find((c) => c.transcript === b && c.start === 2)).toBeDefined();
+    const ca = cs.find((c) => c.transcript === a)!;
+    const cb = cs.find((c) => c.transcript === b && c.start === 2)!;
+    expect(ca.uuids!.filter((u) => cb.uuids!.includes(u)).length).toBeGreaterThan(0);
+  });
+
+  it('puts transcripts that share a uuid on the same side of the split, for every seed', () => {
+    const mk = (t: number, uuids: string[]): Case[] =>
+      Array.from({ length: 3 }, (_, k): Case => ({ id: `t${t}#${k}`, transcript: `/p/t${t}.jsonl`, start: k, end: k + 1, chars: 1, estTokens: 1000, uuids }));
+    const all = Array.from({ length: 36 }, (_, t) => mk(t, t === 1 || t === 2 || t === 3 ? ['shared', `own${t}`] : [`own${t}`])).flat();
+    for (let seed = 0; seed < 20; seed++) {
+      const r = split(all, 5000, seed);
+      const sideOf = (t: string) => (r.dev.some((c) => c.transcript === t) ? 'dev' : 'test');
+      expect(new Set(['/p/t1.jsonl', '/p/t2.jsonl', '/p/t3.jsonl'].map(sideOf)).size).toBe(1);
+    }
+  });
+});
+
 describe('split', () => {
   const mk = (transcripts: number, per: number, tokens: (i: number) => number): Case[] =>
     Array.from({ length: transcripts }, (_, t) =>
