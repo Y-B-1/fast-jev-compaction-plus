@@ -1,5 +1,5 @@
 // Dev-only: answering prompts, scoring and the pass bar (docs/prose-trim-design.md, Fact-recall eval).
-import { tokenKind, type Question } from './questions.js';
+import { tokenKind, type Category, type Question } from './questions.js';
 
 export type Outcome = 'pass' | 'wrong' | 'unknown';
 export interface Scored {
@@ -8,7 +8,11 @@ export interface Scored {
 }
 
 export const answerPrompt = (armOutput: string, q: Question): string =>
-  `Answer the question using ONLY the text below. Reply with the answer alone, or exactly UNKNOWN if the text does not say.
+  `Answer the question using ONLY the text below. ${
+    tokenKind(q.category)
+      ? 'Reply with the single exact value only (no sentence, no extra words), or exactly UNKNOWN if the text does not say.'
+      : 'Reply with the answer alone, or exactly UNKNOWN if the text does not say.'
+  }
 
 TEXT
 ${armOutput}
@@ -29,29 +33,39 @@ ${answer}`;
 export const normalize = (s: string): string =>
   s.toLowerCase().replace(/\s+/g, ' ').trim().replace(/^[`'"]+/, '').replace(/[`'",.;]+$/, '').trim();
 
-const isUnknown = (s: string): boolean => /^unknown(?![\w])/.test(normalize(s));
+/** UNKNOWN, or UNKNOWN followed by ( : , - or an em dash; never when the gold itself starts with "unknown". */
+const isUnknown = (answer: string, gold: string): boolean => {
+  if (normalize(gold).startsWith('unknown')) return false;
+  const n = normalize(answer);
+  return n === 'unknown' || /^unknown ?[(:,\-\u2014]/.test(n);
+};
 
-const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\\/-]/g, '\\$&');
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 /** A character that continues a path, number or identifier; a dot only when a word character follows. */
-const CONT = '[\\w/\\\\-]';
+const CONT = '[\\p{L}\\p{N}_/\\\\-]';
 
-/** Whole-token match, and no second value-shaped token in a list ("a.ts or b.ts"). */
-function tokenMatch(answer: string, gold: string): boolean {
+const CANDIDATES: Partial<Record<Category, RegExp>> = {
+  number: /\d+(?:\.\d+)?/gu,
+  path: /[\p{L}\p{N}_./\\-]+/gu,
+  id: /(?<![\p{L}\p{N}_-])(?:[0-9a-f]{7,}|[a-z]+-\d+)(?![\p{L}\p{N}_-])/gu,
+};
+const pathLike = (t: string): boolean => /[/\\]/.test(t) || /\w\.\p{L}[\p{L}\p{N}]+$/u.test(t);
+
+/** Whole-token match, and no other distinct candidate of the gold's kind (number, path, id) in the answer. Error golds: whole-token only. */
+function tokenMatch(answer: string, gold: string, category: Category): boolean {
   const g = normalize(gold);
   if (!g) return false;
   const a = normalize(answer);
-  const re = new RegExp(`(?<!${CONT}|\\w[.])${escapeRe(g)}(?!${CONT}|[.]\\w)`);
-  if (!re.test(a)) return false;
-  const others = (a.match(/[\w][\w./\\:-]*/g) ?? [])
-    .map((t) => t.replace(/[.:]+$/, ''))
-    .filter((t) => /[/.\d]/.test(t) && t !== g && !g.includes(t));
-  return !(others.length > 0 && /\bor\b|\band\b|[,;|\n]/.test(a));
+  if (!new RegExp(`(?<!${CONT}|[\\p{L}\\p{N}_][.])${escapeRe(g)}(?!${CONT}|[.][\\p{L}\\p{N}_])`, 'u').test(a)) return false;
+  const re = CANDIDATES[category];
+  if (!re) return true;
+  return !(a.match(re) ?? []).map((t) => t.replace(/[.:]+$/, '')).some((t) => t !== g && (category !== 'path' || pathLike(t)));
 }
 
 /** UNKNOWN never passes. Token questions: the gold must appear as a whole token and the answer must not list other candidates. Others: the judge sees only gold and answer. */
 export function scoreAnswer(q: Question, answer: string, judge?: (prompt: string) => string): { outcome: Outcome } {
-  if (isUnknown(answer)) return { outcome: 'unknown' };
-  if (tokenKind(q.category)) return { outcome: tokenMatch(answer, q.gold) ? 'pass' : 'wrong' };
+  if (isUnknown(answer, q.gold)) return { outcome: 'unknown' };
+  if (tokenKind(q.category)) return { outcome: tokenMatch(answer, q.gold, q.category) ? 'pass' : 'wrong' };
   if (!judge) throw new Error('judge required for a non-token question');
   return { outcome: /^\s*CORRECT\b/i.test(judge(judgePrompt(q.gold, answer))) ? 'pass' : 'wrong' };
 }

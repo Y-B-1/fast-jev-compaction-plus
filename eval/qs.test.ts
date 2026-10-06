@@ -163,8 +163,35 @@ describe('score', () => {
   it('UNKNOWN never passes, even when the gold is UNKNOWN or the answer also contains the gold', () => {
     expect(scoreAnswer(q(), 'UNKNOWN')).toEqual({ outcome: 'unknown' });
     expect(scoreAnswer(q(), ' unknown. ')).toEqual({ outcome: 'unknown' });
-    expect(scoreAnswer(q({ gold: 'UNKNOWN' }), 'UNKNOWN')).toEqual({ outcome: 'unknown' });
     expect(scoreAnswer(q({ category: 'decision' }), 'UNKNOWN', () => 'CORRECT')).toEqual({ outcome: 'unknown' });
+  });
+
+  it('sentence answers holding the gold and no other candidate of its kind pass (R1)', () => {
+    const t = (gold: string, answer: string, category: Question['category']) => scoreAnswer(q({ gold, category }), answer).outcome;
+    expect(t('3000', 'The timeout is 3000 ms, set in config.ts', 'number')).toBe('pass');
+    expect(t('404', 'HTTP 404, from /api/x', 'number')).toBe('pass');
+    expect(t('EADDRINUSE', 'EADDRINUSE on port 3000, then retried', 'error')).toBe('pass');
+    expect(t('src/a.ts', 'src/a.ts and it was edited in v1.2', 'path')).toBe('pass');
+    expect(t('8', '8 files and 245 tests', 'number')).toBe('wrong');
+    expect(t('5', '5 retries, then backoff of 2s', 'number')).toBe('wrong');
+    expect(t('a.ts', 'src/b.ts or a.ts', 'path')).toBe('wrong');
+    expect(t('abc1234', 'abc1234 or deadbeef9', 'id')).toBe('wrong');
+    expect(t('PROJ-12', 'PROJ-12, not PROJ-13', 'id')).toBe('wrong');
+    expect(t('abc1234', 'The commit is abc1234 on 2026-10-06', 'id')).toBe('pass');
+  });
+
+  it('exact answers that merely start with "unknown" are not UNKNOWN (R2)', () => {
+    expect(scoreAnswer(q({ gold: "Unknown option '--foo'", category: 'error' }), "Unknown option '--foo'")).toEqual({ outcome: 'pass' });
+    expect(scoreAnswer(q({ gold: 'unknown.ts', category: 'path' }), 'unknown.ts')).toEqual({ outcome: 'pass' });
+    expect(scoreAnswer(q({ gold: 'UNKNOWN', category: 'path' }), 'UNKNOWN')).toEqual({ outcome: 'pass' });
+    expect(scoreAnswer(q(), 'unknown - no idea')).toEqual({ outcome: 'unknown' });
+    expect(scoreAnswer(q(), 'Unknown: not stated')).toEqual({ outcome: 'unknown' });
+    expect(scoreAnswer(q(), 'unknown.ts')).toEqual({ outcome: 'wrong' });
+  });
+
+  it('token answer prompts ask for the single exact value only; free questions do not', () => {
+    for (const c of ['path', 'number', 'id', 'error'] as const) expect(answerPrompt('T', q({ category: c }))).toMatch(/single exact value only/i);
+    expect(answerPrompt('T', q({ category: 'decision' }))).not.toMatch(/single exact value only/i);
   });
 
   it('non-token questions go to the judge, which sees only gold and answer', () => {
