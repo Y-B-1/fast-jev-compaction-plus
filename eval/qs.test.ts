@@ -160,7 +160,7 @@ describe('score', () => {
     expect(scoreAnswer(q(), 'Unknownword src/state.ts')).toEqual({ outcome: 'pass' });
   });
 
-  it('UNKNOWN never passes, even when the gold is UNKNOWN or the answer also contains the gold', () => {
+  it('UNKNOWN answers score unknown, never pass, unless the gold itself starts with "unknown"', () => {
     expect(scoreAnswer(q(), 'UNKNOWN')).toEqual({ outcome: 'unknown' });
     expect(scoreAnswer(q(), ' unknown. ')).toEqual({ outcome: 'unknown' });
     expect(scoreAnswer(q({ category: 'decision' }), 'UNKNOWN', () => 'CORRECT')).toEqual({ outcome: 'unknown' });
@@ -178,6 +178,14 @@ describe('score', () => {
     expect(t('abc1234', 'abc1234 or deadbeef9', 'id')).toBe('wrong');
     expect(t('PROJ-12', 'PROJ-12, not PROJ-13', 'id')).toBe('wrong');
     expect(t('abc1234', 'The commit is abc1234 on 2026-10-06', 'id')).toBe('pass');
+  });
+
+  it('fragments of the gold are not other candidates (repair 3)', () => {
+    const t = (gold: string, answer: string, category: Question['category']) => scoreAnswer(q({ gold, category }), answer).outcome;
+    for (const g of ['3000ms', '30s', '-1', '1,000', '50%', 'v1.2.3']) expect(t(g, g, 'number')).toBe('pass');
+    for (const g of ['~/x.ts', '@scope/pkg/index.ts', 'My Docs/a.ts', 'C:\\foo\\bar.ts']) expect(t(g, g, 'path')).toBe('pass');
+    expect(t('3000ms', '3000ms, not 5000ms', 'number')).toBe('wrong');
+    expect(t('My Docs/a.ts', 'My Docs/a.ts or src/b.ts', 'path')).toBe('wrong');
   });
 
   it('exact answers that merely start with "unknown" are not UNKNOWN (R2)', () => {

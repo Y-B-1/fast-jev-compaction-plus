@@ -56,13 +56,15 @@ function tokenMatch(answer: string, gold: string, category: Category): boolean {
   const g = normalize(gold);
   if (!g) return false;
   const a = normalize(answer);
-  if (!new RegExp(`(?<!${CONT}|[\\p{L}\\p{N}_][.])${escapeRe(g)}(?!${CONT}|[.][\\p{L}\\p{N}_])`, 'u').test(a)) return false;
+  const whole = new RegExp(`(?<!${CONT}|[\\p{L}\\p{N}_][.])${escapeRe(g)}(?!${CONT}|[.][\\p{L}\\p{N}_])`, 'gu');
+  if (!whole.test(a)) return false;
   const re = CANDIDATES[category];
   if (!re) return true;
-  return !(a.match(re) ?? []).map((t) => t.replace(/[.:]+$/, '')).some((t) => t !== g && (category !== 'path' || pathLike(t)));
+  const rest = a.replace(whole, ' ');
+  return !(rest.match(re) ?? []).map((t) => t.replace(/[.:]+$/, '')).some((t) => category !== 'path' || pathLike(t));
 }
 
-/** UNKNOWN never passes. Token questions: the gold must appear as a whole token and the answer must not list other candidates. Others: the judge sees only gold and answer. */
+/** UNKNOWN scores unknown (unless the gold starts with "unknown"). Token questions: the gold must appear as a whole token and, with its occurrences removed, the answer must hold no other candidate. Others: the judge sees only gold and answer. */
 export function scoreAnswer(q: Question, answer: string, judge?: (prompt: string) => string): { outcome: Outcome } {
   if (isUnknown(answer, q.gold)) return { outcome: 'unknown' };
   if (tokenKind(q.category)) return { outcome: tokenMatch(answer, q.gold, q.category) ? 'pass' : 'wrong' };
