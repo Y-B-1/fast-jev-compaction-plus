@@ -132,6 +132,7 @@ export function violations(before: readonly Message[], after: readonly Message[]
     if (!counterpart) {
       if (!removable) out.push(`message ${i}: ${b.role} message missing or unrecognisable`);
       else if (pinned) out.push(`message ${i}: pinned message removed`);
+      else if (splitProse(b.text).some((u) => !u.scored && b.text.slice(u.start, u.end).trim() !== '')) out.push(`message ${i}: assistant message with protected text removed`);
       return;
     }
     j++;

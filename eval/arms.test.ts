@@ -257,4 +257,12 @@ describe('invariants', () => {
     expect(violations(before, before.filter((_, i) => i !== 1), 6)).toEqual([]);
     expect(violations(before, before.filter((_, i) => i !== 0), 6).length).toBeGreaterThan(0);
   });
+
+  it('flags a removed unpinned assistant message holding protected text, not one of prose only', () => {
+    const tail = Array.from({ length: 7 }, (_, i) => user(`t${i}`));
+    const protectedMsg = [user('q'), { role: 'assistant' as const, text: 'Open `src/app.ts` and run `npm test` on v1.2.3 now.', toolUses: [] }, ...tail];
+    expect(violations(protectedMsg, protectedMsg.filter((_, i) => i !== 1), 6).join(' ')).toContain('message 1: assistant message with protected text removed');
+    const proseOnly = [user('q'), { role: 'assistant' as const, text: FILLER, toolUses: [] }, ...tail];
+    expect(violations(proseOnly, proseOnly.filter((_, i) => i !== 1), 6)).toEqual([]);
+  });
 });
