@@ -3,8 +3,8 @@
 // the key goes only into the child's env, never into argv, output or files. Transcript text is never printed.
 import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -24,16 +24,38 @@ export interface BMode {
 export type BSpawn = (argv: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }) => { status: number | null; stdout: string; stderr: string };
 
 /**
- * Last compact boundary of a compacted transcript: summary lines (non-blank) and the messages after the boundary.
- * keptMessages counts main-thread messages from the boundary on (the preserved tail), via load.ts's loader.
+ * Last compact boundary of a compacted transcript: summary lines (non-blank) and keptMessages.
+ * Real transcripts point at the kept messages with compactMetadata.preservedSegment {headUuid, anchorUuid, tailUuid};
+ * they lie BEFORE the boundary, so keptMessages is the main-thread message count from the head record to the tail record.
+ * Without a usable segment it falls back to the messages after the boundary (the synthetic and hand shape).
  */
 export function parseCompacted(file: string, caseId: string, mode: BResult['mode']): BResult {
-  const sha256 = createHash('sha256').update(readFileSync(file)).digest('hex');
-  const t = loadTranscript({ path: file, mtimeMs: 0, sha256 });
+  const text = readFileSync(file);
+  const t = loadTranscript({ path: file, mtimeMs: 0, sha256: createHash('sha256').update(text).digest('hex') });
   const last = t.boundaries[t.boundaries.length - 1];
   if (!last) throw new Error(`no compact boundary in ${file}`);
   if (last.summary === undefined) throw new Error(`no summary after the compact boundary in ${file}`);
-  return { caseId, mode, summary: last.summary.split('\n').filter((l) => l.trim()), keptMessages: t.messages.length - last.at };
+  return { caseId, mode, summary: last.summary.split('\n').filter((l) => l.trim()), keptMessages: preservedCount(text.toString('utf8')) ?? t.messages.length - last.at };
+}
+
+function preservedCount(raw: string): number | undefined {
+  const lines = raw.split('\n').filter((l) => l.trim());
+  const recs = lines.map((l) => { try { return JSON.parse(l); } catch { return undefined; } });
+  const b = recs.map((r, i) => (r?.type === 'system' && r.subtype === 'compact_boundary' && !r.isSidechain ? i : -1)).filter((i) => i >= 0).pop();
+  const seg = b === undefined ? undefined : recs[b].compactMetadata?.preservedSegment;
+  if (typeof seg?.headUuid !== 'string' || typeof seg?.tailUuid !== 'string') return undefined;
+  const head = recs.findIndex((r) => r?.uuid === seg.headUuid);
+  const tail = recs.findIndex((r) => r?.uuid === seg.tailUuid);
+  if (head < 0 || tail < head) return undefined;
+  const dir = mkdtempSync(join(tmpdir(), 'fjev-seg-'));
+  try {
+    const slice = join(dir, 'segment.jsonl');
+    const body = lines.slice(head, tail + 1).join('\n');
+    writeFileSync(slice, body);
+    return loadTranscript({ path: slice, mtimeMs: 0, sha256: createHash('sha256').update(body).digest('hex') }).messages.length;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /** y or yes (any case) is true; anything else, or a closed stream, is false. */
@@ -82,10 +104,15 @@ export interface HeadlessOptions {
 }
 
 /**
- * Detection signal: the hook's own toast, "prose: N scored", which only fastJev's session.compact handler emits (summarize()),
- * found in the child's stdout/stderr or the fork's transcript. A compact boundary alone proves /compact ran, not that the hook did.
+ * Detection signal: any toast fast-jev's session.compact handler emits ("prose: N scored" on a trim, else "trimmed to", "kept N/M",
+ * "skipped (" or "fallback to built-in summary ("), found in the child's stdout/stderr or in NEW fork records only.
+ * A fork copies the source history, so records at or before the source's record count (and its old boundaries) are ignored;
+ * only fork records past that count, written by this run, count. A compact boundary alone proves /compact ran, not the hook.
  */
-const HOOK_SIGNAL = /prose: \d+ scored/;
+const HOOK_SIGNAL = /prose: \d+ scored|trimmed to \d+\/\d+ messages|kept \d+\/\d+ messages, no summary|skipped \(|fallback to built-in summary \(/;
+const TRIM_SIGNAL = /prose: \d+ scored/;
+const recordLines = (raw: string) => raw.split('\n').filter((l) => l.trim());
+const isBoundary = (l: string) => { try { const o = JSON.parse(l); return o.type === 'system' && o.subtype === 'compact_boundary'; } catch { return false; } };
 
 export async function runHeadless(o: HeadlessOptions): Promise<'refused' | BMode> {
   const env = o.env ?? process.env;
@@ -99,6 +126,7 @@ export async function runHeadless(o: HeadlessOptions): Promise<'refused' | BMode
   const sourceFile = join(projectsDir, folder.name, `${o.sourceId}.jsonl`);
   const cwd = readFileSync(sourceFile, 'utf8').split('\n').map((l) => { try { return JSON.parse(l).cwd; } catch { return undefined; } }).find((c) => typeof c === 'string');
   if (!cwd) throw new Error('source session records no cwd');
+  const sourceRecords = recordLines(readFileSync(sourceFile, 'utf8')).length;
   const newId = randomUUID();
   const forkPath = join(projectsDir, folder.name, `${newId}.jsonl`);
   print(`The fork will write: ${forkPath}`);
@@ -108,16 +136,18 @@ export async function runHeadless(o: HeadlessOptions): Promise<'refused' | BMode
   const argv = ['-p', '/compact', '--resume', o.sourceId, '--fork-session', '--session-id', newId, '--setting-sources', 'project,local', '--plugin-dir', copy, '--output-format', 'stream-json', '--verbose'];
   const r = (o.spawn ?? realSpawn)(argv, { cwd, env: { ...env, CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1' } });
   const forked = existsSync(forkPath);
-  const raw = forked ? readFileSync(forkPath, 'utf8') : '';
-  const hasBoundary = raw.includes('"compact_boundary"');
-  const hook = HOOK_SIGNAL.test(`${r.stdout}\n${r.stderr}\n${raw}`);
+  const fresh = forked ? recordLines(readFileSync(forkPath, 'utf8')).slice(sourceRecords) : [];
+  const hasBoundary = fresh.some(isBoundary);
+  const seen = `${r.stdout}\n${r.stderr}\n${fresh.join('\n')}`;
+  const hook = HOOK_SIGNAL.test(seen);
+  const outcome = TRIM_SIGNAL.test(seen) ? 'trim succeeded' : 'fell back to the built-in summary or skipped';
   const mode: BMode = {
-    headless: hook,
-    evidence: hook
-      ? 'hook summary "prose: N scored" found in output or fork transcript'
-      : hasBoundary
-        ? 'compact boundary in fork, no hook summary "prose: N scored"'
-        : `no compact boundary in fork (claude exit ${r.status}${forked ? '' : ', no fork file'})`,
+    headless: hook && hasBoundary,
+    evidence: !hasBoundary
+      ? `no new compact boundary in fork (claude exit ${r.status}${forked ? '' : ', no fork file'}${hook ? '; hook output seen' : ''})`
+      : hook
+        ? `fast-jev hook output in new output or new fork records (${outcome})`
+        : 'new compact boundary in fork, no fast-jev hook output',
     forkPath,
   };
   mkdirSync(outDir, { recursive: true });

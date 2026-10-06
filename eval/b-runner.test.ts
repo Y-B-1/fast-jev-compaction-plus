@@ -7,6 +7,9 @@ import { confirmFromStream, parseCompacted, runHeadless, type BSpawn } from './b
 
 const root = mkdtempSync(join(tmpdir(), 'fjev-b-'));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
+vi.stubGlobal('fetch', () => {
+  throw new Error('network is off in tests');
+});
 const KEY = 'sk-test-synthetic-key-0123456789';
 
 let uid = 0;
@@ -40,6 +43,17 @@ describe('parseCompacted', () => {
   });
 });
 
+describe('parseCompacted preserved segment', () => {
+  it('counts the messages between preservedSegment head and tail, which lie before the boundary', () => {
+    const k1 = user('kept 1');
+    const k2 = asst('kept 2');
+    const [h, t] = [JSON.parse(k1).uuid, JSON.parse(k2).uuid];
+    const b = line({ type: 'system', subtype: 'compact_boundary', compactMetadata: { trigger: 'auto', preservedSegment: { headUuid: h, anchorUuid: 'x', tailUuid: t } } });
+    const p = write('ps.jsonl', [user('old'), k1, k2, asst('dropped'), b, user('SUM', { isCompactSummary: true })]);
+    expect(parseCompacted(p, 'c', 'headless').keptMessages).toBe(2);
+  });
+});
+
 describe('confirmFromStream', () => {
   const ask = async (answer: string) => {
     const input = new PassThrough();
@@ -56,16 +70,17 @@ describe('confirmFromStream', () => {
   });
 });
 
-function setup(sessionText = 'synthetic') {
+function setup(sessionText = 'synthetic', history: string[] = []) {
   const dir = mkdtempSync(join(root, 'h-'));
   const projects = join(dir, 'projects');
   const folder = join(projects, '-synthetic-folder');
   mkdirSync(folder, { recursive: true });
   const src = 'aaaaaaaa-0000-4000-8000-000000000001';
-  writeFileSync(join(folder, `${src}.jsonl`), JSON.stringify({ type: 'user', cwd: join(dir, 'work'), message: { content: sessionText } }) + '\n');
+  writeFileSync(join(folder, `${src}.jsonl`), [JSON.stringify({ type: 'user', cwd: join(dir, 'work'), message: { content: sessionText } }), ...history].join('\n') + '\n');
   mkdirSync(join(dir, 'work'));
   const out: string[] = [];
-  return { dir, projects, folder, src, evalDir: join(dir, 'eval'), outDir: join(dir, 'eval', 'out'), out };
+  const sourceLines = readFileSync(join(folder, `${src}.jsonl`), 'utf8').split('\n').filter(Boolean);
+  return { dir, projects, folder, src, sourceLines, evalDir: join(dir, 'eval'), outDir: join(dir, 'eval', 'out'), out };
 }
 
 const baseOpts = (s: ReturnType<typeof setup>, spawn: BSpawn, confirm: (q: string) => Promise<boolean>) => ({
@@ -95,7 +110,7 @@ describe('runHeadless', () => {
       argv = a;
       spawnEnv = o.env;
       newId = a[a.indexOf('--session-id') + 1];
-      writeFileSync(join(s.folder, `${newId}.jsonl`), compacted('S1\nS2').join('\n') + '\n');
+      writeFileSync(join(s.folder, `${newId}.jsonl`), [...s.sourceLines, ...compacted('S1\nS2')].join('\n') + '\n');
       return { status: 0, stdout: 'trimmed to 3/9 messages (50% reduction; prose: 4 scored, 1 dropped)', stderr: '' };
     };
     const r = await runHeadless(baseOpts(s, spawn, async () => true));
@@ -124,13 +139,44 @@ describe('runHeadless', () => {
   it('records headless false when the fork compacted without the hook summary', async () => {
     const s = setup();
     const spawn: BSpawn = (a) => {
-      writeFileSync(join(s.folder, `${a[a.indexOf('--session-id') + 1]}.jsonl`), compacted('S').join('\n') + '\n');
+      writeFileSync(join(s.folder, `${a[a.indexOf('--session-id') + 1]}.jsonl`), [...s.sourceLines, ...compacted('S')].join('\n') + '\n');
       return { status: 0, stdout: 'done', stderr: '' };
     };
     await runHeadless(baseOpts(s, spawn, async () => true));
     const mode = JSON.parse(readFileSync(join(s.outDir, 'b-mode.json'), 'utf8'));
     expect(mode.headless).toBe(false);
     expect(mode.evidence).toMatch(/boundary/);
+  });
+
+  const forkWith = (s: ReturnType<typeof setup>, extra: string[]): BSpawn => (a) => {
+    writeFileSync(join(s.folder, `${a[a.indexOf('--session-id') + 1]}.jsonl`), [...s.sourceLines, ...extra].join('\n') + '\n');
+    return { status: 0, stdout: 'done', stderr: '' };
+  };
+  const modeOf = (s: ReturnType<typeof setup>) => JSON.parse(readFileSync(join(s.outDir, 'b-mode.json'), 'utf8'));
+
+  it('ignores a hook toast and an old boundary that were only copied from the source history', async () => {
+    const s = setup('synthetic', [user('trimmed to 3/9 messages (prose: 3 scored, 0 dropped)'), ...compacted('OLD')]);
+    await runHeadless(baseOpts(s, forkWith(s, []), async () => true));
+    expect(modeOf(s).headless).toBe(false);
+    expect(existsSync(join(s.outDir, 'b'))).toBe(false);
+  });
+
+  it('records headless false and no b file when only an old boundary exists and the new /compact failed', async () => {
+    const s = setup('synthetic', compacted('OLD'));
+    await runHeadless(baseOpts(s, forkWith(s, [user('later')]), async () => true));
+    expect(modeOf(s).headless).toBe(false);
+    expect(modeOf(s).evidence).toMatch(/no new compact boundary/);
+    expect(existsSync(join(s.outDir, 'b', 'case-9.json'))).toBe(false);
+  });
+
+  it('records headless true with fallback evidence on a new fast-jev fallback toast', async () => {
+    const s = setup();
+    const fallback = line({ type: 'system', subtype: 'info', content: 'fallback to built-in summary (request failed)' });
+    await runHeadless(baseOpts(s, forkWith(s, [fallback, ...compacted('NEW')]), async () => true));
+    const mode = modeOf(s);
+    expect(mode.headless).toBe(true);
+    expect(mode.evidence).toMatch(/fell back/);
+    expect(JSON.parse(readFileSync(join(s.outDir, 'b', 'case-9.json'), 'utf8')).summary).toEqual(['NEW']);
   });
 
   it('refuses without a key, or a missing source, before asking or spawning', async () => {
