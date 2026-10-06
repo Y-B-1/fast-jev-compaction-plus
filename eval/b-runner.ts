@@ -25,8 +25,9 @@ export type BSpawn = (argv: string[], opts: { cwd: string; env: NodeJS.ProcessEn
 
 /**
  * Last compact boundary of a compacted transcript: summary lines (non-blank) and keptMessages.
- * Real transcripts point at the kept messages with compactMetadata.preservedSegment {headUuid, anchorUuid, tailUuid};
- * they lie BEFORE the boundary, so keptMessages is the main-thread message count from the head record to the tail record.
+ * Real transcripts point at the kept messages with compactMetadata.preservedMessages.uuids (keptMessages is the count of user and
+ * assistant records in that list) or compactMetadata.preservedSegment {headUuid, anchorUuid, tailUuid};
+ * they lie BEFORE the boundary, so for a segment keptMessages is the main-thread message count from the head record to the tail record.
  * Without a usable segment it falls back to the messages after the boundary (the synthetic and hand shape).
  */
 export function parseCompacted(file: string, caseId: string, mode: BResult['mode']): BResult {
@@ -42,6 +43,11 @@ function preservedCount(raw: string): number | undefined {
   const lines = raw.split('\n').filter((l) => l.trim());
   const recs = lines.map((l) => { try { return JSON.parse(l); } catch { return undefined; } });
   const b = recs.map((r, i) => (r?.type === 'system' && r.subtype === 'compact_boundary' && !r.isSidechain ? i : -1)).filter((i) => i >= 0).pop();
+  const uuids = b === undefined ? undefined : recs[b].compactMetadata?.preservedMessages?.uuids;
+  if (Array.isArray(uuids)) {
+    const keep = new Set<unknown>(uuids);
+    return recs.filter((r) => keep.has(r?.uuid) && (r?.type === 'user' || r?.type === 'assistant')).length;
+  }
   const seg = b === undefined ? undefined : recs[b].compactMetadata?.preservedSegment;
   if (typeof seg?.headUuid !== 'string' || typeof seg?.tailUuid !== 'string') return undefined;
   const head = recs.findIndex((r) => r?.uuid === seg.headUuid);
@@ -78,16 +84,28 @@ const realSpawn: BSpawn = (argv, { cwd, env }) => {
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const EVAL_DIR = join(homedir(), '.claude', 'fast-jev-eval');
 
-/** Same copy as live-compact.sh: only the copy's userConfig.proseTrim.default is patched. */
-function copyTidyPlugin(evalDir: string): string {
+/**
+ * Same copy as live-compact.sh: the copy's userConfig.proseTrim.default is patched to tidy, and its notify() writes its text to
+ * `marker` (run-unique, so model text can never forge it). The repo's own hook is never touched; a missing or repeated anchor throws.
+ */
+function copyTidyPlugin(evalDir: string, marker: string, repo = REPO): string {
   const copy = join(evalDir, 'live', 'tidy');
   rmSync(copy, { recursive: true, force: true });
   mkdirSync(copy, { recursive: true });
-  for (const dir of ['.claude-plugin', 'hooks', 'src', 'types']) cpSync(join(REPO, dir), join(copy, dir), { recursive: true });
+  for (const dir of ['.claude-plugin', 'hooks', 'src', 'types']) cpSync(join(repo, dir), join(copy, dir), { recursive: true });
   const manifest = join(copy, '.claude-plugin', 'plugin.json');
   const json = JSON.parse(readFileSync(manifest, 'utf8'));
   json.userConfig.proseTrim.default = 'tidy';
   writeFileSync(manifest, JSON.stringify(json, null, 2) + '\n');
+  const hook = join(copy, 'hooks', 'fast-jev.ts');
+  const src = readFileSync(hook, 'utf8');
+  const start = src.indexOf('function notify(');
+  const body = start < 0 || src.indexOf('function notify(', start + 1) >= 0 ? undefined : src.slice(start, src.indexOf('\n}\n', start));
+  const anchor = '  log($, text);';
+  if (body === undefined || body.split(anchor).length !== 2) throw new Error(`cannot instrument the plugin copy: "${anchor}" not found exactly once inside notify() in hooks/fast-jev.ts`);
+  const at = start + body.indexOf(anchor) + anchor.length;
+  const probe = `\n  void ($ as any).fs?.write?.(${JSON.stringify(marker)}, text)?.catch?.(() => {});`;
+  writeFileSync(hook, src.slice(0, at) + probe + src.slice(at));
   return copy;
 }
 
@@ -96,6 +114,7 @@ export interface HeadlessOptions {
   caseId: string;
   projectsDir?: string;
   evalDir?: string;
+  repoDir?: string;
   outDir?: string;
   env?: NodeJS.ProcessEnv;
   spawn?: BSpawn;
@@ -104,13 +123,11 @@ export interface HeadlessOptions {
 }
 
 /**
- * Detection signal: any toast fast-jev's session.compact handler emits ("prose: N scored" on a trim, else "trimmed to", "kept N/M",
- * "skipped (" or "fallback to built-in summary ("), found in the child's stdout/stderr or in NEW fork records only.
- * A fork copies the source history, so records at or before the source's record count (and its old boundaries) are ignored;
- * only fork records past that count, written by this run, count. A compact boundary alone proves /compact ran, not the hook.
+ * Detection: the instrumented plugin copy writes fast-jev's notify text to a marker file named for the fork's new session id.
+ * The hook ran iff that file exists; its text, not model output, says whether the trim succeeded. Only fork records past the
+ * source's record count, written by this run, count for the boundary. A compact boundary alone proves /compact ran, not the hook.
  */
-const HOOK_SIGNAL = /prose: \d+ scored|trimmed to \d+\/\d+ messages|kept \d+\/\d+ messages, no summary|skipped \(|fallback to built-in summary \(/;
-const TRIM_SIGNAL = /prose: \d+ scored/;
+const TRIM_SIGNAL = /prose: \d+ scored|^trimmed to \d+\/\d+ messages/;
 const recordLines = (raw: string) => raw.split('\n').filter((l) => l.trim());
 const isBoundary = (l: string) => { try { const o = JSON.parse(l); return o.type === 'system' && o.subtype === 'compact_boundary'; } catch { return false; } };
 
@@ -126,28 +143,29 @@ export async function runHeadless(o: HeadlessOptions): Promise<'refused' | BMode
   const sourceFile = join(projectsDir, folder.name, `${o.sourceId}.jsonl`);
   const cwd = readFileSync(sourceFile, 'utf8').split('\n').map((l) => { try { return JSON.parse(l).cwd; } catch { return undefined; } }).find((c) => typeof c === 'string');
   if (!cwd) throw new Error('source session records no cwd');
-  const sourceRecords = recordLines(readFileSync(sourceFile, 'utf8')).length;
   const newId = randomUUID();
   const forkPath = join(projectsDir, folder.name, `${newId}.jsonl`);
   print(`The fork will write: ${forkPath}`);
   if (!(await (o.confirm ?? ((q) => confirmFromStream(q)))('Run claude -p --resume --fork-session with /compact on this session?'))) return 'refused';
 
-  const copy = copyTidyPlugin(evalDir);
+  const sourceRecords = recordLines(readFileSync(sourceFile, 'utf8')).length;
+  const marker = join(evalDir, 'live', `marker-${newId}.txt`);
+  const copy = copyTidyPlugin(evalDir, marker, o.repoDir);
+  rmSync(marker, { force: true });
   const argv = ['-p', '/compact', '--resume', o.sourceId, '--fork-session', '--session-id', newId, '--setting-sources', 'project,local', '--plugin-dir', copy, '--output-format', 'stream-json', '--verbose'];
   const r = (o.spawn ?? realSpawn)(argv, { cwd, env: { ...env, CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1' } });
   const forked = existsSync(forkPath);
   const fresh = forked ? recordLines(readFileSync(forkPath, 'utf8')).slice(sourceRecords) : [];
   const hasBoundary = fresh.some(isBoundary);
-  const seen = `${r.stdout}\n${r.stderr}\n${fresh.join('\n')}`;
-  const hook = HOOK_SIGNAL.test(seen);
-  const outcome = TRIM_SIGNAL.test(seen) ? 'trim succeeded' : 'fell back to the built-in summary or skipped';
+  const hook = existsSync(marker);
+  const outcome = hook && TRIM_SIGNAL.test(readFileSync(marker, 'utf8').trim()) ? 'trim succeeded' : 'fell back to the built-in summary or skipped';
   const mode: BMode = {
     headless: hook && hasBoundary,
     evidence: !hasBoundary
-      ? `no new compact boundary in fork (claude exit ${r.status}${forked ? '' : ', no fork file'}${hook ? '; hook output seen' : ''})`
+      ? `no new compact boundary in fork (claude exit ${r.status}${forked ? '' : ', no fork file'}${hook ? '; hook marker seen' : ''})`
       : hook
-        ? `fast-jev hook output in new output or new fork records (${outcome})`
-        : 'new compact boundary in fork, no fast-jev hook output',
+        ? `fast-jev hook marker written and new compact boundary in fork (${outcome})`
+        : 'new compact boundary in fork, no fast-jev hook marker',
     forkPath,
   };
   mkdirSync(outDir, { recursive: true });
