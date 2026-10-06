@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   archiveWriter,
@@ -11,6 +12,7 @@ import {
   toSessionMessages,
 } from '../hooks/fast-jev.ts';
 import { applyDecisions, collectToolCalls, decideCall, type Message } from '../src/index.js';
+import { messageChars } from '../src/compact.js';
 
 type SessionMessage = Message & { handle?: string };
 
@@ -73,6 +75,7 @@ describe('hook config', () => {
       builtinFallback: 'auto',
       jevPruneBashOutput: false,
       jevPruneMinChars: 4_000,
+      proseTrim: 'off',
     });
     expect(
       resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g' }),
@@ -87,6 +90,7 @@ describe('hook config', () => {
       builtinFallback: 'auto',
       jevPruneBashOutput: false,
       jevPruneMinChars: 4_000,
+      proseTrim: 'off',
     });
   });
 
@@ -706,4 +710,180 @@ describe('register: tool.call (Bash output trimming)', () => {
   function next(fn: () => Promise<unknown>) {
     return Object.assign(fn, { signal: new AbortController().signal, budget: { ms: 10_000, remainingMs: 10_000 } });
   }
+});
+
+describe('proseTrim', () => {
+  const FLUFF = 'Let me have a good look at the layout of this module now.';
+  const FACT = 'The cache layer returns stale entries after a restart.';
+  const body = 'const value = compute();\n'.repeat(80);
+
+  function proseTranscript(): SessionMessage[] {
+    return [
+      message('user', 'Fix the stale cache.', { handle: 'p-0' }),
+      message('assistant', `${FLUFF} ${FACT}`, { handle: 'p-1' }),
+      call('w1', 'Write', { file_path: 'src/c.ts', content: body }, 'wrote'),
+      result('w1', 'ok'),
+      message('user', 'thanks', { handle: 'p-4' }),
+      message('assistant', 'Done.', { handle: 'p-5' }),
+      message('user', 'ok', { handle: 'p-6' }),
+    ];
+  }
+
+  /** Tool questions get `tool`, prose parts (`c<n>`) get `prose`; a number throws when prose is 'fail'. */
+  function fetchWith(prose: number | 'fail', tool = 0.9, seen: string[] = []) {
+    return async (_url: string, init?: { body?: string }) => {
+      const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
+      const keys = Object.keys(questions);
+      seen.push(...keys);
+      if (prose === 'fail' && keys.some((k) => /^c\d+$/.test(k))) {
+        return { status: 500, ok: false, text: 'down' };
+      }
+      const answers = Object.fromEntries(
+        keys.map((k) => [k, { type: 'noul', noul: /^c\d+$/.test(k) ? prose : tool }]),
+      );
+      return { status: 200, ok: true, text: JSON.stringify({ answers }) };
+    };
+  }
+
+  const cfg = (extra: Record<string, unknown> = {}) => ({
+    ...resolveHookConfig({ preserveRecentMessages: 2, archiveResults: false, ...extra }),
+    apiKey: 'k',
+  });
+  const strip = (r: Awaited<ReturnType<typeof compactSession>>) => ({
+    messages: r.messages,
+    decisions: r.result.decisions,
+    stats: { ...r.result.stats, ms: 0 },
+    prose: r.prose,
+  });
+
+  it('parses proseTrim like builtinFallback: unknown values become off', () => {
+    expect(resolveHookConfig({}).proseTrim).toBe('off');
+    expect(resolveHookConfig({ proseTrim: 'trim' }).proseTrim).toBe('trim');
+    expect(resolveHookConfig({ proseTrim: 'tidy' }).proseTrim).toBe('tidy');
+    expect(resolveHookConfig({ proseTrim: 'aggressive' }).proseTrim).toBe('off');
+    expect(resolveHookConfig({ proseTrim: true }).proseTrim).toBe('off');
+  });
+
+  it('declares proseTrim in the manifest as a string option defaulting to off', () => {
+    const manifest = JSON.parse(readFileSync(new URL('../.claude-plugin/plugin.json', import.meta.url), 'utf8'));
+    expect(manifest.userConfig.proseTrim).toMatchObject({ type: 'string', default: 'off' });
+  });
+
+  it('gives equal output when proseTrim is omitted and when it is "off", with no prose text', async () => {
+    for (const make of [transcript, proseTranscript]) {
+      const omitted = await compactSession(make(), cfg(), fetchWith(0.01));
+      const off = await compactSession(make(), cfg({ proseTrim: 'off' }), fetchWith(0.01));
+      expect(strip(off)).toEqual(strip(omitted));
+      expect(off.prose).toBeUndefined();
+      expect(summarize(off.result, off.prose)).toBe(summarize(omitted.result));
+      expect(summarize(off.result, off.prose)).not.toContain('prose:');
+    }
+  });
+
+  it('trims prose and inputs, and the savings equal the drop in final chars', async () => {
+    const off = await compactSession(proseTranscript(), cfg(), fetchWith(0.01));
+    const on = await compactSession(proseTranscript(), cfg({ proseTrim: 'trim' }), fetchWith(0.01));
+    expect(on.prose?.scored).toBeGreaterThan(0);
+    expect(on.prose?.dropped).toBeGreaterThan(0);
+    expect(on.prose?.inputsElided).toBe(1);
+    expect(on.prose?.proseCharsSaved).toBeGreaterThan(0);
+    expect(on.prose?.inputCharsSaved).toBeGreaterThan(0);
+    expect(on.result.stats.charsAfter).toBe(on.messages.reduce((n, m) => n + messageChars(m), 0));
+    expect(on.result.decisions).toEqual(off.result.decisions);
+    expect(on.messages.map((m) => m.handle)).toContain('p-0');
+    expect(on.messages.find((m) => m.handle === 'p-5')?.text).toBe('Done.');
+    expect(summarize(on.result, on.prose)).toMatch(
+      /; prose: [1-9]\d* scored, [1-9]\d* dropped; inputs: 1 elided; [1-9]\d* chars$/,
+    );
+    // Prose is counted in plain characters. A tool input is counted as JSON, where each line
+    // break is two characters, so the drop in `charsAfter` exceeds the stage's own count by one
+    // per line break the cut removed.
+    const content = (r: typeof on) =>
+      String(r.messages.flatMap((m) => m.toolUses).find((t) => t.tool_use_id === 'w1')?.input['content']);
+    const breaksCut = body.split('\n').length - content(on).split('\n').length;
+    expect(breaksCut).toBeGreaterThan(0);
+    expect(off.result.stats.charsAfter - on.result.stats.charsAfter).toBe(
+      (on.prose?.proseCharsSaved ?? 0) + (on.prose?.inputCharsSaved ?? 0) + breaksCut,
+    );
+  });
+
+  it('prose savings alone equal the drop in final chars exactly', async () => {
+    const make = (): SessionMessage[] => [
+      message('user', 'Fix the stale cache.'),
+      message('assistant', `${FLUFF} ${FACT}`),
+      message('user', 'thanks'),
+      message('assistant', 'Done.'),
+      message('user', 'ok'),
+    ];
+    const off = await compactSession(make(), cfg(), fetchWith(0.01));
+    const on = await compactSession(make(), cfg({ proseTrim: 'trim' }), fetchWith(0.01));
+    expect(on.prose?.dropped).toBeGreaterThan(0);
+    expect(on.prose?.inputCharsSaved).toBe(0);
+    expect(off.result.stats.charsAfter - on.result.stats.charsAfter).toBe(on.prose?.proseCharsSaved);
+  });
+
+  it('treats tidy like trim here', async () => {
+    const trim = await compactSession(proseTranscript(), cfg({ proseTrim: 'trim' }), fetchWith(0.01));
+    const tidy = await compactSession(proseTranscript(), cfg({ proseTrim: 'tidy' }), fetchWith(0.01));
+    expect(strip(tidy)).toEqual(strip(trim));
+  });
+
+  it('discards the whole stage when every prose request fails', async () => {
+    const off = await compactSession(proseTranscript(), cfg(), fetchWith(0.01));
+    const failed = await compactSession(proseTranscript(), cfg({ proseTrim: 'trim' }), fetchWith('fail'));
+    expect(failed.prose).toBeUndefined();
+    expect(strip(failed)).toEqual(strip(off));
+  });
+
+  describe('through the hook', () => {
+    const hook = (options: Record<string, unknown>) => {
+      const hooks: Record<string, (...args: any[]) => Promise<any>> = {};
+      (register as any)(
+        (event: string, a: unknown, b?: any) => {
+          hooks[event] = typeof b === 'function' ? b : (a as any);
+        },
+        { apiKey: 'k', preserveRecentMessages: 2, archiveResults: false, ...options },
+      );
+      const logs: string[] = [];
+      const toasts: string[] = [];
+      const $ = {
+        clock,
+        http: { fetch: async (url: string, init?: { body?: string }) => fetchWith(0.9)(url, init) },
+        ui: { log: (t: string) => logs.push(t), toast: (t: string) => toasts.push(t) },
+      };
+      const next = Object.assign(async (e: unknown) => e, {
+        signal: new AbortController().signal,
+        budget: { ms: 10_000, remainingMs: 10_000 },
+      });
+      const run = (event: Record<string, unknown>) => hooks['session.compact']!($, event, next);
+      return { run, logs, toasts };
+    };
+
+    it('input-only savings lift a run over the gate, and the result is {messages}', async () => {
+      const event = { trigger: 'auto', messages: proseTranscript() };
+      const off = hook({});
+      expect(await off.run(event)).toBe(event);
+      expect(off.toasts.join('\n')).toContain('fallback to built-in summary');
+
+      const on = hook({ proseTrim: 'trim' });
+      const out = await on.run(event);
+      expect(Object.keys(out)).toEqual(['messages']);
+      expect(out.messages.length).toBe(event.messages.length);
+      expect(on.toasts.join('\n')).toMatch(/kept 7\/7 messages, no summary \(.*prose: [1-9]\d* scored, 0 dropped; inputs: 1 elided; [1-9]\d* chars\)/);
+      expect(on.logs.some((l) => l.startsWith('decisions: '))).toBe(true);
+    });
+
+    it('below the gate the fallback is unchanged and shows no prose text', async () => {
+      const event = { trigger: 'auto', messages: transcript() };
+      const off = hook({ minReductionRatio: 0.99 });
+      const on = hook({ minReductionRatio: 0.99, proseTrim: 'trim' });
+      expect(await on.run(event)).toBe(event);
+      expect(await off.run(event)).toBe(event);
+      for (const run of [on, off]) {
+        expect(run.toasts).toHaveLength(1);
+        expect(run.toasts[0]).toMatch(/^fallback to built-in summary \(below 99% minimum: /);
+      }
+      expect(off.toasts[0]).not.toContain('prose:');
+    });
+  });
 });
