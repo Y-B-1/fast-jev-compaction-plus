@@ -5,7 +5,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PassThrough } from 'node:stream';
 import { afterAll, describe, expect, it, vi } from 'vitest';
-import { confirmFromStream, parseCompacted, runHeadless, type BSpawn } from './b-runner.js';
+import { confirmFromStream, cutCopy, parseCompacted, runHeadless, type BSpawn } from './b-runner.js';
+import { loadTranscript, type Case } from './load.js';
 
 const root = mkdtempSync(join(tmpdir(), 'fjev-b-'));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -96,13 +97,20 @@ function setup(sessionText = 'synthetic', history: string[] = []) {
   mkdirSync(join(dir, 'work'));
   const out: string[] = [];
   const sourceLines = readFileSync(join(folder, `${src}.jsonl`), 'utf8').split('\n').filter(Boolean);
-  return { dir, projects, folder, src, sourceLines, evalDir: join(dir, 'eval'), outDir: join(dir, 'eval', 'out'), out };
+  const file = join(folder, `${src}.jsonl`);
+  const tail = loadTranscript({ path: file, mtimeMs: 0, sha256: createHash('sha256').update(readFileSync(file)).digest('hex') }).messages.length;
+  const theCase: Case = { id: 'case-9', transcript: file, start: 0, end: tail, chars: 0, estTokens: 0 };
+  return { dir, projects, folder, src, sourceLines, theCase, evalDir: join(dir, 'eval'), outDir: join(dir, 'eval', 'out'), out };
 }
 
 const baseOpts = (s: ReturnType<typeof setup>, spawn: BSpawn, confirm: (q: string) => Promise<boolean>) => ({
-  sourceId: s.src, caseId: 'case-9', projectsDir: s.projects, evalDir: s.evalDir, outDir: s.outDir,
+  case: s.theCase, evalDir: s.evalDir, outDir: s.outDir,
   env: { PATH: '/bin', TYPESAFE_API_KEY: KEY } as NodeJS.ProcessEnv, spawn, confirm, print: (m: string) => s.out.push(m),
 });
+
+const modeOf = (s: ReturnType<typeof setup>) => JSON.parse(readFileSync(join(s.outDir, 'b-mode.json'), 'utf8'));
+const idOf = (a: string[]) => a[a.indexOf('--session-id') + 1];
+const markerOf = (s: ReturnType<typeof setup>, a: string[]) => join(s.evalDir, 'live', `marker-${idOf(a)}.txt`);
 
 describe('runHeadless', () => {
   it('prints the fork path, sends nothing and writes nothing on n', async () => {
@@ -133,7 +141,8 @@ describe('runHeadless', () => {
     const r = await runHeadless(baseOpts(s, spawn, async () => true));
     expect(r).not.toBe('refused');
     expect(argv).toContain('--resume');
-    expect(argv[argv.indexOf('--resume') + 1]).toBe(s.src);
+    expect(argv[argv.indexOf('--resume') + 1]).not.toBe(s.src);
+    expect(argv[argv.indexOf('--resume') + 1]).toMatch(/^[0-9a-f-]{36}$/);
     expect(argv).toContain('--fork-session');
     expect(argv).toContain('/compact');
     const copy = join(s.evalDir, 'live', 'tidy');
@@ -169,10 +178,7 @@ describe('runHeadless', () => {
     writeFileSync(join(s.folder, `${a[a.indexOf('--session-id') + 1]}.jsonl`), [...s.sourceLines, ...extra].join('\n') + '\n');
     return { status: 0, stdout: 'done', stderr: '' };
   };
-  const modeOf = (s: ReturnType<typeof setup>) => JSON.parse(readFileSync(join(s.outDir, 'b-mode.json'), 'utf8'));
 
-  const idOf = (a: string[]) => a[a.indexOf('--session-id') + 1];
-  const markerOf = (s: ReturnType<typeof setup>, a: string[]) => join(s.evalDir, 'live', `marker-${idOf(a)}.txt`);
   const forkMarker = (s: ReturnType<typeof setup>, extra: string[], text?: string): BSpawn => (a) => {
     writeFileSync(join(s.folder, `${idOf(a)}.jsonl`), [...s.sourceLines, ...extra].join('\n') + '\n');
     if (text !== undefined) writeFileSync(markerOf(s, a), text);
@@ -271,24 +277,6 @@ describe('runHeadless', () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
-  it('does not count source records appended while the confirm callback runs as fork records', async () => {
-    const s = setup();
-    const srcFile = join(s.folder, `${s.src}.jsonl`);
-    const confirm = async () => {
-      writeFileSync(srcFile, readFileSync(srcFile, 'utf8') + [user('grown 1'), ...compacted('GROWN')].join('\n') + '\n');
-      return true;
-    };
-    const grown = () => readFileSync(srcFile, 'utf8').split('\n').filter(Boolean);
-    const spawn: BSpawn = (a) => {
-      writeFileSync(join(s.folder, `${idOf(a)}.jsonl`), grown().join('\n') + '\n');
-      writeFileSync(markerOf(s, a), 'prose: 3 scored');
-      return { status: 0, stdout: 'done', stderr: '' };
-    };
-    await runHeadless(baseOpts(s, spawn, confirm));
-    expect(modeOf(s).headless).toBe(false);
-    expect(modeOf(s).evidence).toMatch(/no new compact boundary/);
-  });
-
   it('records headless false and no b file when only an old boundary exists and the new /compact failed', async () => {
     const s = setup('synthetic', compacted('OLD'));
     await runHeadless(baseOpts(s, forkWith(s, [user('later')]), async () => true));
@@ -297,14 +285,128 @@ describe('runHeadless', () => {
     expect(existsSync(join(s.outDir, 'b', 'case-9.json'))).toBe(false);
   });
 
-  it('refuses without a key, or a missing source, before asking or spawning', async () => {
+  it('refuses without a key, or an unknown case id, before asking or spawning', async () => {
     const s = setup();
+    const manifestPath = join(s.dir, 'manifest.json');
+    writeFileSync(manifestPath, JSON.stringify({ cutoffMs: 0, files: [] }));
     const spawn = vi.fn<BSpawn>();
     const confirm = vi.fn(async () => true);
     await expect(runHeadless({ ...baseOpts(s, spawn, confirm), env: {} })).rejects.toThrow(/TYPESAFE_API_KEY/);
-    await expect(runHeadless({ ...baseOpts(s, spawn, confirm), sourceId: 'nope' })).rejects.toThrow(/not found/);
+    await expect(runHeadless({ ...baseOpts(s, spawn, confirm), case: 'nope#0-1', manifestPath })).rejects.toThrow(/not found/);
     expect(confirm).not.toHaveBeenCalled();
     expect(spawn).not.toHaveBeenCalled();
-    expect(readdirSync(s.dir).sort()).toEqual(['projects', 'work']);
+    expect(readdirSync(s.dir).sort()).toEqual(['manifest.json', 'projects', 'work']);
+    expect(readdirSync(s.folder)).toEqual([`${s.src}.jsonl`]);
+  });
+
+  it('resolves a case id against the manifest', async () => {
+    const hist = setup('synthetic', compacted('S'));
+    const m2 = join(hist.dir, 'manifest.json');
+    const f2 = join(hist.folder, `${hist.src}.jsonl`);
+    writeFileSync(m2, JSON.stringify({ cutoffMs: 0, files: [{ path: f2, mtimeMs: 0, sha256: createHash('sha256').update(readFileSync(f2)).digest('hex') }] }));
+    let argv: string[] = [];
+    const spawn: BSpawn = (a) => { argv = a; return { status: 0, stdout: '', stderr: '' }; };
+    await runHeadless({ ...baseOpts(hist, spawn, async () => true), case: `${hist.src}#0-3`, manifestPath: m2 });
+    expect(argv).toContain('--resume');
+    expect(readdirSync(hist.folder)).toEqual([`${hist.src}.jsonl`]);
+  });
+});
+
+describe('cutCopy and the cut run', () => {
+  // Source: m0 (cwd line), q1 a1 | boundary#1 at 3 | summary, q2 a2 (+ a sidechain) | boundary#2 at 5 | summary, tail1.
+  const twoBoundaries = () => {
+    const h = [
+      user('q1', { sessionId: 'old' }), asst('a1'), boundary(), user('S1', { isCompactSummary: true, sessionId: 'old' }),
+      user('side', { isSidechain: true }), user('q2'), asst('a2'), 'not json {', boundary(), user('S2', { isCompactSummary: true }), user('tail1'),
+    ];
+    const s = setup('synthetic', h);
+    const file = join(s.folder, `${s.src}.jsonl`);
+    const t = loadTranscript({ path: file, mtimeMs: 0, sha256: createHash('sha256').update(readFileSync(file)).digest('hex') });
+    return { s, t, file };
+  };
+  const hashOf = (p: string) => createHash('sha256').update(readFileSync(p)).digest('hex');
+
+  it('cuts at the second boundary: end messages, same last segment, nothing from the boundary on, every sessionId is the cut id', () => {
+    const { s, t, file } = twoBoundaries();
+    expect(t.boundaries.map((b) => b.at)).toEqual([3, 5]);
+    const c: Case = { ...s.theCase, start: 3, end: 5 };
+    const { cutId, path } = cutCopy(c);
+    expect(path).toBe(join(s.folder, `${cutId}.jsonl`));
+    const cut = loadTranscript({ path, mtimeMs: 0, sha256: hashOf(path) });
+    expect(cut.messages).toHaveLength(5);
+    expect(cut.messages.slice(3)).toEqual(t.messages.slice(3, 5));
+    expect(cut.boundaries).toHaveLength(1);
+    const lines = readFileSync(path, 'utf8').split('\n').filter(Boolean);
+    expect(lines.some((l) => l.includes('S2') || l.includes('tail1') || l.includes('not json'))).toBe(false);
+    expect(lines.some((l) => l.includes('"side"'))).toBe(true);
+    const ids = lines.map((l) => JSON.parse(l).sessionId).filter((x) => x !== undefined);
+    expect(ids.length).toBeGreaterThan(0);
+    expect(new Set(ids)).toEqual(new Set([cutId]));
+    expect(readFileSync(file, 'utf8')).toContain('"sessionId":"old"');
+  });
+
+  it('keeps every parseable line for a tail case', () => {
+    const { s, file } = twoBoundaries();
+    const { path } = cutCopy(s.theCase);
+    const want = readFileSync(file, 'utf8').split('\n').filter((l) => l.trim() && l !== 'not json {');
+    const got = readFileSync(path, 'utf8').split('\n').filter(Boolean);
+    expect(got).toHaveLength(want.length);
+    expect(got.map((l) => JSON.parse(l).uuid)).toEqual(want.map((l) => JSON.parse(l).uuid));
+  });
+
+  it('throws and leaves no file when the end matches no boundary', () => {
+    const { s } = twoBoundaries();
+    const before = readdirSync(s.folder).sort();
+    expect(() => cutCopy({ ...s.theCase, start: 0, end: 4 })).toThrow(/no compact boundary at message 4/);
+    expect(readdirSync(s.folder).sort()).toEqual(before);
+  });
+
+  const cutRun = (s: ReturnType<typeof setup>, c: Case, spawn: BSpawn, confirm: (q: string) => Promise<boolean> = async () => true) =>
+    runHeadless({ ...baseOpts(s, spawn, confirm), case: c });
+
+  it('resumes the cut copy, and removes it after the run', async () => {
+    const { s } = twoBoundaries();
+    const c: Case = { ...s.theCase, start: 3, end: 5 };
+    let resumed = '';
+    let existedDuring = false;
+    const spawn: BSpawn = (a) => {
+      resumed = a[a.indexOf('--resume') + 1];
+      existedDuring = existsSync(join(s.folder, `${resumed}.jsonl`));
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    await cutRun(s, c, spawn);
+    expect(resumed).not.toBe(s.src);
+    expect(existedDuring).toBe(true);
+    expect(existsSync(join(s.folder, `${resumed}.jsonl`))).toBe(false);
+    expect(readdirSync(s.folder)).toEqual([`${s.src}.jsonl`]);
+  });
+
+  it('removes the cut copy when the spawn throws', async () => {
+    const { s } = twoBoundaries();
+    const spawn: BSpawn = () => { throw new Error('boom'); };
+    await expect(cutRun(s, { ...s.theCase, start: 3, end: 5 }, spawn)).rejects.toThrow(/boom/);
+    expect(readdirSync(s.folder)).toEqual([`${s.src}.jsonl`]);
+  });
+
+  it('creates no copy when the confirm is refused', async () => {
+    const { s } = twoBoundaries();
+    const spawn = vi.fn<BSpawn>();
+    expect(await cutRun(s, { ...s.theCase, start: 3, end: 5 }, spawn, async () => false)).toBe('refused');
+    expect(readdirSync(s.folder)).toEqual([`${s.src}.jsonl`]);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it('does not count fork records whose uuid is in the cut copy as new', async () => {
+    const { s } = twoBoundaries();
+    const c: Case = { ...s.theCase, start: 3, end: 5 };
+    const spawn: BSpawn = (a) => {
+      const cutLines = readFileSync(join(s.folder, `${a[a.indexOf('--resume') + 1]}.jsonl`), 'utf8');
+      writeFileSync(join(s.folder, `${idOf(a)}.jsonl`), cutLines);
+      writeFileSync(markerOf(s, a), 'prose: 3 scored');
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    await cutRun(s, c, spawn);
+    expect(modeOf(s).headless).toBe(false);
+    expect(modeOf(s).evidence).toMatch(/no new compact boundary/);
   });
 });
