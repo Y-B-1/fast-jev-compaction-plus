@@ -433,6 +433,13 @@ export async function compactSession(
   };
 }
 
+/** What the core summarizer is told after a tidy trim: the old messages already lost their filler. */
+export function tidyInstructions(user?: string): string {
+  const base =
+    'The older messages were already trimmed by deleting filler and eliding old file contents; every remaining word is original. Condense them without losing any fact, decision or its reason, file path, command, number or version, identifier, error message, user instruction or constraint, or open task. Copy code, paths, commands and error text exactly. Add nothing that is not in the messages.';
+  return user ? `${base}\n\nUser instructions: ${user}` : base;
+}
+
 function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
@@ -573,6 +580,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
     if (event.trigger === 'precompute') {
       return { skip: 'fast-jev-compaction does not handle speculative compactions' };
     }
+    let handoff: { messages: readonly SessionMessage[]; instructions: string } | undefined;
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
       if (event.instructions?.trim()) {
@@ -591,25 +599,30 @@ export const register: Register = (on: On, options: PluginOptions) => {
       );
       if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) log($, line);
-      if (reductionRatio(result) < config.minReductionRatio) {
-        if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
+      if (config.proseTrim === 'tidy' && prose) {
+        notify($, `trimmed to ${messages.length}/${event.messages.length} messages, summary by core (${summarize(result, prose)})`);
+        handoff = { messages, instructions: tidyInstructions(event.instructions?.trim() || undefined) };
+      } else {
+        if (reductionRatio(result) < config.minReductionRatio) {
+          if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
+            notify(
+              $,
+              `skipped (below ${percent(config.minReductionRatio)} minimum, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result, prose)})`,
+            );
+            return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
+          }
           notify(
             $,
-            `skipped (below ${percent(config.minReductionRatio)} minimum, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result, prose)})`,
+            `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result, prose)})`,
           );
-          return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
+          return next(event);
         }
         notify(
           $,
-          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result, prose)})`,
+          `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose)})`,
         );
-        return next(event);
+        return { messages };
       }
-      notify(
-        $,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose)})`,
-      );
-      return { messages };
     } catch (error) {
       if (next.signal.aborted) return interrupted($);
       if (!mayUseBuiltin(event.trigger, configured.builtinFallback)) {
@@ -625,6 +638,8 @@ export const register: Register = (on: On, options: PluginOptions) => {
       );
       return next(event);
     }
+    // Outside the try: a throw from core must not reach the fallback's second `next`.
+    return next({ ...event, messages: handoff!.messages, instructions: handoff!.instructions });
   });
 
   // Opt-in (see HOOK_DEFAULTS.jevPruneBashOutput): trims a Bash command's

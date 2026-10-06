@@ -9,6 +9,7 @@ import {
   register,
   resolveHookConfig,
   summarize,
+  tidyInstructions,
   toSessionMessages,
 } from '../hooks/fast-jev.ts';
 import { applyDecisions, collectToolCalls, decideCall, type Message } from '../src/index.js';
@@ -884,6 +885,104 @@ describe('proseTrim', () => {
         expect(run.toasts[0]).toMatch(/^fallback to built-in summary \(below 99% minimum: /);
       }
       expect(off.toasts[0]).not.toContain('prose:');
+    });
+  });
+
+  describe('tidy through the hook', () => {
+    const TIDY_HEAD = 'The older messages were already trimmed by deleting filler and eliding old file contents;';
+    const hook = (
+      options: Record<string, unknown>,
+      nextImpl: (e: any) => Promise<unknown> = async (e) => e,
+      fetchFn: (url: string, init?: { body?: string }) => Promise<any> = fetchWith(0.9),
+    ) => {
+      const hooks: Record<string, (...args: any[]) => Promise<any>> = {};
+      (register as any)(
+        (event: string, a: unknown, b?: any) => {
+          hooks[event] = typeof b === 'function' ? b : (a as any);
+        },
+        { apiKey: 'k', preserveRecentMessages: 2, archiveResults: false, proseTrim: 'tidy', ...options },
+      );
+      const logs: string[] = [];
+      const toasts: string[] = [];
+      const calls: any[] = [];
+      const $ = {
+        clock,
+        http: { fetch: async (url: string, init?: { body?: string }) => fetchFn(url, init) },
+        ui: { log: (t: string) => logs.push(t), toast: (t: string) => toasts.push(t) },
+      };
+      const next = Object.assign(
+        async (e: any) => {
+          calls.push(e);
+          return nextImpl(e);
+        },
+        { signal: new AbortController().signal, budget: { ms: 10_000, remainingMs: 10_000 } },
+      );
+      const run = (event: Record<string, unknown>) => hooks['session.compact']!($, event, next);
+      return { run, calls, logs, toasts };
+    };
+
+    it('exports the tidy text, with the user suffix only when given', () => {
+      expect(tidyInstructions()).toMatch(/^The older messages were already trimmed/);
+      expect(tidyInstructions()).toContain('Add nothing that is not in the messages.');
+      expect(tidyInstructions()).not.toContain('User instructions');
+      expect(tidyInstructions('keep the auth plan')).toBe(`${tidyInstructions()}\n\nUser instructions: keep the auth plan`);
+    });
+
+    it('calls next once with the edited messages and tidy instructions, including the user suffix', async () => {
+      const event = { trigger: 'manual', messages: proseTranscript(), instructions: 'keep the cache bug' };
+      const h = hook({});
+      const sentinel = { summary: 'core' };
+      const again = hook({}, async () => sentinel);
+      expect(await again.run(event)).toBe(sentinel);
+      await h.run(event);
+      expect(h.calls).toHaveLength(1);
+      expect(h.calls[0].trigger).toBe('manual');
+      expect(h.calls[0].instructions.startsWith(TIDY_HEAD)).toBe(true);
+      expect(h.calls[0].instructions.endsWith('User instructions: keep the cache bug')).toBe(true);
+      const sent = JSON.stringify(h.calls[0].messages);
+      expect(JSON.stringify(event.messages).length).toBeGreaterThan(sent.length);
+      const plain = hook({});
+      await plain.run({ trigger: 'manual', messages: proseTranscript() });
+      expect(plain.calls[0].instructions).toBe(tidyInstructions());
+      expect(plain.toasts.join('\n')).toMatch(/prose: [1-9]\d* scored/);
+    });
+
+    it('still calls next below the gate when builtinFallback is never', async () => {
+      const h = hook({ minReductionRatio: 0.99, builtinFallback: 'never' });
+      await h.run({ trigger: 'auto', messages: proseTranscript() });
+      expect(h.calls).toHaveLength(1);
+      expect(h.calls[0].instructions).toBe(tidyInstructions());
+    });
+
+    it("returns core's skip as is", async () => {
+      const skip = { skip: 'core says no' };
+      const h = hook({}, async () => skip);
+      expect(await h.run({ trigger: 'auto', messages: proseTranscript() })).toBe(skip);
+      expect(h.calls).toHaveLength(1);
+    });
+
+    it('propagates a core throw with next called exactly once', async () => {
+      const h = hook({}, async () => {
+        throw new Error('core down');
+      });
+      await expect(h.run({ trigger: 'auto', messages: proseTranscript() })).rejects.toThrow('core down');
+      expect(h.calls).toHaveLength(1);
+    });
+
+    it('takes the off/gate path when the whole trim stage fails', async () => {
+      const event = { trigger: 'auto', messages: proseTranscript() };
+      const tidy = hook({}, async (e) => e, fetchWith('fail'));
+      const off = hook({ proseTrim: 'off' }, async (e) => e, fetchWith('fail'));
+      expect(await tidy.run(event)).toEqual(await off.run(event));
+      expect(tidy.toasts).toEqual(off.toasts);
+      const never = hook({ builtinFallback: 'never', minReductionRatio: 0.99 }, async (e) => e, fetchWith('fail'));
+      const neverOff = hook(
+        { proseTrim: 'off', builtinFallback: 'never', minReductionRatio: 0.99 },
+        async (e) => e,
+        fetchWith('fail'),
+      );
+      expect(await never.run(event)).toEqual(await neverOff.run(event));
+      expect(never.calls).toHaveLength(0);
     });
   });
 });
