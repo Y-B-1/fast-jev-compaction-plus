@@ -18,6 +18,7 @@ const ABBREVIATIONS = new Set(['e.g', 'i.e', 'etc', 'vs', 'cf']);
 const QUOTED = /"[^"\n]{4,}"|“[^”\n]{4,}”|(?<![\w])'[^'\n]{4,}'(?![\w])/;
 const BOUND =
   /\b(?:not|no|never|none|nothing|neither|nor|without|cannot|if|unless|only|except|until|before|after|when|otherwise|instead|but|however|although|though|yet|because|since|so that|must|needs?|required|always|avoid)\b|n't\b|n’t\b/i;
+const BOUND_START = new RegExp(`^(?:${BOUND.source})`, 'i');
 const MARKER_LINE = '[fast-jev-compaction ';
 
 /** Whether `s` holds any protected span (P3, P5-P9; line-level spans are handled by the caller). */
@@ -87,7 +88,8 @@ function sentenceSpans(text: string, from: number, to: number): Span[] {
   let at = from;
   // Opener: a short lead-in ending in , or ; stands alone, unless it holds a bound word.
   const lead = /^[^,;\n]*[,;](?=\s)/.exec(text.slice(from, to));
-  if (lead && wordCount(lead[0]) <= 4 && !BOUND.test(lead[0]) && /\S/.test(text.slice(from + lead[0].length, to))) {
+  const rest = lead ? text.slice(from + lead[0].length, to).trimStart() : '';
+  if (lead && wordCount(lead[0]) <= 4 && !BOUND.test(lead[0]) && rest !== '' && !BOUND_START.test(rest)) {
     units.push([from, from + lead[0].length]);
     at = from + lead[0].length;
     while (at < to && /\s/.test(text.charAt(at))) at++;
@@ -180,11 +182,11 @@ export function reassemble(text: string, units: ProseUnit[], keep: (u: ProseUnit
     let piece = slice(i);
     if (!kept[i]) {
       dropped = true;
-      // A list item whose first unit goes but later ones stay keeps its marker.
+      // A block whose first unit goes but later ones stay keeps its marker, or its break and indent.
       if (startsBlock(i)) {
         let j = i + 1;
         while (j < units.length && !startsBlock(j)) j++;
-        const marker = /^\s*(?:[-*+]|\d+[.)])[ \t]+/.exec(piece)?.[0];
+        const marker = /^\s*(?:[-*+]|\d+[.)])[ \t]+/.exec(piece)?.[0] ?? /^\s*/.exec(piece)?.[0];
         if (marker && kept.slice(i + 1, j).some(Boolean)) out += marker;
       }
       continue;

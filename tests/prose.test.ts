@@ -275,3 +275,31 @@ describe('salvage exports', () => {
     expect(ERROR_LINE.test('boom: fatal')).toBe(true);
   });
 });
+
+describe('T4 repair: line breaks and bound remainders', () => {
+  const dropAt = (text: string, n: number): string => {
+    const units = splitProse(text);
+    return reassemble(text, units, (u) => units.indexOf(u) !== n);
+  };
+
+  test.each([
+    ['single newline', 'Keep `one` here.\nDrop this sentence here. Keep `two` here.', 'Keep `one` here.\nKeep `two` here.'],
+    ['paragraph break', 'Keep `one` here.\n\nDrop this sentence here. Keep `two` here.', 'Keep `one` here.\n\nKeep `two` here.'],
+    ['indented line', 'Keep `one` here.\n  Drop this sentence here. Keep `two` here.', 'Keep `one` here.\n  Keep `two` here.'],
+  ])('a dropped first unit passes its %s to the next kept unit', (_name, text, expected) => {
+    expect(dropAt(text, 1)).toBe(expected);
+  });
+
+  test.each([
+    'Deploy now, but not on prod.',
+    'Run it on staging, unless it is Friday.',
+    'Restart the server, only after the backup.',
+    'Use the cache, never the database.',
+  ])('a bound remainder keeps %j as one unit', (text) => {
+    expect(view(text)).toHaveLength(1);
+  });
+
+  test('an opener before a plain remainder still splits', () => {
+    expect(view('Great question; the cache is stale because the TTL never resets.')).toHaveLength(2);
+  });
+});
