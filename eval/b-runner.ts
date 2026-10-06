@@ -104,7 +104,8 @@ function copyTidyPlugin(evalDir: string, marker: string, repo = REPO): string {
   const anchor = '  log($, text);';
   if (body === undefined || body.split(anchor).length !== 2) throw new Error(`cannot instrument the plugin copy: "${anchor}" not found exactly once inside notify() in hooks/fast-jev.ts`);
   const at = start + body.indexOf(anchor) + anchor.length;
-  const probe = `\n  void ($ as any).fs?.write?.(${JSON.stringify(marker)}, text)?.catch?.(() => {});`;
+  // The hook loader rejects `?.(` and silently loads no hooks, so the inserted line must not use it.
+  const probe = `\n  try { void ($ as any).fs.write(${JSON.stringify(marker)}, text).catch(() => {}); } catch {}`;
   writeFileSync(hook, src.slice(0, at) + probe + src.slice(at));
   return copy;
 }
@@ -124,11 +125,12 @@ export interface HeadlessOptions {
 
 /**
  * Detection: the instrumented plugin copy writes fast-jev's notify text to a marker file named for the fork's new session id.
- * The hook ran iff that file exists; its text, not model output, says whether the trim succeeded. Only fork records past the
- * source's record count, written by this run, count for the boundary. A compact boundary alone proves /compact ran, not the hook.
+ * The hook ran iff that file exists; its text, not model output, says whether the trim succeeded. Only fork records whose uuid is not
+ * in the source (read just before the spawn), written by this run, count for the boundary; a fork drops non-main-chain records. A compact boundary alone proves /compact ran, not the hook.
  */
 const TRIM_SIGNAL = /prose: \d+ scored|^trimmed to \d+\/\d+ messages/;
 const recordLines = (raw: string) => raw.split('\n').filter((l) => l.trim());
+const uuidOf = (l: string) => { try { const u = JSON.parse(l).uuid; return typeof u === 'string' ? u : undefined; } catch { return undefined; } };
 const isBoundary = (l: string) => { try { const o = JSON.parse(l); return o.type === 'system' && o.subtype === 'compact_boundary'; } catch { return false; } };
 
 export async function runHeadless(o: HeadlessOptions): Promise<'refused' | BMode> {
@@ -148,14 +150,14 @@ export async function runHeadless(o: HeadlessOptions): Promise<'refused' | BMode
   print(`The fork will write: ${forkPath}`);
   if (!(await (o.confirm ?? ((q) => confirmFromStream(q)))('Run claude -p --resume --fork-session with /compact on this session?'))) return 'refused';
 
-  const sourceRecords = recordLines(readFileSync(sourceFile, 'utf8')).length;
+  const sourceUuids = new Set(recordLines(readFileSync(sourceFile, 'utf8')).map(uuidOf));
   const marker = join(evalDir, 'live', `marker-${newId}.txt`);
   const copy = copyTidyPlugin(evalDir, marker, o.repoDir);
   rmSync(marker, { force: true });
   const argv = ['-p', '/compact', '--resume', o.sourceId, '--fork-session', '--session-id', newId, '--setting-sources', 'project,local', '--plugin-dir', copy, '--output-format', 'stream-json', '--verbose'];
   const r = (o.spawn ?? realSpawn)(argv, { cwd, env: { ...env, CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1' } });
   const forked = existsSync(forkPath);
-  const fresh = forked ? recordLines(readFileSync(forkPath, 'utf8')).slice(sourceRecords) : [];
+  const fresh = forked ? recordLines(readFileSync(forkPath, 'utf8')).filter((l) => { const u = uuidOf(l); return u !== undefined && !sourceUuids.has(u); }) : [];
   const hasBoundary = fresh.some(isBoundary);
   const hook = existsSync(marker);
   const outcome = hook && TRIM_SIGNAL.test(readFileSync(marker, 'utf8').trim()) ? 'trim succeeded' : 'fell back to the built-in summary or skipped';
