@@ -75,12 +75,19 @@ const hasHeadlessB = (deps: Deps, c: Case): boolean => readB(join(deps.outDir, '
 
 // ---- Claude answering and scoring ----
 
-/** Answers every question from the arm text and scores it; a refused (over-cap) answer is unknown. */
+/** Answers every question from the arm text and scores it; a refused (over-cap) answer or judge call is unknown. */
 function scoreArm(text: string, qs: Question[], stats: Stats, deps: Deps): Row[] {
-  const judge = (prompt: string): string => ask(prompt, stats, deps.spawn)?.text ?? '';
+  let judgeRefused = false;
+  const judge = (prompt: string): string => {
+    const j = ask(prompt, stats, deps.spawn);
+    if (!j) judgeRefused = true;
+    return j?.text ?? '';
+  };
   return qs.map((q) => {
     const a = ask(answerPrompt(text, q), stats, deps.spawn);
-    return toRow(q, a ? scoreAnswer(q, a.text, judge).outcome : 'unknown');
+    judgeRefused = false;
+    const outcome = a ? scoreAnswer(q, a.text, judge).outcome : 'unknown';
+    return toRow(q, judgeRefused ? 'unknown' : outcome);
   });
 }
 
@@ -187,6 +194,8 @@ async function bCmd(deps: Deps, split: SplitName): Promise<number> {
   const results = new Map(prior.map((r) => [r.id, r]));
   for (const c of todo) {
     let rec: { id: string; headless: boolean; evidence: string };
+    const bFile = join(bDir, `${c.id}.json`);
+    const earlier = existsSync(bFile) ? readFileSync(bFile) : undefined;
     try {
       const r: 'refused' | BMode = await deps.runHeadless({ case: c, outDir: deps.outDir, confirm: async () => true, print: deps.print });
       rec = r === 'refused' ? { id: c.id, headless: false, evidence: 'refused' } : { id: c.id, headless: r.headless, evidence: r.evidence };
@@ -194,7 +203,11 @@ async function bCmd(deps: Deps, split: SplitName): Promise<number> {
       rec = { id: c.id, headless: false, evidence: `threw: ${errText(e)}` };
     }
     // A fork without the hook marker still leaves a b/<id>.json; it is not a tidy result, so it must not feed the B arm.
-    if (!rec.headless) rmSync(join(bDir, `${c.id}.json`), { force: true });
+    // Put back what was there before the run (a hand result), or remove the file when there was none.
+    if (!rec.headless) {
+      if (earlier) writeFileSync(bFile, earlier);
+      else rmSync(bFile, { force: true });
+    }
     results.set(c.id, rec);
     writeJson(file, { split, results: [...results.values()] });
     deps.print(`${c.id} headless ${rec.headless}`);

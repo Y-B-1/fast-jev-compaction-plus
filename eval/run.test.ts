@@ -295,3 +295,61 @@ describe('run dev', () => {
     expect(existsSync(join(d.outDir, 'dev-stale.json'))).toBe(true);
   });
 });
+
+describe('run b keeps a hand result', () => {
+  const runB = async (hasHand: boolean, fake: (c: Case, d: { outDir: string }) => Promise<BMode>) => {
+    const d = fresh();
+    const c = theCase(0);
+    if (hasHand) writeB(d, c, 'hand');
+    const file = join(d.outDir, 'b', `${c.id}.json`);
+    const before = hasHand ? readFileSync(file) : undefined;
+    const f = fakes(d, [c], { headless: async ({ case: x }) => fake(x as Case, d) });
+    await main(['b', '--split', 'test'], f.deps);
+    return { file, before };
+  };
+  const overwrite = async (c: Case, d: { outDir: string }, headless: boolean): Promise<BMode> => {
+    writeB(d, c, 'headless');
+    return { headless, evidence: 'x', forkPath: 'f' };
+  };
+
+  it('restores the hand file byte for byte when the run returns headless false', async () => {
+    const { file, before } = await runB(true, (c, d) => overwrite(c, d, false));
+    expect(readFileSync(file).equals(before!)).toBe(true);
+  });
+
+  it('restores the hand file byte for byte when the run throws', async () => {
+    const { file, before } = await runB(true, async (c, d) => { writeB(d, c, 'headless'); throw new Error('boom'); });
+    expect(readFileSync(file).equals(before!)).toBe(true);
+  });
+
+  it('removes a file the run wrote when none existed and the run is not headless', async () => {
+    const { file } = await runB(false, (c, d) => overwrite(c, d, false));
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it('keeps what a headless run wrote over a hand file', async () => {
+    const { file, before } = await runB(true, (c, d) => overwrite(c, d, true));
+    expect(readFileSync(file).equals(before!)).toBe(false);
+    expect(JSON.parse(readFileSync(file, 'utf8')).mode).toBe('headless');
+  });
+});
+
+describe('run scoring', () => {
+  it('scores a refused judge call unknown, not wrong', async () => {
+    const d = fresh();
+    const cs = [theCase(0)];
+    cache(d, cs, 4);
+    const f = fakes(d, cs);
+    const inner = f.deps.spawn!;
+    // An answer far over the cap makes the judge prompt (gold plus answer) over it too, so ask() returns null for the judge only.
+    const huge = 'a '.repeat(600_000);
+    f.deps.spawn = (argv, o) => (o.input.startsWith('Answer the question')
+      ? { status: 0, stdout: JSON.stringify({ result: `${huge} ${gold(0)}`, modelUsage: { [MODEL]: {} } }) }
+      : inner(argv, o));
+    await main(['test', '--threshold', '0.15'], f.deps);
+    const rows: { category: string; outcome: string }[] = JSON.parse(rd(d, 'test.json')).rows.S;
+    const judged = rows.filter((r) => r.category === 'decision');
+    expect(judged.length).toBeGreaterThan(0);
+    expect(judged.every((r) => r.outcome === 'unknown')).toBe(true);
+  });
+});
