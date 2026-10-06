@@ -8,7 +8,8 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { loadTranscript } from './load.js';
+import { isDeepStrictEqual } from 'node:util';
+import { cases, loadTranscript, type Case, type Manifest } from './load.js';
 
 export interface BResult {
   caseId: string;
@@ -110,10 +111,44 @@ function copyTidyPlugin(evalDir: string, marker: string, repo = REPO): string {
   return copy;
 }
 
+const parseLine = (l: string): any => { try { return JSON.parse(l); } catch { return undefined; } };
+
+/**
+ * A copy of the case's transcript cut at the case end, written next to it under a fresh session id: the fork then compacts exactly the
+ * case's messages. A tail case keeps every parseable line; otherwise lines stop before the first main-thread boundary whose `at` is the
+ * case end (main-thread boundary records pair one-to-one with loadTranscript(...).boundaries). Unparseable lines are dropped and every
+ * string sessionId becomes the new id. The copy is checked against the source and removed on a mismatch.
+ */
+export function cutCopy(c: Case): { cutId: string; path: string } {
+  const raw = readFileSync(c.transcript);
+  const load = (path: string, buf: Buffer) => loadTranscript({ path, mtimeMs: 0, sha256: createHash('sha256').update(buf).digest('hex') });
+  const source = load(c.transcript, raw);
+  const lines = raw.toString('utf8').split('\n').filter((l) => l.trim()).map((l) => ({ l, o: parseLine(l) })).filter((x) => x.o !== undefined);
+  let stop = lines.length;
+  if (c.end !== source.messages.length) {
+    const marks = lines.flatMap((x, i) => (x.o?.type === 'system' && x.o.subtype === 'compact_boundary' && !x.o.isSidechain ? [i] : []));
+    const k = source.boundaries.findIndex((b) => b.at === c.end);
+    if (k < 0 || marks[k] === undefined) throw new Error(`no compact boundary at message ${c.end} in ${c.transcript}`);
+    stop = marks[k];
+  }
+  const cutId = randomUUID();
+  const path = join(dirname(c.transcript), `${cutId}.jsonl`);
+  const body = lines.slice(0, stop).map((x) => (typeof x.o?.sessionId === 'string' ? JSON.stringify({ ...x.o, sessionId: cutId }) : x.l)).join('\n') + '\n';
+  writeFileSync(path, body);
+  try {
+    const cut = load(path, Buffer.from(body));
+    if (cut.messages.length !== c.end || !isDeepStrictEqual(cut.messages.slice(c.start), source.messages.slice(c.start, c.end))) throw new Error(`cut copy does not match case ${c.id}`);
+  } catch (e) {
+    rmSync(path, { force: true });
+    throw e;
+  }
+  return { cutId, path };
+}
+
 export interface HeadlessOptions {
-  sourceId: string;
-  caseId: string;
-  projectsDir?: string;
+  /** A Case, or a case id resolved against the frozen manifest. */
+  case: Case | string;
+  manifestPath?: string;
   evalDir?: string;
   repoDir?: string;
   outDir?: string;
@@ -126,36 +161,46 @@ export interface HeadlessOptions {
 /**
  * Detection: the instrumented plugin copy writes fast-jev's notify text to a marker file named for the fork's new session id.
  * The hook ran iff that file exists; its text, not model output, says whether the trim succeeded. Only fork records whose uuid is not
- * in the source (read just before the spawn), written by this run, count for the boundary; a fork drops non-main-chain records. A compact boundary alone proves /compact ran, not the hook.
+ * in the cut copy (read just before the spawn), written by this run, count for the boundary; a fork drops non-main-chain records. A compact boundary alone proves /compact ran, not the hook.
  */
 const TRIM_SIGNAL = /prose: \d+ scored|^trimmed to \d+\/\d+ messages/;
 const recordLines = (raw: string) => raw.split('\n').filter((l) => l.trim());
 const uuidOf = (l: string) => { try { const u = JSON.parse(l).uuid; return typeof u === 'string' ? u : undefined; } catch { return undefined; } };
 const isBoundary = (l: string) => { try { const o = JSON.parse(l); return o.type === 'system' && o.subtype === 'compact_boundary'; } catch { return false; } };
 
+function resolveCase(id: string, manifestPath: string): Case {
+  const found = cases(JSON.parse(readFileSync(manifestPath, 'utf8')) as Manifest).find((x) => x.id === id);
+  if (!found) throw new Error(`case ${id} not found in ${manifestPath}`);
+  return found;
+}
+
 export async function runHeadless(o: HeadlessOptions): Promise<'refused' | BMode> {
   const env = o.env ?? process.env;
   const print = o.print ?? ((m: string) => console.log(m));
-  const projectsDir = o.projectsDir ?? join(homedir(), '.claude', 'projects');
   const evalDir = o.evalDir ?? EVAL_DIR;
   const outDir = o.outDir ?? join(evalDir, 'out');
   if (!env.TYPESAFE_API_KEY) throw new Error('TYPESAFE_API_KEY is not set in the environment');
-  const folder = readdirSync(projectsDir, { withFileTypes: true }).find((d) => d.isDirectory() && existsSync(join(projectsDir, d.name, `${o.sourceId}.jsonl`)));
-  if (!folder) throw new Error(`source session ${o.sourceId} not found under ${projectsDir}`);
-  const sourceFile = join(projectsDir, folder.name, `${o.sourceId}.jsonl`);
-  const cwd = readFileSync(sourceFile, 'utf8').split('\n').map((l) => { try { return JSON.parse(l).cwd; } catch { return undefined; } }).find((c) => typeof c === 'string');
+  const c = typeof o.case === 'string' ? resolveCase(o.case, o.manifestPath ?? join(EVAL_DIR, 'out', 'manifest.json')) : o.case;
+  const sourceFile = c.transcript;
+  const cwd = readFileSync(sourceFile, 'utf8').split('\n').map((l) => parseLine(l)?.cwd).find((x) => typeof x === 'string');
   if (!cwd) throw new Error('source session records no cwd');
   const newId = randomUUID();
-  const forkPath = join(projectsDir, folder.name, `${newId}.jsonl`);
+  const forkPath = join(dirname(sourceFile), `${newId}.jsonl`);
   print(`The fork will write: ${forkPath}`);
-  if (!(await (o.confirm ?? ((q) => confirmFromStream(q)))('Run claude -p --resume --fork-session with /compact on this session?'))) return 'refused';
+  if (!(await (o.confirm ?? ((q) => confirmFromStream(q)))('Run claude -p --resume --fork-session with /compact on a copy of this session cut at the case end?'))) return 'refused';
 
-  const sourceUuids = new Set(recordLines(readFileSync(sourceFile, 'utf8')).map(uuidOf));
-  const marker = join(evalDir, 'live', `marker-${newId}.txt`);
-  const copy = copyTidyPlugin(evalDir, marker, o.repoDir);
-  rmSync(marker, { force: true });
-  const argv = ['-p', '/compact', '--resume', o.sourceId, '--fork-session', '--session-id', newId, '--setting-sources', 'project,local', '--plugin-dir', copy, '--output-format', 'stream-json', '--verbose'];
-  const r = (o.spawn ?? realSpawn)(argv, { cwd, env: { ...env, CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1' } });
+  const cut = cutCopy(c);
+  let sourceUuids: Set<string | undefined>, marker: string, r: ReturnType<BSpawn>;
+  try {
+    sourceUuids = new Set(recordLines(readFileSync(cut.path, 'utf8')).map(uuidOf));
+    marker = join(evalDir, 'live', `marker-${newId}.txt`);
+    const copy = copyTidyPlugin(evalDir, marker, o.repoDir);
+    rmSync(marker, { force: true });
+    const argv = ['-p', '/compact', '--resume', cut.cutId, '--fork-session', '--session-id', newId, '--setting-sources', 'project,local', '--plugin-dir', copy, '--output-format', 'stream-json', '--verbose'];
+    r = (o.spawn ?? realSpawn)(argv, { cwd, env: { ...env, CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1' } });
+  } finally {
+    rmSync(cut.path, { force: true });
+  }
   const forked = existsSync(forkPath);
   const fresh = forked ? recordLines(readFileSync(forkPath, 'utf8')).filter((l) => { const u = uuidOf(l); return u !== undefined && !sourceUuids.has(u); }) : [];
   const hasBoundary = fresh.some(isBoundary);
@@ -174,25 +219,31 @@ export async function runHeadless(o: HeadlessOptions): Promise<'refused' | BMode
   writeFileSync(join(outDir, 'b-mode.json'), JSON.stringify(mode, null, 2) + '\n');
   if (hasBoundary) {
     mkdirSync(join(outDir, 'b'), { recursive: true });
-    writeFileSync(join(outDir, 'b', `${o.caseId}.json`), JSON.stringify(parseCompacted(forkPath, o.caseId, 'headless'), null, 2) + '\n');
+    writeFileSync(join(outDir, 'b', `${c.id}.json`), JSON.stringify(parseCompacted(forkPath, c.id, 'headless'), null, 2) + '\n');
   }
   print(`headless ${mode.headless}: ${mode.evidence}`);
   return mode;
 }
 
-// CLI: `npx tsx eval/b-runner.ts headless <source session id> --case <id>` or `--from-transcript <jsonl> --case <id>`.
+// CLI: `npx tsx eval/b-runner.ts cut|headless --case <id>` or `--from-transcript <jsonl> --case <id>`.
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
   const flag = (name: string) => args[args.indexOf(name) + 1];
   const caseId = args.includes('--case') ? flag('--case') : undefined;
-  if (!caseId) throw new Error('usage: b-runner.ts headless <session id> --case <id> | --from-transcript <jsonl> --case <id>');
+  const usage = 'usage: b-runner.ts cut --case <id> | headless --case <id> | --from-transcript <jsonl> --case <id>';
+  if (!caseId) throw new Error(usage);
   if (args.includes('--from-transcript')) {
     const result = parseCompacted(flag('--from-transcript'), caseId, 'hand');
     const dir = join(EVAL_DIR, 'out', 'b');
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, `${caseId}.json`), JSON.stringify(result, null, 2) + '\n');
     console.log(`wrote ${join(dir, `${caseId}.json`)} (${result.summary.length} summary lines, ${result.keptMessages} kept)`);
-  } else if (args[0] === 'headless' && args[1] && !args[1].startsWith('--')) {
-    await runHeadless({ sourceId: args[1], caseId });
-  } else throw new Error('usage: b-runner.ts headless <session id> --case <id> | --from-transcript <jsonl> --case <id>');
+  } else if (args[0] === 'cut') {
+    const c = resolveCase(caseId, join(EVAL_DIR, 'out', 'manifest.json'));
+    const { cutId, path } = cutCopy(c);
+    console.log(`cut ${cutId}: ${c.end} messages (case end ${c.end})`);
+    console.log(path);
+  } else if (args[0] === 'headless') {
+    await runHeadless({ case: caseId });
+  } else throw new Error(usage);
 }
