@@ -1,5 +1,8 @@
 import { splitsSurrogatePair } from './compact.js';
+import { noulAnswer } from './request.js';
 import { ERROR_LINE, SCAN, salvageBlock } from './salvage.js';
+import { collectToolCalls, estimateTokens, goalFromMessages, isPinned, truncate } from './state.js';
+import type { CallDecision, JevAsker, JevQuestions, Message, ToolUse } from './types.js';
 
 /**
  * Clause splitter for assistant prose and prose tool inputs, plus rule-based
@@ -261,4 +264,402 @@ export function elideBody(text: string, label: string, headChars: number, salvag
   const salvaged = salvageBlock(text.slice(cut), salvageChars);
   const out = salvaged ? `${head}${note}\n${salvaged}` : `${head}${note}`;
   return out.length < text.length ? out : text;
+}
+
+export type ProseTrimOptions = {
+  preserveRecentMessages: number;
+  truncateHeadChars: number;
+  salvageChars: number;
+  maxRequestTokens: number;
+  goal: string;
+  /** Library only. Default 0.15. */
+  proseKeepThreshold?: number;
+  /** Estimated tokens per window. Default 20000. */
+  windowTokens?: number;
+};
+
+/** One scored unit's outcome. `message` is the index in the input messages. */
+export type ProseDecision = { id: string; message: number; noul?: number; kept: boolean };
+
+export type ProseStats = {
+  scored: number;
+  dropped: number;
+  inputsElided: number;
+  proseCharsSaved: number;
+  inputCharsSaved: number;
+  requests: number;
+  failedRequests: number;
+  failed?: string;
+};
+
+/** Pairs each tool call with its decision by position; `decisions` must come from the same messages. */
+export function callActions(
+  messages: readonly Message[],
+  decisions: readonly CallDecision[],
+  preserveRecentMessages: number,
+): Map<string, CallDecision> {
+  const calls = collectToolCalls(messages, preserveRecentMessages);
+  if (calls.length !== decisions.length) {
+    throw new Error(`${decisions.length} decisions for ${calls.length} tool calls`);
+  }
+  return new Map(calls.map((call, i) => [call.tool_use_id, decisions[i] as CallDecision]));
+}
+
+const PROSE_CONTEXT =
+  'A coding assistant conversation is being compacted. `window` is a stretch of it, oldest first. Assistant text and long tool-call prompts are split into numbered parts: `c` parts may be deleted, `k` parts always stay. Each question asks whether one `c` part must stay. A deleted part is gone for good; everything else stays word for word.';
+
+const DEFAULT_KEEP_THRESHOLD = 0.15;
+const DEFAULT_WINDOW_TOKENS = 20_000;
+const CONCURRENCY = 4;
+const OVERHEAD_TOKENS = 20;
+const STATE_PLUS_QUESTION_TOKENS = 32_000;
+const PROSE_INPUT_MIN_CHARS = 200;
+const CONTEXT_TEXT_CHARS = 600;
+const TOOL_INPUT_CHARS = 60;
+const PROSE_INPUTS: Record<string, string> = { Agent: 'prompt', Task: 'prompt', SendMessage: 'message' };
+const BODY_FIELDS: Record<string, string[]> = {
+  Write: ['content'],
+  Edit: ['old_string', 'new_string'],
+  NotebookEdit: ['new_source'],
+  Workflow: ['script'],
+};
+
+type Slot = { id: string; unit: ProseUnit; source: string; input: number };
+type Elision = { input: Record<string, unknown>; fields: number; saved: number };
+type Plan = {
+  text: ProseUnit[];
+  /** Prose inputs by tool-use index: the field, its text and its units. */
+  prose: Map<number, { field: string; value: string; units: ProseUnit[] }>;
+  elided: Map<number, Elision>;
+  slots: Slot[];
+};
+
+function pathOf(input: Record<string, unknown>): string | undefined {
+  for (const key of ['file_path', 'notebook_path', 'path']) {
+    const v = input[key];
+    if (typeof v === 'string' && v !== '') return v;
+  }
+  return undefined;
+}
+
+/** The input of `tool` with its code bodies cut, or undefined when no body is long enough. */
+function elideInput(tool: ToolUse, head: number, salvage: number): Elision | undefined {
+  const where = pathOf(tool.input);
+  const label = (field: string): string => `${tool.tool}.${field}${where ? ` for ${where}` : ''}`;
+  const input: Record<string, unknown> = { ...tool.input };
+  let fields = 0;
+  let saved = 0;
+  const cut = (text: string, name: string): string => {
+    const out = elideBody(text, label(name), head, salvage);
+    if (out !== text) {
+      fields++;
+      saved += text.length - out.length;
+    }
+    return out;
+  };
+  for (const field of BODY_FIELDS[tool.tool] ?? []) {
+    const v = input[field];
+    if (typeof v === 'string') input[field] = cut(v, field);
+  }
+  if (tool.tool === 'MultiEdit' && Array.isArray(input['edits'])) {
+    input['edits'] = input['edits'].map((edit: unknown) => {
+      if (edit === null || typeof edit !== 'object') return edit;
+      const copy = { ...(edit as Record<string, unknown>) };
+      for (const field of ['old_string', 'new_string']) {
+        const v = copy[field];
+        if (typeof v === 'string') copy[field] = cut(v, field);
+      }
+      return copy;
+    });
+  }
+  const command = input['command'];
+  if (tool.tool === 'Bash' && typeof command === 'string') {
+    let rebuilt = '';
+    let at = 0;
+    for (const span of heredocBodies(command)) {
+      const original = command.slice(span.start, span.end);
+      let out = cut(original, 'command heredoc');
+      if (out !== original && original.endsWith('\n') && !out.endsWith('\n')) out += '\n';
+      rebuilt += command.slice(at, span.start) + out;
+      at = span.end;
+    }
+    input['command'] = rebuilt + command.slice(at);
+  }
+  return fields > 0 ? { input, fields, saved } : undefined;
+}
+
+type Batch = { state: object; questions: JevQuestions; ids: string[]; error?: string };
+
+function question(path: string): JevQuestions[string] {
+  return {
+    type: 'noul',
+    instructions: `Part \`${path}\` must stay: deleting it would lose information that the work in \`goal\` still needs and that no other part of \`window\` states`,
+    criteria: {
+      true: 'It states something specific a later reader needs: a finding, a decision or its reason, a result, a change made, a failure, a limit or condition on an action, a step still to do, or an answer to the user',
+      false:
+        'It adds nothing of its own: an acknowledgement, greeting or praise; narration of what the assistant is about to do or just did that the tool calls already record; a repeat of another part; hedging, apology or politeness; an offer of more help',
+    },
+  };
+}
+
+/**
+ * Drops the clauses Jev scores as filler from old assistant text and prose tool inputs, and cuts the
+ * code bodies of old tool inputs by rule. User messages, pinned messages, protected spans and every
+ * non-body field stay; untouched messages and tool uses come back as the same objects. When every
+ * request fails the stage returns its input unchanged with `stats.failed` set.
+ */
+export async function trimProse(
+  messages: readonly Message[],
+  actions: ReadonlyMap<string, CallDecision>,
+  asker: JevAsker,
+  options: ProseTrimOptions,
+): Promise<{ messages: Message[]; decisions: ProseDecision[]; stats: ProseStats }> {
+  const stats: ProseStats = {
+    scored: 0,
+    dropped: 0,
+    inputsElided: 0,
+    proseCharsSaved: 0,
+    inputCharsSaved: 0,
+    requests: 0,
+    failedRequests: 0,
+  };
+  const unchanged = (failed: string) => ({ messages: [...messages], decisions: [], stats: { ...stats, failed } });
+  const threshold = options.proseKeepThreshold ?? DEFAULT_KEEP_THRESHOLD;
+  const windowTokens = options.windowTokens ?? DEFAULT_WINDOW_TOKENS;
+  const total = messages.length;
+  const pinned = (i: number): boolean => isPinned(i, total, options.preserveRecentMessages);
+  const resultAt = new Map<string, number>();
+  messages.forEach((m, i) => m.toolResults?.forEach((r) => resultAt.set(r.tool_use_id, i)));
+
+  const plans = new Map<number, Plan>();
+  let counter = 0;
+  const slotsOf = (units: ProseUnit[], source: string, input: number, out: Slot[]): void => {
+    for (const unit of units) {
+      const id = `${unit.scored ? 'c' : 'k'}${++counter}`;
+      out.push({ id, unit, source, input });
+    }
+  };
+  try {
+    messages.forEach((m, i) => {
+      if (m.role !== 'assistant' || pinned(i)) return;
+      const plan: Plan = { text: [], prose: new Map(), elided: new Map(), slots: [] };
+      if (m.text.trim() !== '') {
+        plan.text = splitProse(m.text);
+        slotsOf(plan.text, m.text, -1, plan.slots);
+      }
+      m.toolUses.forEach((tool, k) => {
+        const action = actions.get(tool.tool_use_id);
+        if (!action || action.reason === 'pinned' || (action.action !== 'keep' && action.action !== 'drop_result')) return;
+        const at = resultAt.get(tool.tool_use_id);
+        if (at !== undefined && pinned(at)) return;
+        const field = PROSE_INPUTS[tool.tool];
+        const value = field === undefined ? undefined : tool.input[field];
+        if (field !== undefined && typeof value === 'string') {
+          if (value.length < PROSE_INPUT_MIN_CHARS) return;
+          const units = splitProse(value);
+          plan.prose.set(k, { field, value, units });
+          slotsOf(units, value, k, plan.slots);
+          return;
+        }
+        const elision = elideInput(tool, options.truncateHeadChars, options.salvageChars);
+        if (elision) plan.elided.set(k, elision);
+      });
+      if (plan.slots.length > 0 || plan.elided.size > 0) plans.set(i, plan);
+    });
+  } catch (error) {
+    return unchanged(error instanceof Error ? error.message : String(error));
+  }
+
+  // Windows: chunks of scored messages with the messages between them as context.
+  const goal = options.goal || goalFromMessages(messages);
+  type Entry = { key: string; value: Record<string, unknown>; tokens: number; ids: string[] };
+  const entryOf = (i: number, slots: Slot[], first: boolean): Entry => {
+    const m = messages[i] as Message;
+    const value: Record<string, unknown> = { role: 'assistant' };
+    if (first && m.toolUses.length > 0) {
+      value['tools'] = m.toolUses.map((t) => `${t.tool} ${truncate(JSON.stringify(t.input) ?? '', TOOL_INPUT_CHARS)}`.trim()).join(' | ');
+    }
+    const objects = new Map<number, Record<string, unknown>>();
+    const ids: string[] = [];
+    for (const slot of slots) {
+      let target = value;
+      if (slot.input >= 0) {
+        let obj = objects.get(slot.input);
+        if (!obj) {
+          obj = { tool: (m.toolUses[slot.input] as ToolUse).tool };
+          objects.set(slot.input, obj);
+          value[`a${slot.input + 1}`] = obj;
+        }
+        target = obj;
+      }
+      target[slot.id] = slot.source.slice(slot.unit.start, slot.unit.end).trim();
+      if (slot.unit.scored) ids.push(slot.id);
+    }
+    return { key: `m${i}`, value, tokens: estimateTokens(JSON.stringify(value)), ids };
+  };
+  const windows: Entry[][] = [];
+  let current: Entry[] = [];
+  let currentTokens = 0;
+  let pending: Entry[] = [];
+  messages.forEach((m, i) => {
+    const plan = plans.get(i);
+    if (!plan || !plan.slots.some((s) => s.unit.scored)) {
+      if (m.text.trim() !== '') {
+        const value = { role: m.role, text: truncate(m.text, CONTEXT_TEXT_CHARS) };
+        pending.push({ key: `m${i}`, value, tokens: estimateTokens(JSON.stringify(value)), ids: [] });
+      }
+      return;
+    }
+    // Split an oversize message at paragraph starts (any unit once it is twice the limit).
+    const chunks: Slot[][] = [[]];
+    let size = 0;
+    for (const slot of plan.slots) {
+      const tokens = estimateTokens(slot.source.slice(slot.unit.start, slot.unit.end)) + 4;
+      const paragraph = /\n\s*\n/.test(slot.source.slice(slot.unit.start, slot.unit.end).match(/^\s*/)?.[0] ?? '');
+      if ((chunks[chunks.length - 1] as Slot[]).length > 0 && ((size >= windowTokens && paragraph) || size >= 2 * windowTokens)) {
+        chunks.push([]);
+        size = 0;
+      }
+      (chunks[chunks.length - 1] as Slot[]).push(slot);
+      size += tokens;
+    }
+    chunks.forEach((slots, c) => {
+      const entry = entryOf(i, slots, c === 0);
+      const group = [...pending, entry];
+      pending = [];
+      const tokens = group.reduce((sum, e) => sum + e.tokens, 0);
+      if (current.length > 0 && currentTokens + tokens > windowTokens) {
+        windows.push(current);
+        current = [];
+        currentTokens = 0;
+      }
+      current.push(...group);
+      currentTokens += tokens;
+    });
+  });
+  if (current.length > 0) windows.push(current);
+
+  const slotPath = new Map<string, string>();
+  for (const [i, plan] of plans) {
+    for (const slot of plan.slots) {
+      slotPath.set(slot.id, `window.m${i}.${slot.input >= 0 ? `a${slot.input + 1}.` : ''}${slot.id}`);
+    }
+  }
+  const batches: Batch[] = [];
+  for (const entries of windows) {
+    const window: Record<string, unknown> = {};
+    for (const e of entries) {
+      const prev = window[e.key];
+      window[e.key] = prev && typeof prev === 'object' ? { ...(prev as object), ...e.value } : e.value;
+    }
+    const state = { context: PROSE_CONTEXT, goal, window };
+    const stateTokens = estimateTokens(JSON.stringify(state));
+    const budget = options.maxRequestTokens - stateTokens - OVERHEAD_TOKENS;
+    let batch: Batch = { state, questions: {}, ids: [] };
+    let used = 0;
+    for (const id of entries.flatMap((e) => e.ids)) {
+      const q = question(slotPath.get(id) as string);
+      const tokens = estimateTokens(JSON.stringify(q));
+      if (stateTokens + tokens + OVERHEAD_TOKENS > STATE_PLUS_QUESTION_TOKENS || tokens > budget) {
+        batches.push({ state, questions: {}, ids: [id], error: `state of ~${stateTokens} tokens leaves no room for a question` });
+        continue;
+      }
+      if (batch.ids.length > 0 && used + tokens > budget) {
+        batches.push(batch);
+        batch = { state, questions: {}, ids: [] };
+        used = 0;
+      }
+      batch.questions[id] = q;
+      batch.ids.push(id);
+      used += tokens;
+    }
+    if (batch.ids.length > 0) batches.push(batch);
+  }
+
+  const noul = new Map<string, number | undefined>();
+  let failed = 0;
+  let lastFailure: unknown;
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < batches.length) {
+      const batch = batches[cursor++] as Batch;
+      try {
+        if (batch.error) throw new Error(batch.error);
+        const { answers } = await asker.ask(batch.state, batch.questions);
+        for (const id of batch.ids) {
+          try {
+            noul.set(id, noulAnswer(answers, id));
+          } catch {
+            // A missing or invalid answer keeps the unit.
+          }
+        }
+      } catch (error) {
+        failed++;
+        lastFailure = error;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, batches.length) }, worker));
+  stats.requests = batches.length;
+  stats.failedRequests = failed;
+  if (failed > 0 && failed === batches.length) {
+    return unchanged(lastFailure instanceof Error ? lastFailure.message : String(lastFailure));
+  }
+
+  const decisions: ProseDecision[] = [];
+  const dropped = new Set<ProseUnit>();
+  for (const [i, plan] of plans) {
+    for (const slot of plan.slots) {
+      if (!slot.unit.scored) continue;
+      const n = noul.get(slot.id);
+      const kept = n === undefined || n >= threshold;
+      decisions.push({ id: slot.id, message: i, ...(n === undefined ? {} : { noul: n }), kept });
+      if (!kept) dropped.add(slot.unit);
+    }
+  }
+  decisions.sort((a, b) => a.message - b.message || Number(a.id.slice(1)) - Number(b.id.slice(1)));
+  stats.scored = decisions.length;
+  stats.dropped = dropped.size;
+
+  const out: Message[] = [];
+  messages.forEach((m, i) => {
+    const plan = plans.get(i);
+    if (!plan) {
+      out.push(m);
+      return;
+    }
+    const text = plan.text.length > 0 ? reassemble(m.text, plan.text, (u) => !dropped.has(u)) : m.text;
+    stats.proseCharsSaved += m.text.length - text.length;
+    let changed = text !== m.text;
+    const toolUses = m.toolUses.map((tool, k) => {
+      const elision = plan.elided.get(k);
+      const prose = plan.prose.get(k);
+      let input: Record<string, unknown> | undefined;
+      if (elision) {
+        input = elision.input;
+        stats.inputsElided += elision.fields;
+        stats.inputCharsSaved += elision.saved;
+      } else if (prose) {
+        const value = reassemble(prose.value, prose.units, (u) => !dropped.has(u));
+        if (value === prose.value) return tool;
+        stats.proseCharsSaved += prose.value.length - value.length;
+        input = { ...tool.input, [prose.field]: value };
+      }
+      if (!input) return tool;
+      changed = true;
+      const copy: ToolUse = { tool_use_id: tool.tool_use_id, tool: tool.tool, input };
+      if (tool.text !== undefined) copy.text = tool.text;
+      if (tool.isError !== undefined) copy.isError = tool.isError;
+      return copy;
+    });
+    if (!changed) {
+      out.push(m);
+      return;
+    }
+    if (text.trim() === '' && toolUses.length === 0 && (m.toolResults?.length ?? 0) === 0) return;
+    const rebuilt: Message = { role: m.role, text, toolUses };
+    if (m.toolResults) rebuilt.toolResults = m.toolResults;
+    out.push(rebuilt);
+  });
+  return { messages: out, decisions, stats };
 }

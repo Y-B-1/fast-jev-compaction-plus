@@ -2,6 +2,9 @@ import { describe, expect, test } from 'vitest';
 
 import { ERROR_LINE, SCAN } from '../src/salvage.js';
 import { elideBody, heredocBodies, reassemble, splitProse } from '../src/prose.js';
+import { callActions, trimProse, type ProseTrimOptions } from '../src/prose.js';
+import { collectToolCalls } from '../src/state.js';
+import type { CallAction, CallDecision, JevAsker, JevQuestions, Message, ToolUse } from '../src/types.js';
 
 /** One entry per unit: `c` scored, `k` kept, then the unit's text without its separators. */
 function view(text: string): string[] {
@@ -301,5 +304,227 @@ describe('T4 repair: line breaks and bound remainders', () => {
 
   test('an opener before a plain remainder still splits', () => {
     expect(view('Great question; the cache is stale because the TTL never resets.')).toHaveLength(2);
+  });
+});
+
+describe('trimProse (Jev trim stage)', () => {
+  const FLUFF = 'Let me have a good look at the layout of this module now.';
+  const FACT = 'The cache layer returns stale entries after a restart.';
+  const OPTS: ProseTrimOptions = {
+    preserveRecentMessages: 2,
+    truncateHeadChars: 300,
+    salvageChars: 300,
+    maxRequestTokens: 60_000,
+    goal: 'fix the stale cache',
+  };
+
+  type Req = { state: { window: Record<string, Record<string, unknown>> }; questions: JevQuestions };
+  type Answer = (id: string, req: Req) => number | undefined | 'throw';
+
+  function asker(answer: Answer, seen: Req[] = []): JevAsker {
+    return {
+      async ask(state, questions) {
+        const req = { state, questions } as Req;
+        seen.push(req);
+        const answers: Record<string, { type: 'noul'; noul: number }> = {};
+        for (const id of Object.keys(questions)) {
+          const a = answer(id, req);
+          if (a === 'throw') throw new Error('boom');
+          if (a !== undefined) answers[id] = { type: 'noul', noul: a };
+        }
+        return { answers };
+      },
+    };
+  }
+
+  const msg = (role: Message['role'], text: string, toolUses: ToolUse[] = []): Message => ({ role, text, toolUses });
+  const use = (id: string, tool: string, input: Record<string, unknown>): ToolUse => ({ tool_use_id: id, tool, input, text: 'out' });
+  const res = (id: string): Message => ({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: id, text: 'ok' }] });
+  const pad = (): Message[] => [msg('user', 'pad one'), msg('user', 'pad two')];
+
+  function decisionsFor(messages: Message[], actions: Record<string, CallAction>, preserve = 2): CallDecision[] {
+    return collectToolCalls(messages, preserve).map((c) => {
+      const action = actions[c.tool_use_id] ?? 'keep';
+      const reason = c.pinned ? 'pinned' : action === 'keep' ? 'kept' : action === 'drop_result' ? 'result_dropped' : 'call_dropped';
+      return { id: c.id, tool: c.tool, keepCall: 1, keepResult: 1, action, reason };
+    });
+  }
+
+  const actionsOf = (messages: Message[], acts: Record<string, CallAction> = {}) =>
+    callActions(messages, decisionsFor(messages, acts), 2);
+
+  const body = `${'const value = compute();\n'.repeat(80)}`;
+
+  test('callActions pairs calls with decisions by position and throws on a length mismatch', () => {
+    const messages = [msg('user', 'go'), msg('assistant', '', [use('x1', 'Read', { file_path: 'a' })]), res('x1'), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
+    const decisions = decisionsFor(messages, { x1: 'drop_result' });
+    const map = callActions(messages, decisions, 2);
+    expect([...map.keys()]).toEqual(['x1']);
+    expect(map.get('x1')?.action).toBe('drop_result');
+    expect(() => callActions(messages, [], 2)).toThrow();
+  });
+
+  test('no request holds a protected span; scored parts are exactly the scored units', async () => {
+    const protectedLine = 'Run `npm ci` in src/app.ts before v1.2.3 ships.';
+    const messages = [msg('user', 'go'), msg('assistant', `${FLUFF} ${protectedLine}\n${FACT}`), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
+    const seen: Req[] = [];
+    await trimProse(messages, new Map(), asker(() => 0.9, seen), OPTS);
+    expect(seen).toHaveLength(1);
+    const wire = JSON.stringify(seen[0]!.questions);
+    for (const secret of ['npm ci', 'src/app.ts', 'v1.2.3']) expect(wire).not.toContain(secret);
+    const parts = Object.entries(seen[0]!.state.window['m1'] ?? {}).filter(([k]) => /^c\d+$/.test(k));
+    expect(parts.map(([, v]) => v)).toEqual([FLUFF, FACT]);
+    expect(Object.keys(seen[0]!.questions)).toEqual(parts.map(([k]) => k));
+  });
+
+  test('user, pinned and untouched messages return as the same objects', async () => {
+    const messages = [msg('user', FLUFF), msg('assistant', FLUFF), msg('user', FLUFF), msg('user', 'pad'), msg('assistant', FLUFF), msg('user', FLUFF)];
+    const out = await trimProse(messages, new Map(), asker(() => 0), OPTS);
+    expect(out.messages).toHaveLength(5);
+    out.messages.forEach((m, i) => expect(m).toBe(messages[i === 0 ? 0 : i + 1]));
+    expect(out.stats.dropped).toBe(1);
+    expect(out.stats.proseCharsSaved).toBe(FLUFF.length);
+  });
+
+  test('a dropped clause leaves the kept clause bytes identical', async () => {
+    const messages = [msg('user', 'go'), msg('assistant', `${FLUFF} ${FACT}`), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
+    const out = await trimProse(messages, new Map(), asker((id, r) => (r.state.window['m1']?.[id] === FLUFF ? 0.01 : 0.9)), OPTS);
+    expect(out.messages[1]?.text).toBe(FACT);
+    expect(out.decisions.map((d) => [d.message, d.kept])).toEqual([[1, false], [1, true]]);
+  });
+
+  test('drop_call and unmapped calls are untouched; keep and drop_result bodies are elided', async () => {
+    const mk = (id: string) => use(id, 'Write', { file_path: 'src/app.ts', content: body });
+    const messages = [
+      msg('user', 'go'),
+      msg('assistant', '', [mk('k1'), mk('d1'), mk('c1'), mk('u1')]),
+      res('k1'), res('d1'), res('c1'),
+      ...pad(), msg('assistant', 'end'), msg('user', 'end'),
+    ];
+    const actions = actionsOf(messages, { k1: 'keep', d1: 'drop_result', c1: 'drop_call' });
+    const out = await trimProse(messages, actions, asker(() => 0.9), OPTS);
+    const uses = out.messages[1]!.toolUses;
+    const input = (i: number) => uses[i]!.input['content'] as string;
+    for (const i of [0, 1]) {
+      expect(input(i).startsWith(body.slice(0, 300))).toBe(true);
+      expect(input(i)).toContain('[fast-jev-compaction elided');
+      expect(input(i)).toContain('Write.content for src/app.ts');
+      expect(input(i).length).toBeLessThan(body.length);
+    }
+    expect(uses[2]).toBe(messages[1]!.toolUses[2]);
+    expect(uses[3]).toBe(messages[1]!.toolUses[3]);
+    expect(out.stats.inputsElided).toBe(2);
+    expect(out.stats.inputCharsSaved).toBe(2 * (body.length - input(0).length));
+  });
+
+  test('a call whose result is in the pinned tail is untouched', async () => {
+    const messages = [msg('user', 'go'), msg('assistant', 'x'), ...pad(), msg('assistant', '', [use('p1', 'Write', { file_path: 'a.ts', content: body })]), res('p1')];
+    const map = new Map<string, CallDecision>([['p1', { id: 't1', tool: 'Write', keepCall: 1, keepResult: 1, action: 'keep', reason: 'kept' }]]);
+    const out = await trimProse(messages, map, asker(() => 0.9), OPTS);
+    expect(out.messages[4]).toBe(messages[4]);
+  });
+
+  test('a stale-only map elides only drop_result calls', async () => {
+    const mk = (id: string) => use(id, 'Write', { file_path: 'src/app.ts', content: body });
+    const messages = [msg('user', 'go'), msg('assistant', '', [mk('k1'), mk('d1')]), res('k1'), res('d1'), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
+    const full = actionsOf(messages, { k1: 'keep', d1: 'drop_result' });
+    const stale = new Map([...full].filter(([, d]) => d.action === 'drop_result'));
+    const out = await trimProse(messages, stale, asker(() => 0.9), OPTS);
+    expect(out.messages[1]!.toolUses[0]).toBe(messages[1]!.toolUses[0]);
+    expect(out.messages[1]!.toolUses[1]!.input['content']).toContain('[fast-jev-compaction elided');
+  });
+
+  test('a prose input of 200 chars is scored, 199 is not', async () => {
+    const sentence = (n: number) => `${'Please look at the way the cache layer behaves overall. '.repeat(10)}`.slice(0, n - 1) + '.';
+    for (const [n, asked] of [[200, 1], [199, 0]] as const) {
+      const messages = [msg('user', 'go'), msg('assistant', '', [use('a1', 'Agent', { prompt: sentence(n), subagent_type: 'x' })]), res('a1'), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
+      const seen: Req[] = [];
+      await trimProse(messages, actionsOf(messages), asker(() => 0.9, seen), OPTS);
+      expect(seen.length).toBe(asked);
+    }
+  });
+
+  test('an edited call is a fresh ToolUse and input; name, id, keys and other fields are equal', async () => {
+    const original = use('w1', 'Write', { file_path: 'src/app.ts', content: body, mode: 'x' });
+    const messages = [msg('user', 'go'), msg('assistant', '', [original]), res('w1'), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
+    const out = await trimProse(messages, actionsOf(messages), asker(() => 0.9), OPTS);
+    const edited = out.messages[1]!.toolUses[0]!;
+    expect(edited).not.toBe(original);
+    expect(edited.input).not.toBe(original.input);
+    expect(edited.tool).toBe('Write');
+    expect(edited.tool_use_id).toBe('w1');
+    expect(edited.text).toBe('out');
+    expect(Object.keys(edited.input)).toEqual(['file_path', 'content', 'mode']);
+    expect(edited.input['file_path']).toBe('src/app.ts');
+    expect(edited.input['mode']).toBe('x');
+    expect(original.input['content']).toBe(body);
+  });
+
+  test('a heredoc body is cut and the command line and closing marker stay', async () => {
+    const command = `cat > src/x.ts <<'EOF'\n${body}EOF\necho done`;
+    const messages = [msg('user', 'go'), msg('assistant', '', [use('b1', 'Bash', { command })]), res('b1'), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
+    const out = await trimProse(messages, actionsOf(messages), asker(() => 0.9), OPTS);
+    const cut = out.messages[1]!.toolUses[0]!.input['command'] as string;
+    expect(cut.startsWith("cat > src/x.ts <<'EOF'\n")).toBe(true);
+    expect(cut.endsWith('\nEOF\necho done')).toBe(true);
+    expect(cut).toContain('[fast-jev-compaction elided');
+    expect(cut.length).toBeLessThan(command.length);
+  });
+
+  test('a missing answer keeps the unit', async () => {
+    const messages = [msg('user', 'go'), msg('assistant', FLUFF), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
+    const out = await trimProse(messages, new Map(), asker(() => undefined), OPTS);
+    expect(out.messages[1]).toBe(messages[1]);
+    expect(out.decisions).toEqual([{ id: 'c1', message: 1, kept: true }]);
+  });
+
+  test.each([[0.14, false], [0.15, true]])('noul %s kept=%s', async (noul, kept) => {
+    const messages = [msg('user', 'go'), msg('assistant', FLUFF), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
+    const out = await trimProse(messages, new Map(), asker(() => noul), OPTS);
+    expect(out.decisions[0]).toEqual({ id: 'c1', message: 1, noul, kept });
+  });
+
+  test('one failed batch keeps its units while the others apply', async () => {
+    const messages = [msg('user', 'go'), msg('assistant', FLUFF), msg('assistant', FACT), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
+    const seen: Req[] = [];
+    const out = await trimProse(
+      messages,
+      new Map(),
+      asker((_id, r) => (JSON.stringify(r.state).includes('m1') ? 'throw' : 0), seen),
+      { ...OPTS, windowTokens: 1 },
+    );
+    expect(seen).toHaveLength(2);
+    expect(out.messages[1]).toBe(messages[1]);
+    expect(out.messages.some((m) => m.text === FACT)).toBe(false);
+    expect(out.stats).toMatchObject({ requests: 2, failedRequests: 1, dropped: 1 });
+    expect(out.stats.failed).toBeUndefined();
+  });
+
+  test('every batch failing returns the input objects, cuts no body and sets stats.failed', async () => {
+    const messages = [msg('user', 'go'), msg('assistant', FLUFF, [use('w1', 'Write', { file_path: 'a.ts', content: body })]), res('w1'), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
+    const out = await trimProse(messages, actionsOf(messages), asker(() => 'throw'), OPTS);
+    expect(out.messages).toHaveLength(messages.length);
+    out.messages.forEach((m, i) => expect(m).toBe(messages[i]));
+    expect(out.decisions).toEqual([]);
+    expect(out.stats.failed).toBeTruthy();
+    expect(out.stats).toMatchObject({ dropped: 0, inputsElided: 0, proseCharsSaved: 0, inputCharsSaved: 0 });
+  });
+
+  test('windows split at the token limit and run at most 4 requests at a time', async () => {
+    const messages = [msg('user', 'go'), ...Array.from({ length: 9 }, () => msg('assistant', FLUFF)), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
+    let live = 0;
+    let peak = 0;
+    const slow: JevAsker = {
+      async ask(_s, questions) {
+        live++;
+        peak = Math.max(peak, live);
+        await new Promise((r) => setTimeout(r, 5));
+        live--;
+        return { answers: Object.fromEntries(Object.keys(questions).map((k) => [k, { type: 'noul' as const, noul: 0.9 }])) };
+      },
+    };
+    const out = await trimProse(messages, new Map(), slow, { ...OPTS, windowTokens: 1 });
+    expect(out.stats.requests).toBe(9);
+    expect(peak).toBe(4);
   });
 });
