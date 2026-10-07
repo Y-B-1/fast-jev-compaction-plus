@@ -21,7 +21,7 @@ import {
   type Category, type Question, type Tag,
 } from './questions.js';
 import { buildReport, renderReport } from './report.js';
-import { aggregate, answerPrompt, scoreAnswer, type Outcome, type Scored } from './score.js';
+import { aggregate, answerPrompt, scoreAnswerAsync, type Outcome, type Scored } from './score.js';
 
 export type SplitName = 'dev' | 'test';
 export const THRESHOLDS = [0.05, 0.1, 0.15, 0.25, 0.35];
@@ -33,6 +33,9 @@ const PINNED_TAIL = DEFAULT_OPTIONS.preserveRecentMessages;
 const DEV_TRIM_RUNS = THRESHOLDS.length + 1 + 2 + 1;
 /** Scored dev runs per question: S, the sweep, the 5k window, stale only. */
 const DEV_SCORED_ARMS = 1 + THRESHOLDS.length + 1 + 1;
+const DEFAULT_CONCURRENCY = 4;
+/** Cases run K at a time; each may have this many claude -p calls in flight, so K x 4 is the process limit. */
+const CALLS_PER_CASE = 4;
 
 export interface Deps {
   outDir: string;
@@ -70,25 +73,53 @@ const writeJson = (file: string, value: unknown): void => {
 };
 const errText = (e: unknown): string => (e instanceof Error ? `${e.name}: ${e.message}` : String(e)).slice(0, 100);
 
+/** At most `n` tasks run at once; the rest wait their turn. */
+const limiter = (n: number) => {
+  let active = 0;
+  const waiting: (() => void)[] = [];
+  return async <T>(task: () => Promise<T>): Promise<T> => {
+    while (active >= n) await new Promise<void>((resolve) => waiting.push(resolve));
+    active++;
+    try {
+      return await task();
+    } finally {
+      active--;
+      waiting.shift()?.();
+    }
+  };
+};
+type Gate = ReturnType<typeof limiter>;
+/** Maps with up to `k` in flight; results keep the input order. */
+const mapLimit = async <T, R>(items: T[], k: number, fn: (item: T) => Promise<R>): Promise<R[]> => {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(k, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]!);
+    }
+  }));
+  return out;
+};
+
 const questionsOf = (deps: Deps, c: Case): Question[] => loadQuestions(deps.cacheDir, c.id)?.questions ?? [];
 const hasHeadlessB = (deps: Deps, c: Case): boolean => readB(join(deps.outDir, 'b'), c.id)?.mode === 'headless';
 
 // ---- Claude answering and scoring ----
 
-/** Answers every question from the arm text and scores it; a refused (over-cap) answer or judge call is unknown. */
-function scoreArm(text: string, qs: Question[], stats: Stats, deps: Deps): Row[] {
-  let judgeRefused = false;
-  const judge = (prompt: string): string => {
-    const j = ask(prompt, stats, deps.spawn);
-    if (!j) judgeRefused = true;
-    return j?.text ?? '';
-  };
-  return qs.map((q) => {
-    const a = ask(answerPrompt(text, q), stats, deps.spawn);
-    judgeRefused = false;
-    const outcome = a ? scoreAnswer(q, a.text, judge).outcome : 'unknown';
+/** Answers every question from the arm text and scores it; a refused (over-cap) answer or judge call is unknown. Rows keep question order. */
+function scoreArm(text: string, qs: Question[], stats: Stats, deps: Deps, gate: Gate): Promise<Row[]> {
+  return Promise.all(qs.map(async (q) => {
+    let judgeRefused = false;
+    const judge = async (prompt: string): Promise<string> => {
+      const j = await gate(() => ask(prompt, stats, deps.spawn));
+      if (!j) judgeRefused = true;
+      return j?.text ?? '';
+    };
+    const a = await gate(() => ask(answerPrompt(text, q), stats, deps.spawn));
+    const outcome = a ? (await scoreAnswerAsync(q, a.text, judge)).outcome : 'unknown';
     return toRow(q, judgeRefused ? 'unknown' : outcome);
-  });
+  }));
 }
 
 // ---- Arms at a given threshold (arms.ts buildArms takes no threshold, so its steps are mirrored here) ----
@@ -149,33 +180,35 @@ function planLines(deps: Deps, split: SplitName, cmd: 'all' | 'questions' | 'b' 
 
 // ---- Commands ----
 
-async function questionsCmd(deps: Deps, split: SplitName): Promise<number> {
+async function questionsCmd(deps: Deps, split: SplitName, k: number): Promise<number> {
   const todo = deps.cases(split).filter((c) => !loadQuestions(deps.cacheDir, c.id));
   planLines(deps, split, 'questions').forEach(deps.print);
   if (!(await deps.confirm(`Run these live claude -p calls for ${todo.length} cases?`))) return 1;
   const stats = makeStats();
-  let failed = 0;
-  for (const c of todo) {
+  const gate = limiter(k * CALLS_PER_CASE);
+  const failures = await mapLimit(todo, k, async (c) => {
     try {
       const history = renderMessages(deps.messages(c));
-      const gen = ask(questionPrompt(history, PINNED_TAIL), stats, deps.spawn);
+      const gen = await gate(() => ask(questionPrompt(history, PINNED_TAIL), stats, deps.spawn));
       if (!gen) throw new Error('question prompt over the cap');
       const parsed = parseQuestions(c.id, gen.text);
       if (parsed.malformed) throw new Error('malformed question reply');
-      const judge = (prompt: string): string => ask(prompt, stats, deps.spawn)?.text ?? '';
-      const passed = new Map<string, boolean>();
-      for (const q of parsed.questions) {
-        const a = ask(answerPrompt(history, q), stats, deps.spawn);
-        passed.set(q.id, !!a && scoreAnswer(q, a.text, judge).outcome === 'pass');
-      }
+      const judge = async (prompt: string): Promise<string> => (await gate(() => ask(prompt, stats, deps.spawn)))?.text ?? '';
+      const results = await Promise.all(parsed.questions.map(async (q) => {
+        const a = await gate(() => ask(answerPrompt(history, q), stats, deps.spawn));
+        return !!a && (await scoreAnswerAsync(q, a.text, judge)).outcome === 'pass';
+      }));
+      const passed = new Map(parsed.questions.map((q, i) => [q.id, results[i]!]));
       const { kept, dropped } = dropFailed(parsed.questions, passed);
       saveQuestions(deps.cacheDir, c.id, kept, { dropped, model: gen.model });
       deps.print(`${c.id} kept ${kept.length} dropped ${dropped} invalid ${parsed.invalid}`);
+      return 0;
     } catch (e) {
-      failed++;
       deps.print(`${c.id} failed: ${errText(e)}`);
+      return 1;
     }
-  }
+  });
+  const failed = failures.reduce((n: number, f) => n + f, 0);
   deps.print(`questions done: ${todo.length - failed} cached, ${failed} failed, ${stats.refusals} refused`);
   return failed > 0 ? 1 : 0;
 }
@@ -217,16 +250,21 @@ async function bCmd(deps: Deps, split: SplitName): Promise<number> {
   return 0;
 }
 
-/** Per-case resume cache under out/run-cache/<kind>/. A hit costs no call; its model ids still count. */
+/** Per-case resume cache under out/run-cache/<kind>/. A hit costs no call; its model ids still count. Each miss gets its own Stats, so parallel cases never mix model ids; refusals fold into the shared stats. */
 function memoFor(deps: Deps, kind: string, stats: Stats, models: Set<string>) {
   const dir = join(deps.outDir, 'run-cache', kind);
-  return async <T extends object>(key: string, fn: () => Promise<T>): Promise<T & { models: string[] }> => {
+  return async <T extends object>(key: string, fn: (own: Stats) => Promise<T>): Promise<T & { models: string[] }> => {
     const file = cacheFile(dir, key);
     let entry = readJson<T & { models: string[] }>(file);
     if (!entry) {
-      const before = stats.models.length;
-      const value = await fn();
-      entry = { ...value, models: uniq(stats.models.slice(before)) };
+      const own = makeStats();
+      let value: T;
+      try {
+        value = await fn(own);
+      } finally {
+        stats.refusals += own.refusals;
+      }
+      entry = { ...value, models: uniq(own.models) };
       writeJson(file, entry);
     }
     entry.models.forEach((m) => models.add(m));
@@ -244,7 +282,7 @@ const lazyT0 = (deps: Deps, asker: JevAsker) => {
   };
 };
 
-async function devCmd(deps: Deps): Promise<number> {
+async function devCmd(deps: Deps, k: number): Promise<number> {
   const ready = deps.cases('dev').filter((c) => questionsOf(deps, c).length > 0);
   planLines(deps, 'dev', 'all').forEach(deps.print);
   if (ready.length === 0) {
@@ -263,33 +301,37 @@ async function devCmd(deps: Deps): Promise<number> {
   const models = new Set<string>();
   const memo = memoFor(deps, 'dev', stats, models);
   const t0Of_ = lazyT0(deps, asker);
+  const gate = limiter(k * CALLS_PER_CASE);
   const rowsOf = async (c: Case, key: string, text: (messages: Message[], t0: T0) => Promise<string>) =>
-    (await memo(key, async () => {
+    (await memo(key, async (own) => {
       const messages = deps.messages(c);
-      return { rows: scoreArm(await text(messages, await t0Of_(c, messages)), questionsOf(deps, c), stats, deps) };
+      return { rows: await scoreArm(await text(messages, await t0Of_(c, messages)), questionsOf(deps, c), own, deps, gate) };
     })).rows;
   const failedCases = new Set<string>();
-  const guard = async (c: Case, fn: () => Promise<void>) => {
+  const guard = async <T>(c: Case, fn: () => Promise<T>): Promise<T | undefined> => {
     try {
-      await fn();
+      return await fn();
     } catch (e) {
       failedCases.add(c.id);
       deps.print(`${c.id} failed: ${errText(e)}`);
+      return undefined;
     }
   };
 
   const S: Row[] = [];
   const A = new Map<number, Row[]>(THRESHOLDS.map((t) => [t, []]));
-  for (const c of ready) {
-    await guard(c, async () => {
-      const s = await rowsOf(c, `${c.id}.S`, async (m, t0) => sTextOf(c, m, t0));
-      const as = new Map<number, Row[]>();
-      for (const t of THRESHOLDS) {
-        as.set(t, await rowsOf(c, `${c.id}.t${t}`, async (m, t0) => renderMessages((await trimOf(m, t0, asker, { threshold: t })).messages)));
-      }
-      S.push(...s);
-      for (const [t, rows] of as) A.get(t)!.push(...rows);
-    });
+  const sweepRows = await mapLimit(ready, k, (c) => guard(c, async () => {
+    const s = await rowsOf(c, `${c.id}.S`, async (m, t0) => sTextOf(c, m, t0));
+    const as = new Map<number, Row[]>();
+    for (const t of THRESHOLDS) {
+      as.set(t, await rowsOf(c, `${c.id}.t${t}`, async (m, t0) => renderMessages((await trimOf(m, t0, asker, { threshold: t })).messages)));
+    }
+    return { s, as };
+  }));
+  for (const r of sweepRows) {
+    if (!r) continue;
+    S.push(...r.s);
+    for (const [t, rows] of r.as) A.get(t)!.push(...rows);
   }
   if (failedCases.size > 0) {
     deps.print(`dev stopped: ${failedCases.size} cases failed; finished work is cached, rerun to resume`);
@@ -310,22 +352,24 @@ async function devCmd(deps: Deps): Promise<number> {
   const small: Row[] = [];
   const stale: Row[] = [];
   const flips: { id: string; compared: number; flips: number }[] = [];
-  for (const c of ready) {
-    await guard(c, async () => {
-      const w = await rowsOf(c, `${c.id}.t${chosen}.w${SMALL_WINDOW}`, async (m, t0) => renderMessages((await trimOf(m, t0, asker, { threshold: chosen, windowTokens: SMALL_WINDOW })).messages));
-      const st = await rowsOf(c, `${c.id}.t${chosen}.stale`, async (m, t0) => renderMessages((await trimOf(m, t0, asker, { threshold: chosen, staleOnly: true })).messages));
-      const f = await memo(`${c.id}.t${chosen}.flip`, async () => {
-        const messages = deps.messages(c);
-        const t0 = await t0Of_(c, messages);
-        const first = await trimOf(messages, t0, asker, { threshold: chosen });
-        const second = await trimOf(messages, t0, asker, { threshold: chosen });
-        return flipOf(first.decisions, second.decisions);
-      });
-      small.push(...w);
-      stale.push(...st);
-      big.push(...A.get(chosen)!.filter((r) => r.caseId === c.id));
-      flips.push({ id: c.id, compared: f.compared, flips: f.flips });
+  const extras = await mapLimit(ready, k, (c) => guard(c, async () => {
+    const w = await rowsOf(c, `${c.id}.t${chosen}.w${SMALL_WINDOW}`, async (m, t0) => renderMessages((await trimOf(m, t0, asker, { threshold: chosen, windowTokens: SMALL_WINDOW })).messages));
+    const st = await rowsOf(c, `${c.id}.t${chosen}.stale`, async (m, t0) => renderMessages((await trimOf(m, t0, asker, { threshold: chosen, staleOnly: true })).messages));
+    const f = await memo(`${c.id}.t${chosen}.flip`, async () => {
+      const messages = deps.messages(c);
+      const t0 = await t0Of_(c, messages);
+      const first = await trimOf(messages, t0, asker, { threshold: chosen });
+      const second = await trimOf(messages, t0, asker, { threshold: chosen });
+      return flipOf(first.decisions, second.decisions);
     });
+    return { c, w, st, f };
+  }));
+  for (const r of extras) {
+    if (!r) continue;
+    small.push(...r.w);
+    stale.push(...r.st);
+    big.push(...A.get(chosen)!.filter((row) => row.caseId === r.c.id));
+    flips.push({ id: r.c.id, compared: r.f.compared, flips: r.f.flips });
   }
   if (failedCases.size > 0) {
     deps.print(`dev stopped: ${failedCases.size} cases failed; finished work is cached, rerun to resume`);
@@ -343,7 +387,7 @@ async function devCmd(deps: Deps): Promise<number> {
   return 0;
 }
 
-async function testCmd(deps: Deps, threshold: number): Promise<number> {
+async function testCmd(deps: Deps, threshold: number, k: number): Promise<number> {
   const ready = deps.cases('test').filter((c) => questionsOf(deps, c).length > 0);
   planLines(deps, 'test', 'all').forEach(deps.print);
   let asker: JevAsker;
@@ -362,9 +406,10 @@ async function testCmd(deps: Deps, threshold: number): Promise<number> {
   const failedCases: string[] = [];
   let scored = 0;
   let handIgnored = 0;
-  for (const c of ready) {
+  const gate = limiter(k * CALLS_PER_CASE);
+  const entries = await mapLimit(ready, k, async (c) => {
     try {
-      const e = await memo(`${c.id}.t${threshold}`, async () => {
+      return await memo(`${c.id}.t${threshold}`, async (own) => {
         const messages = deps.messages(c);
         const t0 = await t0Of(messages, asker);
         const trimmed = await trimOf(messages, t0, asker, { threshold });
@@ -374,17 +419,24 @@ async function testCmd(deps: Deps, threshold: number): Promise<number> {
         if (b?.mode === 'headless') text.B = b.summary.join('\n');
         const qs = questionsOf(deps, c);
         const byArm: Partial<Record<Arm, Row[]>> = {};
-        for (const arm of ARMS) if (text[arm] !== undefined) byArm[arm] = scoreArm(text[arm] as string, qs, stats, deps);
+        for (const arm of ARMS) if (text[arm] !== undefined) byArm[arm] = await scoreArm(text[arm] as string, qs, own, deps, gate);
         return { rows: byArm, handIgnored: b?.mode === 'hand' };
       });
-      scored++;
-      if (e.handIgnored) handIgnored++;
-      for (const arm of ARMS) if (e.rows[arm]) (rows[arm] ??= []).push(...(e.rows[arm] as Row[]));
     } catch (err) {
-      failedCases.push(c.id);
       deps.print(`${c.id} failed: ${errText(err)}`);
+      return undefined;
     }
-  }
+  });
+  ready.forEach((c, i) => {
+    const e = entries[i];
+    if (!e) {
+      failedCases.push(c.id);
+      return;
+    }
+    scored++;
+    if (e.handIgnored) handIgnored++;
+    for (const arm of ARMS) if (e.rows[arm]) (rows[arm] ??= []).push(...(e.rows[arm] as Row[]));
+  });
   const report = buildReport(Object.fromEntries(ARMS.filter((a) => rows[a]).map((a) => [a, (rows[a] as Row[]).map(toScored)])));
   const modelIds = [...models];
   const md =
@@ -402,11 +454,26 @@ async function testCmd(deps: Deps, threshold: number): Promise<number> {
   return scored < MIN_TEST_CASES || failedCases.length > 0 ? 1 : 0;
 }
 
-const USAGE = 'usage: run.ts plan --split dev|test | questions --split dev|test | b --split dev|test | dev | test --threshold <t>';
+const USAGE = 'usage: run.ts plan --split dev|test | questions --split dev|test | b --split dev|test | dev | test --threshold <t>  [--cases <N>] [--concurrency <K>]';
 
 export async function main(argv: string[], deps: Deps): Promise<number> {
   const [cmd] = argv;
   const flag = (name: string) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined);
+  const posInt = (name: string): number | undefined => {
+    const v = flag(name);
+    return v === undefined ? undefined : /^[1-9]\d*$/.test(v) ? Number(v) : NaN;
+  };
+  const cases = posInt('--cases');
+  const concurrency = posInt('--concurrency') ?? DEFAULT_CONCURRENCY;
+  if (Number.isNaN(cases) || Number.isNaN(concurrency)) {
+    deps.print(USAGE);
+    return 2;
+  }
+  // --cases keeps the first N cases of a split, in the split's own (seeded) order.
+  if (cases !== undefined) {
+    const all = deps.cases;
+    deps = { ...deps, cases: (name) => all(name).slice(0, cases) };
+  }
   const splitArg = flag('--split');
   const split = splitArg === 'dev' || splitArg === 'test' ? splitArg : undefined;
   if ((cmd === 'plan' || cmd === 'questions' || cmd === 'b') && split) {
@@ -414,12 +481,12 @@ export async function main(argv: string[], deps: Deps): Promise<number> {
       planLines(deps, split, 'all').forEach(deps.print);
       return 0;
     }
-    return cmd === 'questions' ? questionsCmd(deps, split) : bCmd(deps, split);
+    return cmd === 'questions' ? questionsCmd(deps, split, concurrency) : bCmd(deps, split);
   }
-  if (cmd === 'dev') return devCmd(deps);
+  if (cmd === 'dev') return devCmd(deps, concurrency);
   if (cmd === 'test') {
     const t = Number(flag('--threshold'));
-    if (flag('--threshold') !== undefined && t > 0 && t <= 1) return testCmd(deps, t);
+    if (flag('--threshold') !== undefined && t > 0 && t <= 1) return testCmd(deps, t, concurrency);
   }
   deps.print(USAGE);
   return 2;
@@ -439,7 +506,7 @@ export function liveDeps(): Deps {
   const outDir = join(EVAL_DIR, 'out');
   let manifest: Manifest | undefined;
   let split: ReturnType<typeof splitCases> | undefined;
-  let loaded: { path: string; messages: Message[] } | undefined;
+  const loaded = new Map<string, Message[]>();
   const load = () => {
     manifest ??= JSON.parse(readFileSync(join(outDir, 'manifest.json'), 'utf8')) as Manifest;
     split ??= splitCases(loadCases(manifest), EVAL_CAP, DEFAULT_SEED);
@@ -450,12 +517,14 @@ export function liveDeps(): Deps {
     cacheDir: join(EVAL_DIR, 'cache'),
     cases: (name) => load().split[name].filter((c) => c.estTokens < EVAL_CAP),
     messages: (c) => {
-      if (loaded?.path !== c.transcript) {
+      // Keyed per transcript: cases of different transcripts run at the same time.
+      let all = loaded.get(c.transcript);
+      if (!all) {
         const file = load().manifest.files.find((f) => f.path === c.transcript);
         if (!file) throw new Error(`Case ${c.id}: transcript not in the manifest`);
-        loaded = { path: c.transcript, messages: loadTranscript(file).messages };
+        loaded.set(c.transcript, (all = loadTranscript(file).messages));
       }
-      return loaded.messages.slice(c.start, c.end);
+      return all.slice(c.start, c.end);
     },
     makeAsker: () => {
       const key = process.env.TYPESAFE_API_KEY;

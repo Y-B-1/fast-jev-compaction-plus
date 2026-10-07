@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { estimateTokens } from '../src/state.js';
 import { ask, EVAL_ARGV, EVAL_CAP, EVAL_MODEL, EVAL_OVERHEAD, makeStats, type SpawnFn } from './claude.js';
 import { cacheFile, dropFailed, loadQuestions, parseQuestions, questionPrompt, saveQuestions, tokenKind, type Question } from './questions.js';
-import { aggregate, answerPrompt, judgePrompt, normalize, passBar, scoreAnswer, type Scored } from './score.js';
+import { aggregate, answerPrompt, judgePrompt, normalize, passBar, scoreAnswer, scoreAnswerAsync, type Scored } from './score.js';
 
 const okJson = (result: string, model = 'claude-sonnet-5-5') =>
   JSON.stringify({ type: 'result', result, modelUsage: { [model]: { inputTokens: 1 } } });
@@ -20,11 +20,11 @@ function fake(result = 'hi', model?: string) {
 }
 
 describe('claude.ask', () => {
-  it('spawns the exact argv in an empty cwd with the prompt on stdin', () => {
+  it('spawns the exact argv in an empty cwd with the prompt on stdin', async () => {
     const f = fake('answer');
-    const r = ask('hello', makeStats(), f.spawn);
-    expect(EVAL_MODEL).toBe('sonnet');
-    expect(EVAL_ARGV).toEqual(['-p', '--model', 'sonnet', '--tools', '', '--strict-mcp-config', '--no-session-persistence', '--setting-sources', 'project,local', '--output-format', 'json']);
+    const r = await ask('hello', makeStats(), f.spawn);
+    expect(EVAL_MODEL).toBe('claude-sonnet-5-5');
+    expect(EVAL_ARGV).toEqual(['-p', '--model', 'claude-sonnet-5-5', '--tools', '', '--strict-mcp-config', '--no-session-persistence', '--setting-sources', 'project,local', '--output-format', 'json']);
     expect(f.calls).toHaveLength(1);
     expect(f.calls[0].argv).toEqual(EVAL_ARGV);
     expect(f.calls[0].input).toBe('hello');
@@ -34,41 +34,63 @@ describe('claude.ask', () => {
     expect(r).toEqual({ text: 'answer', model: 'claude-sonnet-5-5' });
   });
 
-  it('records the resolved model id per call', () => {
+  it('records the resolved model id per call', async () => {
     const stats = makeStats();
-    ask('a', stats, fake('x', 'claude-sonnet-5-5').spawn);
-    ask('b', stats, fake('y', 'claude-sonnet-5-6').spawn);
-    expect(stats.models).toEqual(['claude-sonnet-5-5', 'claude-sonnet-5-6']);
+    await ask('a', stats, fake('x', 'claude-sonnet-5-5').spawn);
+    await ask('b', stats, fake('y', 'claude-sonnet-5-5').spawn);
+    expect(stats.models).toEqual(['claude-sonnet-5-5', 'claude-sonnet-5-5']);
   });
 
-  it('refuses a prompt over the cap, counts it, and never spawns', () => {
+  it('throws, and records nothing, when the resolved model is not claude-sonnet-5-5', async () => {
+    const stats = makeStats();
+    await expect(ask('a', stats, fake('x', 'claude-sonnet-5-6').spawn)).rejects.toThrow(/claude-sonnet-5-6/);
+    await expect(ask('a', stats, fake('x', 'claude-opus-4-1').spawn)).rejects.toThrow(/claude-sonnet-5-5/);
+    expect(stats.models).toEqual([]);
+  });
+
+  it('awaits an async spawn', async () => {
+    const spawn: SpawnFn = async () => { await new Promise((r) => setImmediate(r)); return { status: 0, stdout: okJson('late') }; };
+    expect(await ask('a', makeStats(), spawn)).toEqual({ text: 'late', model: 'claude-sonnet-5-5' });
+  });
+
+  it('refuses a prompt over the cap, counts it, and never spawns', async () => {
     expect(EVAL_OVERHEAD).toBe(2906);
     expect(EVAL_CAP).toBe(197094);
     const f = fake();
     const stats = makeStats();
     const big = 'word '.repeat(400_000);
     expect(estimateTokens(big)).toBeGreaterThan(EVAL_CAP);
-    expect(ask(big, stats, f.spawn)).toBeNull();
+    expect(await ask(big, stats, f.spawn)).toBeNull();
     expect(stats.refusals).toBe(1);
     expect(f.calls).toHaveLength(0);
   });
 
-  it('redacts credential-shaped text before spawn', () => {
+  it('redacts credential-shaped text before spawn', async () => {
     const f = fake();
-    ask('key sk-abcdefghijklmnopqrstuvwxyz123456 here', makeStats(), f.spawn);
+    await ask('key sk-abcdefghijklmnopqrstuvwxyz123456 here', makeStats(), f.spawn);
     expect(f.calls[0].input).not.toContain('sk-abcdefghijklmnop');
     expect(f.calls[0].input).toContain('here');
   });
 
-  it('throws when the result carries no model id or the spawn fails', () => {
-    expect(() => ask('a', makeStats(), () => ({ status: 0, stdout: JSON.stringify({ result: 'x' }) }))).toThrow(/model/);
-    expect(() => ask('a', makeStats(), () => ({ status: 1, stdout: '' }))).toThrow(/exit/);
+  it('throws when the result carries no model id or the spawn fails', async () => {
+    await expect(ask('a', makeStats(), () => ({ status: 0, stdout: JSON.stringify({ result: 'x' }) }))).rejects.toThrow(/model/);
+    await expect(ask('a', makeStats(), () => ({ status: 1, stdout: '' }))).rejects.toThrow(/exit/);
   });
 });
 
 const q = (over: Partial<Question> = {}): Question => ({
   id: 'q1', caseId: 'c1', question: 'Which file?', gold: 'src/state.ts', evidence: 'edited src/state.ts',
   category: 'path', tag: 'assistant-prose', ...over,
+});
+
+describe('scoreAnswerAsync', () => {
+  it('matches scoreAnswer for token, unknown and judged questions, awaiting an async judge', async () => {
+    const judged = q({ category: 'decision' });
+    expect(await scoreAnswerAsync(q(), 'src/state.ts', async () => 'never')).toEqual({ outcome: 'pass' });
+    expect(await scoreAnswerAsync(judged, 'UNKNOWN', async () => 'CORRECT')).toEqual({ outcome: 'unknown' });
+    expect(await scoreAnswerAsync(judged, 'X', async () => 'CORRECT')).toEqual({ outcome: 'pass' });
+    expect(await scoreAnswerAsync(judged, 'X', async () => 'INCORRECT')).toEqual({ outcome: 'wrong' });
+  });
 });
 
 describe('questions', () => {

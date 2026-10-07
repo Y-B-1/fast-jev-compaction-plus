@@ -7,7 +7,7 @@ import { buildArms, renderMessages } from './arms.js';
 import type { BMode } from './b-runner.js';
 import type { SpawnFn } from './claude.js';
 import type { Case } from './load.js';
-import { loadQuestions, saveQuestions, CATEGORIES, type Question } from './questions.js';
+import { cacheFile, loadQuestions, saveQuestions, CATEGORIES, type Question } from './questions.js';
 import { main, t0Of, trimOf, THRESHOLDS, type Deps } from './run.js';
 
 // Each fake claude -p call makes a temp dir; the 24-case runs make a few thousand.
@@ -52,6 +52,8 @@ interface Fakes {
   spawnCalls: () => number;
   askerCalls: () => number;
   headlessCalls: () => number;
+  /** Highest number of fake claude -p calls in flight at once. */
+  peak: () => number;
   confirms: () => number;
   printed: string[];
 }
@@ -61,9 +63,20 @@ function fakes(d: { outDir: string; cacheDir: string }, cs: Case[], o: { lowNoul
   let asks = 0;
   let headless = 0;
   let confirms = 0;
+  let inFlight = 0;
+  let peak = 0;
   const printed: string[] = [];
-  const spawn: SpawnFn = (_argv, { input }) => {
+  const spawn: SpawnFn = async (_argv, { input }) => {
     spawns++;
+    peak = Math.max(peak, ++inFlight);
+    try {
+      await new Promise((r) => setImmediate(r));
+      return reply(input);
+    } finally {
+      inFlight--;
+    }
+  };
+  const reply = (input: string) => {
     if (o.failSpawnAfter !== undefined && spawns > o.failSpawnAfter) return { status: 1, stdout: '' };
     let result: string;
     if (input.startsWith('Below is a coding-session history')) {
@@ -103,7 +116,7 @@ function fakes(d: { outDir: string; cacheDir: string }, cs: Case[], o: { lowNoul
     print: (m) => printed.push(m),
   };
   if (o.headless) { const inner = o.headless; deps.runHeadless = async (x) => { headless++; return inner(x); }; }
-  return { deps, spawnCalls: () => spawns, askerCalls: () => asks, headlessCalls: () => headless, confirms: () => confirms, printed };
+  return { deps, spawnCalls: () => spawns, askerCalls: () => asks, headlessCalls: () => headless, peak: () => peak, confirms: () => confirms, printed };
 }
 const writeB = (d: { outDir: string }, c: Case, mode: 'headless' | 'hand') => {
   mkdirSync(join(d.outDir, 'b'), { recursive: true });
@@ -209,10 +222,10 @@ describe('run confirm and resume', () => {
     cache(d, cs, 4);
     const clean = fakes(fresh(), cs);
     cache(clean.deps, cs, 4);
-    await main(['test', '--threshold', '0.15'], clean.deps);
+    await main(['test', '--threshold', '0.15', '--concurrency', '1'], clean.deps);
     const perCase = clean.spawnCalls() / 6;
     const crash = fakes(d, cs, { failSpawnAfter: Math.floor(perCase * 3.5) });
-    expect(await main(['test', '--threshold', '0.15'], crash.deps)).toBe(1);
+    expect(await main(['test', '--threshold', '0.15', '--concurrency', '1'], crash.deps)).toBe(1);
     const finished = readdirSync(join(d.outDir, 'run-cache', 'test')).length;
     expect(finished).toBe(3);
     const again = fakes(d, cs);
@@ -343,7 +356,7 @@ describe('run scoring', () => {
     const inner = f.deps.spawn!;
     // An answer far over the cap makes the judge prompt (gold plus answer) over it too, so ask() returns null for the judge only.
     const huge = 'a '.repeat(600_000);
-    f.deps.spawn = (argv, o) => (o.input.startsWith('Answer the question')
+    f.deps.spawn = async (argv, o) => (o.input.startsWith('Answer the question')
       ? { status: 0, stdout: JSON.stringify({ result: `${huge} ${gold(0)}`, modelUsage: { [MODEL]: {} } }) }
       : inner(argv, o));
     await main(['test', '--threshold', '0.15'], f.deps);
@@ -351,5 +364,128 @@ describe('run scoring', () => {
     const judged = rows.filter((r) => r.category === 'decision');
     expect(judged.length).toBeGreaterThan(0);
     expect(judged.every((r) => r.outcome === 'unknown')).toBe(true);
+  });
+});
+
+const outFiles = (dir: string, rel = ''): Record<string, string> =>
+  Object.fromEntries(readdirSync(join(dir, rel), { withFileTypes: true }).flatMap((e) =>
+    e.isDirectory() ? Object.entries(outFiles(dir, join(rel, e.name))) : [[join(rel, e.name), readFileSync(join(dir, rel, e.name), 'utf8')]]));
+
+describe('run --cases', () => {
+  const ids = (cs: Case[]) => cs.map((c) => c.id);
+  const cached = (d: { outDir: string }, kind: string, suffix: string, cs: Case[]) =>
+    cs.filter((c) => existsSync(cacheFile(join(d.outDir, 'run-cache', kind), `${c.id}${suffix}`)));
+
+  it('plan --cases 2 counts 2 cases of a 5-case split', async () => {
+    const d = fresh();
+    const cs = many(5);
+    const f = fakes(d, cs);
+    expect(await main(['plan', '--split', 'test', '--cases', '2'], f.deps)).toBe(0);
+    expect(f.printed.join('\n')).toContain('cases under the cap: 2');
+  });
+
+  it('questions keeps the first 2 cases in split order', async () => {
+    const d = fresh();
+    const cs = many(5);
+    const f = fakes(d, cs);
+    expect(await main(['questions', '--split', 'test', '--cases', '2'], f.deps)).toBe(0);
+    expect(cs.filter((c) => loadQuestions(d.cacheDir, c.id)).map((c) => c.id)).toEqual(ids(cs.slice(0, 2)));
+  });
+
+  it('b keeps the first 2 cases', async () => {
+    const d = fresh();
+    const cs = many(5);
+    const seen: string[] = [];
+    const f = fakes(d, cs, { headless: async ({ case: c }) => { seen.push((c as Case).id); return { headless: false, evidence: 'x', forkPath: 'f' }; } });
+    expect(await main(['b', '--split', 'test', '--cases', '2'], f.deps)).toBe(0);
+    expect(seen).toEqual(ids(cs.slice(0, 2)));
+  });
+
+  it('dev and test keep the first 2 cases', async () => {
+    const d = fresh();
+    const cs = many(5);
+    cache(d, cs, 4);
+    const f = fakes(d, cs);
+    await main(['dev', '--cases', '2'], f.deps);
+    expect(ids(cached(d, 'dev', '.S', cs))).toEqual(ids(cs.slice(0, 2)));
+    expect(JSON.parse(rd(d, 'dev-sweep.json')).cases).toEqual(ids(cs.slice(0, 2)));
+    await main(['test', '--threshold', '0.15', '--cases', '2'], f.deps);
+    expect(ids(cached(d, 'test', '.t0.15', cs))).toEqual(ids(cs.slice(0, 2)));
+    expect(JSON.parse(rd(d, 'test.json')).ids).toEqual(ids(cs.slice(0, 2)));
+  });
+
+  it('rejects a bad --cases or --concurrency with usage and no call', async () => {
+    for (const bad of [['--cases', '0'], ['--cases', 'x'], ['--cases', '1.5'], ['--concurrency', '0'], ['--concurrency', 'x']]) {
+      const d = fresh();
+      const cs = many(2);
+      cache(d, cs, 4);
+      const f = fakes(d, cs);
+      expect(await main(['dev', ...bad], f.deps)).toBe(2);
+      expect([bad[0], f.confirms(), f.spawnCalls()]).toEqual([bad[0], 0, 0]);
+    }
+  });
+});
+
+describe('run --concurrency', () => {
+  const K = 3;
+  const LIMIT = K * 4;
+
+  const runBoth = async (argv: string[], cs: Case[], prep: (d: { outDir: string; cacheDir: string }) => void, exit = 0) => {
+    const one = fresh();
+    const many_ = fresh();
+    prep(one);
+    prep(many_);
+    const f1 = fakes(one, cs);
+    const fK = fakes(many_, cs);
+    expect(await main([...argv, '--concurrency', '1'], f1.deps)).toBe(exit);
+    expect(await main([...argv, '--concurrency', String(K)], fK.deps)).toBe(exit);
+    return { one, many_, f1, fK };
+  };
+
+  it('dev: calls overlap, never exceed K x 4, and outputs equal a --concurrency 1 run', async () => {
+    const cs = many(6);
+    const { one, many_, f1, fK } = await runBoth(['dev'], cs, (d) => cache(d, cs, 6));
+    expect(f1.peak()).toBeLessThanOrEqual(4);
+    expect(fK.peak()).toBeGreaterThan(1);
+    expect(fK.peak()).toBeLessThanOrEqual(LIMIT);
+    expect(fK.spawnCalls()).toBe(f1.spawnCalls());
+    expect(outFiles(many_.outDir)).toEqual(outFiles(one.outDir));
+  });
+
+  it('test: calls overlap, never exceed K x 4, and outputs equal a --concurrency 1 run', async () => {
+    const cs = many(6);
+    const { one, many_, f1, fK } = await runBoth(['test', '--threshold', '0.15'], cs, (d) => { cache(d, cs, 6); cs.forEach((c) => writeB(d, c, 'headless')); }, 1); // 1: under the 24-case minimum
+    expect(fK.peak()).toBeGreaterThan(1);
+    expect(fK.peak()).toBeLessThanOrEqual(LIMIT);
+    expect(fK.spawnCalls()).toBe(f1.spawnCalls());
+    expect(outFiles(many_.outDir)).toEqual(outFiles(one.outDir));
+  });
+
+  it('questions: calls overlap, never exceed K x 4, and the cache equals a --concurrency 1 run', async () => {
+    const cs = many(5);
+    const { one, many_, fK } = await runBoth(['questions', '--split', 'test'], cs, () => {});
+    expect(fK.peak()).toBeGreaterThan(1);
+    expect(fK.peak()).toBeLessThanOrEqual(LIMIT);
+    expect(outFiles(many_.cacheDir)).toEqual(outFiles(one.cacheDir));
+  });
+
+  it('defaults to 4 cases at once (a limit of 16 calls)', async () => {
+    const d = fresh();
+    const cs = many(8);
+    cache(d, cs, 6);
+    const f = fakes(d, cs);
+    expect(await main(['dev'], f.deps)).toBe(0);
+    expect(f.peak()).toBeGreaterThan(4);
+    expect(f.peak()).toBeLessThanOrEqual(16);
+  });
+
+  it('resume: a second dev run with every cache file present makes no call', async () => {
+    const d = fresh();
+    const cs = many(6);
+    cache(d, cs, 4);
+    expect(await main(['dev', '--concurrency', String(K)], fakes(d, cs).deps)).toBe(0);
+    const again = fakes(d, cs);
+    expect(await main(['dev', '--concurrency', String(K)], again.deps)).toBe(0);
+    expect([again.spawnCalls(), again.askerCalls()]).toEqual([0, 0]);
   });
 });
