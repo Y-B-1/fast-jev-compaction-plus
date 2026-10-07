@@ -6,7 +6,7 @@ import type { HookFetch } from '../hooks/fast-jev.js';
 import { estimateTokens } from '../src/state.js';
 import type { Message } from '../src/types.js';
 import type { SpawnFn } from './claude.js';
-import { main, type Deps } from './compare.js';
+import { main, modelText, type Deps } from './compare.js';
 import type { Case } from './load.js';
 import { saveQuestions, type Question } from './questions.js';
 
@@ -28,11 +28,12 @@ const OAI_TOKENS = 400;
 const gold = (i: number): string => `flamingo${String.fromCharCode(97 + i)}`;
 
 /** A goal, then old turns each stating one fact (plus a Read call), then a short tail. Everything carries the canary. */
-function history(n = 20): Message[] {
+function history(n = 20, quotes = false): Message[] {
   const out: Message[] = [{ role: 'user', text: `Fix the loader. ${CANARY}`, toolUses: [] }];
   for (let i = 0; i < n; i++) {
+    const noise = quotes ? ` ${'"quoted \\path" '.repeat(20)}` : '';
     out.push(
-      { role: 'assistant', text: `In the review we settled on ${gold(i)} for the loader. ${CANARY}`, toolUses: [{ tool_use_id: `t${i}`, tool: 'Read', input: { file_path: `/x/f${i}.ts` } }] },
+      { role: 'assistant', text: `In the review we settled on ${gold(i)} for the loader. ${CANARY}${noise}`, toolUses: [{ tool_use_id: `t${i}`, tool: 'Read', input: { file_path: `/x/f${i}.ts` } }] },
       { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `t${i}`, text: `${CANARY} ${'x'.repeat(3000)}` }] },
     );
   }
@@ -55,7 +56,7 @@ interface Fakes {
   printed: string[];
 }
 /** Fake Jev drops everything (noul 0.01); fake OpenAI keeps the calls and results of t1..t3 and drops the rest. Both report usage. */
-function fakes(d: { outDir: string; cacheDir: string }, cs: Case[], o: { allow?: boolean; env?: Deps['env']; openaiUsage?: boolean } = {}): Fakes {
+function fakes(d: { outDir: string; cacheDir: string }, cs: Case[], o: { allow?: boolean; env?: Deps['env']; openaiUsage?: boolean; turns?: number; quotes?: boolean } = {}): Fakes {
   const jevBodies: string[] = [];
   const openaiBodies: string[] = [];
   const printed: string[] = [];
@@ -87,7 +88,7 @@ function fakes(d: { outDir: string; cacheDir: string }, cs: Case[], o: { allow?:
     return { status: 0, stdout: JSON.stringify({ result, modelUsage: { [MODEL]: {} } }) };
   };
   const deps: Deps = {
-    ...d, cases: () => cs, messages: () => history(), spawn, jevFetch, openaiFetch,
+    ...d, cases: () => cs, messages: () => history(o.turns, o.quotes), spawn, jevFetch, openaiFetch,
     env: o.env ?? { TYPESAFE_API_KEY: JEV_KEY, OPENAI_API_KEY: OAI_KEY },
     confirm: async () => { confirms++; return o.allow ?? true; },
     print: (m) => printed.push(m),
@@ -96,7 +97,7 @@ function fakes(d: { outDir: string; cacheDir: string }, cs: Case[], o: { allow?:
 }
 const cache = (d: { cacheDir: string }, cs: Case[]) => cs.forEach((c) => saveQuestions(d.cacheDir, c.id, questions(c), { dropped: 0, model: MODEL }));
 const out = (d: { outDir: string }, f: string) => readFileSync(join(d.outDir, 'compare', f), 'utf8');
-const jsonl = (text: string) => text.trim().split('\n').map((l) => JSON.parse(l) as Record<string, any>);
+const jsonl = (text: string) => text.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as Record<string, any>);
 const filesUnder = (dir: string): string[] => readdirSync(dir).flatMap((n) => (statSync(join(dir, n)).isDirectory() ? filesUnder(join(dir, n)) : [join(dir, n)]));
 const ARGS = ['--split', 'dev', '--cases', '2'];
 
@@ -117,8 +118,9 @@ describe('compare', () => {
     expect(oai).toHaveLength(f.openaiBodies.length);
     expect(jev.every((r) => r.inputReported === JEV_TOKENS && r.status === 200 && r.error === null && r.questions > 0 && r.ms >= 0)).toBe(true);
     expect(oai.every((r) => r.inputReported === OAI_TOKENS && r.outputReported === null)).toBe(true);
-    expect(jev.reduce((n, r) => n + r.inputEstimated, 0)).toBe(f.jevBodies.reduce((n, b) => n + estimateTokens(b), 0));
-    expect(oai.reduce((n, r) => n + r.inputEstimated, 0)).toBe(f.openaiBodies.reduce((n, b) => n + estimateTokens(b), 0));
+    // Same state and same questions in every request, so both deciders are estimated alike, call for call.
+    expect(jev.map((r) => [r.caseId, r.index, r.inputEstimated])).toEqual(oai.map((r) => [r.caseId, r.index, r.inputEstimated]));
+    expect(jev.every((r) => r.inputEstimated > 0)).toBe(true);
 
     const rows = jsonl(out(d, 'cases.jsonl'));
     expect(rows).toHaveLength(4);
@@ -253,6 +255,9 @@ describe('compare', () => {
     expect(text).toContain('failed');
     expect(text).not.toContain(OAI_KEY);
     expect(out(d, 'report.md')).toContain('failed cases');
+    const rows = jsonl(out(d, 'requests.jsonl'));
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((r) => r.decider === 'openai' && r.error === 'http_401')).toBe(true);
     // The Jev half stays cached; a rerun repeats only the failed OpenAI half.
     const again = fakes(d, cs);
     expect(await main(['--split', 'dev'], again.deps)).toBe(0);
@@ -265,5 +270,71 @@ describe('compare', () => {
     const f = fakes(d, []);
     expect(await main(['--split', 'dev', '--cases', '0'], f.deps)).toBe(2);
     expect(await main([], f.deps)).toBe(2);
+  });
+
+  it('estimates input on the decoded text, so JSON escaping does not move the number', async () => {
+    const d = fresh();
+    const cs = [theCase(0)];
+    cache(d, cs);
+    const f = fakes(d, cs, { quotes: true });
+    expect(await main(['--split', 'dev'], f.deps)).toBe(0);
+    const reqs = jsonl(out(d, 'requests.jsonl'));
+    const jev = reqs.filter((r) => r.decider === 'jev');
+    const oai = reqs.filter((r) => r.decider === 'openai');
+    expect(jev.length).toBeGreaterThan(0);
+    expect(oai.map((r) => r.inputEstimated)).toEqual(jev.map((r) => r.inputEstimated));
+    // The raw bodies differ a lot (OpenAI's `input` is a JSON string inside JSON): the old basis.
+    const raw = (bodies: string[]) => bodies.reduce((n, b) => n + estimateTokens(b), 0);
+    expect(raw(f.openaiBodies)).toBeGreaterThan(raw(f.jevBodies));
+    console.log(`escaping probe: raw-body estimate jev ${raw(f.jevBodies)} openai ${raw(f.openaiBodies)}; decoded estimate jev ${jev.reduce((n, r) => n + r.inputEstimated, 0)} openai ${oai.reduce((n, r) => n + r.inputEstimated, 0)}`);
+  });
+
+  it('modelText counts the state once, as a string, plus instruction and criteria text', () => {
+    const state = { t: 'say "hi" \\ there' };
+    const qs = { a: { type: 'noul' as const, instructions: 'I', criteria: { true: 'T', false: 'F' } } };
+    expect(modelText(state, qs)).toBe(`${JSON.stringify(state)}\nI\nT\nF`);
+    expect(modelText('plain', qs)).toBe('plain\nI\nT\nF');
+  });
+
+  it('does not cache a decider with any failed request, keeps its rows, and a rerun retries it', async () => {
+    const d = fresh();
+    const cs = [theCase(0)];
+    cache(d, cs);
+    const f = fakes(d, cs, { turns: 300 });
+    const good = f.deps.openaiFetch;
+    let n = 0;
+    f.deps.openaiFetch = async (u, init) => (n++ === 1 ? { status: 400, ok: false, text: 'nope' } : good(u, init));
+    expect(await main(['--split', 'dev'], f.deps)).toBe(1);
+    expect(n).toBeGreaterThan(1);
+    const rows = jsonl(out(d, 'requests.jsonl')).filter((r) => r.decider === 'openai');
+    expect(rows).toHaveLength(n);
+    expect(rows.filter((r) => r.error === 'http_400')).toHaveLength(1);
+    expect(jsonl(out(d, 'cases.jsonl'))).toHaveLength(0);
+    const again = fakes(d, cs, { turns: 300 });
+    expect(await main(['--split', 'dev'], again.deps)).toBe(0);
+    expect(again.jevBodies).toHaveLength(0);
+    expect(again.openaiBodies.length).toBe(n);
+  });
+
+  it('shows the reported total as n/a and costs each call by reported-else-estimated when usage is partial', async () => {
+    const d = fresh();
+    const cs = [theCase(0)];
+    cache(d, cs);
+    const f = fakes(d, cs, { turns: 300 });
+    const plain = f.deps.openaiFetch;
+    let n = 0;
+    f.deps.openaiFetch = async (u, init) => {
+      const r = await plain(u, init);
+      return n++ === 0 ? r : { ...r, text: JSON.stringify({ answers: JSON.parse(r.text).answers }) };
+    };
+    expect(await main(['--split', 'dev'], f.deps)).toBe(0);
+    expect(n).toBeGreaterThan(1);
+    const o = jsonl(out(d, 'cases.jsonl')).find((r) => r.decider === 'openai')!;
+    const rows = jsonl(out(d, 'requests.jsonl')).filter((r) => r.decider === 'openai');
+    expect(o.inputReported).toBeNull();
+    expect(o.costBasis).toBe('mixed');
+    const tokens = OAI_TOKENS + rows.slice(1).reduce((t, r) => t + r.inputEstimated, 0);
+    expect(o.costUsd).toBeCloseTo((tokens / 1e6) * 0.1, 12);
+    expect(out(d, 'report.md')).toMatch(/\| Input tokens, reported by the API \| [\d,]+ \| n\/a \| n\/a \|/);
   });
 });

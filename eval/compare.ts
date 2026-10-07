@@ -11,7 +11,7 @@ import { compact } from '../src/compact.js';
 import { redactText } from '../src/redact.js';
 import { DEFAULT_MODEL } from '../src/request.js';
 import { estimateTokens } from '../src/state.js';
-import type { CallAction, JevAsker, Message } from '../src/types.js';
+import type { CallAction, JevAsker, JevQuestions, JevState, Message } from '../src/types.js';
 import { renderMessages } from './arms.js';
 import { confirmFromStream } from './b-runner.js';
 import { ask, EVAL_CAP, makeStats, type SpawnFn, type Stats } from './claude.js';
@@ -50,7 +50,7 @@ interface ReqRow {
   questions: number;
   /** Input tokens the API reported; null when it reported none. */
   inputReported: number | null;
-  /** estimateTokens of the exact request body. */
+  /** estimateTokens of the decoded text the model sees (modelText), the same basis for both deciders. */
   inputEstimated: number;
   outputReported: number | null;
   ms: number;
@@ -78,7 +78,7 @@ interface CaseRow {
   requestMs: number;
   wallMs: number;
   costUsd: number | null;
-  costBasis: 'reported' | 'estimated' | 'jev-price' | null;
+  costBasis: 'reported' | 'estimated' | 'mixed' | 'jev-price' | null;
   /** Share of items on which both deciders chose the same action; null when there are none. */
   agreement: number | null;
   /** Null when the case has no cached questions. */
@@ -98,7 +98,8 @@ const writeText = (file: string, text: string): void => {
   writeFileSync(file, text);
 };
 const sum = (xs: number[]): number => xs.reduce((a, b) => a + b, 0);
-const reportedSum = (xs: (number | null)[]): number | null => (xs.every((x) => x === null) ? null : sum(xs.filter((x): x is number => x !== null)));
+/** The sum, or null unless every entry is a number: a partial total would undercount. */
+const reportedSum = (xs: (number | null)[]): number | null => (xs.length === 0 || xs.some((x) => x === null) ? null : sum(xs as number[]));
 
 /** At most `n` tasks run at once; the rest wait their turn (as in run.ts). */
 const limiter = (n: number) => {
@@ -135,30 +136,45 @@ const errorClass = (e: unknown, status: number): string => {
 };
 const numberOr = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
-/** Logs one row per asker call: the exact body, last status, latency, reported usage, error class. */
+/**
+ * The text the model reads, decoded: the state as one string (what Jev nests as `state` and OpenAI sends as `input`)
+ * plus the questions' instruction and criteria text. Counting the raw HTTP body instead would bill OpenAI's
+ * string-in-JSON `input` for a second round of quote and backslash escaping that Jev's nested object does not pay.
+ */
+export function modelText(state: JevState, questions: JevQuestions): string {
+  const parts: string[] = [typeof state === 'string' ? state : JSON.stringify(state)];
+  for (const q of Object.values(questions)) {
+    parts.push(q.instructions);
+    if (q.type === 'noul') parts.push(q.criteria?.true ?? '', q.criteria?.false ?? '');
+    else if (q.type === 'choice') parts.push(...Object.entries(q.criteria).flatMap(([k, v]) => [k, v ?? '']));
+    else parts.push(...q.criteria);
+  }
+  return parts.join('\n');
+}
+
+/** Logs one row per asker call: the decoded model text's estimate, last status, latency, reported usage, error class. */
 function instrument(make: (f: HookFetch) => JevAsker, base: HookFetch, caseId: string, decider: Decider, log: ReqRow[]): JevAsker {
   let next = 0;
   return {
     async ask(state, questions) {
       const index = next++;
-      let body = '';
       let status = 0;
       const f: HookFetch = async (url, init) => {
-        body ||= init?.body ?? '';
         status = 0;
         const r = await base(url, init);
         status = r.status;
         return r;
       };
       const row = { caseId, decider, index, questions: Object.keys(questions).length };
+      const estimated = estimateTokens(modelText(state, questions));
       const started = Date.now();
       try {
         const res = await make(f).ask(state, questions);
         const price = numberOr((res as { price?: unknown }).price) ?? numberOr((res as { cost?: unknown }).cost);
-        log.push({ ...row, inputReported: numberOr(res.usage?.input_tokens), inputEstimated: estimateTokens(body), outputReported: numberOr(res.usage?.output_tokens), ms: Date.now() - started, status, error: null, price });
+        log.push({ ...row, inputReported: numberOr(res.usage?.input_tokens), inputEstimated: estimated, outputReported: numberOr(res.usage?.output_tokens), ms: Date.now() - started, status, error: null, price });
         return res;
       } catch (e) {
-        log.push({ ...row, inputReported: null, inputEstimated: estimateTokens(body), outputReported: null, ms: Date.now() - started, status, error: errorClass(e, status), price: null });
+        log.push({ ...row, inputReported: null, inputEstimated: estimated, outputReported: null, ms: Date.now() - started, status, error: errorClass(e, status), price: null });
         throw e;
       }
     },
@@ -190,14 +206,15 @@ const countsOf = (rows: { category: Category; outcome: Outcome }[]): NonNullable
   return { overall: of(() => true), path: of((c) => c === 'path'), number: of((c) => c === 'number'), id: of((c) => c === 'id'), error: of((c) => c === 'error') };
 };
 
-async function runDecider(deps: Deps, c: Case, decider: Decider, keys: { jev: string; openai: string }, gate: Gate): Promise<Entry> {
+/** `log` is filled as the asker is called, so a failed run still leaves its request rows. */
+async function runDecider(deps: Deps, c: Case, decider: Decider, keys: { jev: string; openai: string }, gate: Gate, log: ReqRow[]): Promise<Entry> {
   const messages = deps.messages(c);
-  const log: ReqRow[] = [];
   const asker = decider === 'jev'
     ? instrument((f) => jevAsker(f, keys.jev, DEFAULT_MODEL), deps.jevFetch, c.id, decider, log)
     : instrument((f) => openaiAsker(f, keys.openai), deps.openaiFetch, c.id, decider, log);
   const result = await compact(messages, asker, {});
-  if (result.stats.requests > 0 && result.stats.failedRequests === result.stats.requests) throw new Error(`every ${decider} request failed`);
+  // A failed call leaves its calls defaulted to keep; such a run would skew size and agreement, so it is not a result.
+  if (result.stats.failedRequests > 0) throw new Error(`${result.stats.failedRequests} of ${result.stats.requests} ${decider} requests failed`);
   const stats = makeStats();
   const qs = questionsOf(deps, c);
   const recall = qs.length > 0 ? countsOf(await scoreText(renderMessages(result.messages), qs, stats, deps, gate)) : null;
@@ -207,9 +224,11 @@ async function runDecider(deps: Deps, c: Case, decider: Decider, keys: { jev: st
   const estimated = sum(log.map((r) => r.inputEstimated));
   const prices = log.map((r) => r.price);
   const jevPrice = decider === 'jev' && prices.length > 0 && prices.every((p) => p !== null) ? sum(prices as number[]) : null;
-  const tokens = reported ?? estimated;
+  const tokens = sum(log.map((r) => r.inputReported ?? r.inputEstimated));
+  const nReported = log.filter((r) => r.inputReported !== null).length;
+  const basis: CaseRow['costBasis'] = nReported === log.length ? 'reported' : nReported === 0 ? 'estimated' : 'mixed';
   const cost = decider === 'openai'
-    ? { costUsd: (tokens / 1e6) * OPENAI_USD_PER_M, costBasis: (reported === null ? 'estimated' : 'reported') as CaseRow['costBasis'] }
+    ? { costUsd: (tokens / 1e6) * OPENAI_USD_PER_M, costBasis: basis }
     : { costUsd: jevPrice, costBasis: (jevPrice === null ? null : 'jev-price') as CaseRow['costBasis'] };
   return {
     row: {
@@ -286,7 +305,7 @@ function renderCompare(split: string, pairs: { id: string; jev: Entry; openai: E
     const a = agreementOf(p.jev, p.openai);
     return { agree: t.agree + a.agree, items: t.items + a.items };
   }, { agree: 0, items: 0 });
-  const basis = pairs.some((p) => p.openai.row.costBasis === 'estimated') ? '\nOpenAI cost uses estimated input tokens where the API reported none ($0.10 per 1M input tokens). Jev cost is n/a unless its response reports a price.\n' : '\nOpenAI cost is $0.10 per 1M input tokens. Jev cost is n/a unless its response reports a price.\n';
+  const basis = pairs.some((p) => p.openai.row.costBasis === 'estimated' || p.openai.row.costBasis === 'mixed') ? '\nOpenAI cost uses estimated input tokens for each call where the API reported none ($0.10 per 1M input tokens). Jev cost is n/a unless its response reports a price.\n' : '\nOpenAI cost is $0.10 per 1M input tokens. Jev cost is n/a unless its response reports a price.\n';
   return [
     `# Jev vs OpenAI Decisions, split ${split}, ${pairs.length} cases\n`,
     `## Totals\n\n${table(lines(pairs.map((p) => p.jev.row), pairs.map((p) => p.openai.row), total))}\n${basis}`,
@@ -347,16 +366,19 @@ export async function main(argv: string[], deps: Deps): Promise<number> {
 
   const gate = limiter(k * CALLS_PER_CASE);
   const failed = new Set<string>();
+  const failedRows: ReqRow[] = [];
   const entries = await mapLimit(chosen, k, async (c) => {
     const out: Partial<Record<Decider, Entry>> = {};
     for (const d of DECIDERS) {
       const file = fileOf(c, d);
       let entry = readJson<Entry>(file);
       if (!entry) {
+        const log: ReqRow[] = [];
         try {
-          entry = await runDecider(deps, c, d, keys, gate);
+          entry = await runDecider(deps, c, d, keys, gate, log);
         } catch (e) {
           failed.add(c.id);
+          failedRows.push(...log);
           deps.print(`${c.id} ${d} failed: ${errText(e)}`);
           continue;
         }
@@ -374,7 +396,7 @@ export async function main(argv: string[], deps: Deps): Promise<number> {
     return { ...e.row, agreement: a.items === 0 ? null : a.agree / a.items };
   };
   const jsonl = (rows: object[]) => rows.map((r) => JSON.stringify(r)).join('\n') + (rows.length > 0 ? '\n' : '');
-  writeText(join(dir, 'requests.jsonl'), jsonl(pairs.flatMap((p) => [...p.jev.requests, ...p.openai.requests])));
+  writeText(join(dir, 'requests.jsonl'), jsonl([...pairs.flatMap((p) => [...p.jev.requests, ...p.openai.requests]), ...failedRows]));
   writeText(join(dir, 'cases.jsonl'), jsonl(pairs.flatMap((p) => [withAgreement(p.jev, p.openai), withAgreement(p.openai, p.jev)])));
   writeText(join(dir, 'report.md'), renderCompare(split, pairs, [...new Set(pairs.flatMap((p) => [...p.jev.models, ...p.openai.models]))], [...failed]));
   deps.print(`compare done: ${pairs.length} cases reported, ${failed.size} failed; report at ${join(dir, 'report.md')}`);

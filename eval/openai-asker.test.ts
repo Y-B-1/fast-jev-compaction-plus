@@ -99,4 +99,10 @@ describe('openaiAsker', () => {
     expect(f.calls).toHaveLength(2);
     expect(res.answers.keep).toEqual({ type: 'noul', noul: 0.5 });
   });
+
+  it('times out a hung attempt with a TimeoutError', async () => {
+    const hung: HookFetch = () => new Promise(() => {});
+    const err = await openaiAsker(hung, KEY, undefined, { timeoutMs: 20 }).ask(STATE, QUESTIONS).then(() => undefined, (e: unknown) => e as Error);
+    expect(err?.name).toBe('TimeoutError');
+  });
 });

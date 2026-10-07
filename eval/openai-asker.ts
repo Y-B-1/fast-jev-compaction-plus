@@ -62,7 +62,24 @@ function usageOf(body: Rec): JevResponse['usage'] {
   return input === undefined && output === undefined ? undefined : { ...(input !== undefined ? { input_tokens: input } : {}), ...(output !== undefined ? { output_tokens: output } : {}) };
 }
 
-export function openaiAsker(fetchFn: HookFetch, key: string, model: string = DECISIONS_MODEL): JevAsker {
+/** Per-attempt deadline, the same as jevAsker's. */
+const TIMEOUT_MS = 20_000;
+
+/** Rejects with a TimeoutError when the attempt takes longer than `ms` (a thrown attempt is not retried, as in jevAsker). */
+function bounded<T>(attempt: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`Decisions request timed out after ${ms} ms`);
+      error.name = 'TimeoutError';
+      reject(error);
+    }, ms);
+  });
+  return Promise.race([attempt, late]).finally(() => clearTimeout(timer));
+}
+
+export function openaiAsker(fetchFn: HookFetch, key: string, model: string = DECISIONS_MODEL, options: { timeoutMs?: number } = {}): JevAsker {
+  const timeoutMs = options.timeoutMs ?? TIMEOUT_MS;
   const clean = (text: string) => redactText(text, key);
   return {
     async ask(state, questions) {
@@ -78,11 +95,11 @@ export function openaiAsker(fetchFn: HookFetch, key: string, model: string = DEC
           questions: names.map((n) => toQuestion(n, redactCompactionState(questions[n]!, key))),
         }),
       };
-      let r: HookFetchResponse = await fetchFn(DECISIONS_URL, init);
+      let r: HookFetchResponse = await bounded(fetchFn(DECISIONS_URL, init), timeoutMs);
       if (!r.ok && isRetryableStatus(r.status)) {
         const delay = retryDelayMs(r.headers?.['retry-after']);
         if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-        r = await fetchFn(DECISIONS_URL, init);
+        r = await bounded(fetchFn(DECISIONS_URL, init), timeoutMs);
       }
       if (!r.ok) throw new DecisionsError(`Decisions request failed (${r.status}): ${clean(r.text).slice(0, 200)}`, 'http', r.status);
       let body: unknown;
