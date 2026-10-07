@@ -64,12 +64,26 @@ function tokenMatch(answer: string, gold: string, category: Category): boolean {
   return !(rest.match(re) ?? []).map((t) => t.replace(/[.:]+$/, '')).some((t) => category !== 'path' || pathLike(t));
 }
 
+/** The outcome decided without a judge, or undefined when the judge must decide (a non-token, non-UNKNOWN answer). */
+function settled(q: Question, answer: string): Outcome | undefined {
+  if (isUnknown(answer, q.gold)) return 'unknown';
+  if (tokenKind(q.category)) return tokenMatch(answer, q.gold, q.category) ? 'pass' : 'wrong';
+  return undefined;
+}
+const judged = (reply: string): Outcome => (/^\s*CORRECT\b/i.test(reply) ? 'pass' : 'wrong');
+
 /** UNKNOWN scores unknown (unless the gold starts with "unknown"). Token questions: the gold must appear as a whole token and, with its occurrences removed, the answer must hold no other candidate. Others: the judge sees only gold and answer. */
 export function scoreAnswer(q: Question, answer: string, judge?: (prompt: string) => string): { outcome: Outcome } {
-  if (isUnknown(answer, q.gold)) return { outcome: 'unknown' };
-  if (tokenKind(q.category)) return { outcome: tokenMatch(answer, q.gold, q.category) ? 'pass' : 'wrong' };
+  const outcome = settled(q, answer);
+  if (outcome) return { outcome };
   if (!judge) throw new Error('judge required for a non-token question');
-  return { outcome: /^\s*CORRECT\b/i.test(judge(judgePrompt(q.gold, answer))) ? 'pass' : 'wrong' };
+  return { outcome: judged(judge(judgePrompt(q.gold, answer))) };
+}
+
+/** scoreAnswer with a judge that answers later, so many judge calls can run at once. */
+export async function scoreAnswerAsync(q: Question, answer: string, judge: (prompt: string) => Promise<string>): Promise<{ outcome: Outcome }> {
+  const outcome = settled(q, answer);
+  return { outcome: outcome ?? judged(await judge(judgePrompt(q.gold, answer))) };
 }
 
 export interface Metrics {

@@ -145,6 +145,7 @@ describe('runHeadless', () => {
     expect(argv[argv.indexOf('--resume') + 1]).toMatch(/^[0-9a-f-]{36}$/);
     expect(argv).toContain('--fork-session');
     expect(argv).toContain('/compact');
+    expect(argv[argv.indexOf('--model') + 1]).toBe('claude-sonnet-5-5');
     const copy = join(s.evalDir, 'live', 'tidy');
     expect(argv[argv.indexOf('--plugin-dir') + 1]).toBe(copy);
     expect(JSON.parse(readFileSync(join(copy, '.claude-plugin', 'plugin.json'), 'utf8')).userConfig.proseTrim.default).toBe('tidy');

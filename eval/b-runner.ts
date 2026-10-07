@@ -9,6 +9,7 @@ import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { EVAL_MODEL } from './claude.js';
 import { cases, loadTranscript, type Case, type Manifest } from './load.js';
 
 export interface BResult {
@@ -196,7 +197,7 @@ export async function runHeadless(o: HeadlessOptions): Promise<'refused' | BMode
     marker = join(evalDir, 'live', `marker-${newId}.txt`);
     const copy = copyTidyPlugin(evalDir, marker, o.repoDir);
     rmSync(marker, { force: true });
-    const argv = ['-p', '/compact', '--resume', cut.cutId, '--fork-session', '--session-id', newId, '--setting-sources', 'project,local', '--plugin-dir', copy, '--output-format', 'stream-json', '--verbose'];
+    const argv = ['-p', '/compact', '--model', EVAL_MODEL, '--resume', cut.cutId, '--fork-session', '--session-id', newId, '--setting-sources', 'project,local', '--plugin-dir', copy, '--output-format', 'stream-json', '--verbose'];
     r = (o.spawn ?? realSpawn)(argv, { cwd, env: { ...env, CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: '1' } });
   } finally {
     rmSync(cut.path, { force: true });
