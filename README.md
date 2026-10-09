@@ -131,6 +131,7 @@ put it in a source file.
 | `archiveResults` | `true` | Write the full text of a dropped tool call or result to `.claude/fast-jev-compaction/` and cite the file in the marker left in its place, so it can be `Read` or grepped back later; text that looks like a credential is never written |
 | `resultPreviewChars` | `300` | Characters from each end of a tool result quoted in its keep question; `0` disables |
 | `salvageChars` | `300` | Characters of identifiers and error lines recovered from the dropped part of a tool result and kept next to its truncation note; `0` disables |
+| `proseTrim` | `false` | Plugin hook only. Opt-in rescue: when tool compaction cuts less than `minReductionRatio`, Jev scores the clauses of old assistant text and prose tool inputs once, then drops the filler at the first fixed keep cut-off (`0.05`, `0.15`, `0.35`) that reaches the minimum, and cuts old code bodies in tool inputs. User messages, pinned messages and protected spans (code, paths, identifiers, numbers) are never trimmed. If no cut-off reaches the minimum, the built-in fallback runs as before |
 | `jevPruneBashOutput` | `false` | Opt-in: before a Bash tool result reaches the transcript, trim its stdout through Jev when it is long (`src/output.ts`). A second, separate Jev call site from compaction — leave it off unless you want the extra cost |
 | `jevPruneMinChars` | `4000` | Stdout shorter than this is left untouched even when `jevPruneBashOutput` is on |
 

@@ -20,14 +20,14 @@
  * A SHA must carry a digit: without that, ordinary words spelled from a-f
  * ("defaced") read as hashes.
  */
-const SCAN =
+export const SCAN =
   /\b([A-Za-z_][A-Za-z0-9_]{2,})=\S+|https?:\/\/[^\s)'"<>\]]+|[A-Za-z]:\\[^\s:*?"<>|]+|(?:\.{0,2}\/)?(?:[\w.@-]+\/)+[\w.@-]+|\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/g;
 
 /**
  * `fail` needs its own word-bounded alternative: test runners emit a bare
  * "FAIL", which neither "failed" nor "failure" matches.
  */
-const ERROR_LINE = /error|exception|\bfail(ed|ure|ing|s)?\b|fatal|traceback|panic|refused/i;
+export const ERROR_LINE = /error|exception|\bfail(ed|ure|ing|s)?\b|fatal|traceback|panic|refused/i;
 const EXIT_CODE = /\bexit (?:code|status)\s+(\d+)/i;
 
 /** The same assignment shape `SCAN` consumes, for redacting kept lines. */

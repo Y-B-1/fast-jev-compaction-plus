@@ -70,6 +70,12 @@
       "description": "Characters of identifiers and error lines recovered from the dropped part of a tool result and kept alongside its truncation note; 0 disables.",
       "default": 300
     },
+    "proseTrim": {
+      "type": "boolean",
+      "title": "Trim assistant prose when tool compaction falls short",
+      "description": "Opt-in: when tool compaction cuts less than the minimum reduction, drop filler clauses from old assistant text and prose tool inputs and cut old code bodies, before falling back to the built-in summary.",
+      "default": false
+    },
     "jevPruneBashOutput": {
       "type": "boolean",
       "title": "Trim Bash output with Jev",
