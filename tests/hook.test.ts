@@ -73,7 +73,7 @@ describe('hook config', () => {
       minReductionRatio: 0.25,
       model: 'jev-latest',
       builtinFallback: 'auto',
-      proseTrim: false,
+      proseTrim: true,
       jevPruneBashOutput: false,
       jevPruneMinChars: 4_000,
     });
@@ -88,7 +88,7 @@ describe('hook config', () => {
       archiveResults: true,
       minReductionRatio: 0.25,
       builtinFallback: 'auto',
-      proseTrim: false,
+      proseTrim: true,
       jevPruneBashOutput: false,
       jevPruneMinChars: 4_000,
     });
@@ -752,15 +752,15 @@ describe('proseTrim rescue', () => {
     prose: r.prose,
   });
 
-  it('reads proseTrim as a boolean, ignoring other values', () => {
-    expect(resolveHookConfig({}).proseTrim).toBe(false);
-    expect(resolveHookConfig({ proseTrim: true }).proseTrim).toBe(true);
-    expect(resolveHookConfig({ proseTrim: 'trim' }).proseTrim).toBe(false);
+  it('reads proseTrim as a boolean, on unless set to false, ignoring other values', () => {
+    expect(resolveHookConfig({}).proseTrim).toBe(true);
+    expect(resolveHookConfig({ proseTrim: false }).proseTrim).toBe(false);
+    expect(resolveHookConfig({ proseTrim: 'trim' }).proseTrim).toBe(true);
   });
 
-  it('declares proseTrim in the manifest as a boolean defaulting to false', () => {
+  it('declares proseTrim in the manifest as a boolean defaulting to true', () => {
     const manifest = JSON.parse(readFileSync(new URL('../.claude-plugin/plugin.json', import.meta.url), 'utf8'));
-    expect(manifest.userConfig.proseTrim).toMatchObject({ type: 'boolean', default: false });
+    expect(manifest.userConfig.proseTrim).toMatchObject({ type: 'boolean', default: true });
   });
 
   it('makes no prose request when tool compaction reaches the minimum', async () => {
@@ -804,7 +804,7 @@ describe('proseTrim rescue', () => {
   });
 
   it('keeps the tool result and records the attempt when no cut-off reaches the minimum', async () => {
-    const plain = await compactSession(proseTranscript(), cfg(), fetchWith(0.9));
+    const plain = await compactSession(proseTranscript(), cfg({ proseTrim: false, notificationTrim: false }), fetchWith(0.9));
     const out = await compactSession(proseTranscript(), cfg({ proseTrim: true }), fetchWith(0.9));
     expect(out.prose).toMatchObject({ stats: { requests: 1 } });
     expect(out.prose?.cutoff).toBeUndefined();
@@ -812,22 +812,38 @@ describe('proseTrim rescue', () => {
   });
 
   it('keeps the tool result when the prose stage fails completely', async () => {
-    const plain = await compactSession(proseTranscript(), cfg(), fetchWith(0.9));
+    const plain = await compactSession(proseTranscript(), cfg({ proseTrim: false, notificationTrim: false }), fetchWith(0.9));
     const out = await compactSession(proseTranscript(), cfg({ proseTrim: true }), fetchWith('fail'));
     expect(out.prose?.stats.failed).toBeTruthy();
     expect(out.prose?.cutoff).toBeUndefined();
     expect(strip({ ...out, prose: undefined })).toEqual(strip(plain));
   });
 
-  it('proseTrim false is identical to the option being omitted, with no prose request', async () => {
+  it('proseTrim false keeps the 0.6.1 result, with no prose request', async () => {
     const seenOff: string[][] = [];
     const seenOmitted: string[][] = [];
     const off = await compactSession(proseTranscript(), cfg({ proseTrim: false }), fetchWith(0.01, seenOff));
-    const omitted = await compactSession(proseTranscript(), cfg(), fetchWith(0.01, seenOmitted));
+    const omitted = await compactSession(proseTranscript(), cfg({ proseTrim: false, notificationTrim: false }), fetchWith(0.01, seenOmitted));
     expect(strip(off)).toEqual(strip(omitted));
     expect(off.prose).toBeUndefined();
     expect(seenOff).toEqual(seenOmitted);
     expect(proseRequests(seenOff)).toHaveLength(0);
+  });
+
+  it('with no options, tool compaction below the minimum runs the trim rescue', async () => {
+    const requests: string[][] = [];
+    const out = await compactSession(proseTranscript(), cfg(), fetchWith(0.1, requests));
+    expect(proseRequests(requests)).toHaveLength(1);
+    expect(out.prose?.cutoff).toBe(0.15);
+    expect(reductionRatioOf(out)).toBeGreaterThanOrEqual(0.25);
+  });
+
+  it('with both trims false, nothing but tool compaction runs', async () => {
+    const requests: string[][] = [];
+    const out = await compactSession(proseTranscript(), cfg({ proseTrim: false, notificationTrim: false }), fetchWith(0.1, requests));
+    expect(proseRequests(requests)).toHaveLength(0);
+    expect(out.prose).toBeUndefined();
+    expect(out.notifications).toBeUndefined();
   });
 
   describe('through the hook', () => {
@@ -931,7 +947,7 @@ describe('proseTrim rescue', () => {
       const failed = hook({ proseTrim: true }, fetchWith('fail'));
       expect(await failed.run(event)).toBe(event);
       expect(failed.toasts[0]).toContain('prose trim tried');
-      const off = hook({}, fetchWith(0.1));
+      const off = hook({ proseTrim: false, notificationTrim: false }, fetchWith(0.1));
       expect(await off.run(event)).toBe(event);
       expect(off.toasts[0]).not.toContain('prose');
     });
@@ -1015,22 +1031,22 @@ describe('notificationTrim rescue', () => {
   });
   const textOf = (r: Awaited<ReturnType<typeof compactSession>>) => r.messages.map((m) => m.text).join('\n');
 
-  it('reads notificationTrim as a boolean, off unless true', () => {
-    expect(resolveHookConfig({}).notificationTrim).toBeFalsy();
-    expect(resolveHookConfig({ notificationTrim: true }).notificationTrim).toBe(true);
-    expect(resolveHookConfig({ notificationTrim: 'yes' }).notificationTrim).toBeFalsy();
+  it('reads notificationTrim as a boolean, absent (default on) unless set to false', () => {
+    expect(resolveHookConfig({}).notificationTrim).toBeUndefined();
+    expect(resolveHookConfig({ notificationTrim: false }).notificationTrim).toBe(false);
+    expect(resolveHookConfig({ notificationTrim: 'yes' }).notificationTrim).toBeUndefined();
   });
 
-  it('declares notificationTrim in the manifest as a boolean defaulting to false', () => {
+  it('declares notificationTrim in the manifest as a boolean defaulting to true', () => {
     const manifest = JSON.parse(readFileSync(new URL('../.claude-plugin/plugin.json', import.meta.url), 'utf8'));
-    expect(manifest.userConfig.notificationTrim).toMatchObject({ type: 'boolean', default: false });
+    expect(manifest.userConfig.notificationTrim).toMatchObject({ type: 'boolean', default: true });
   });
 
-  it('asks nothing extra when the option is off', async () => {
+  it('asks nothing extra when the option is off (0.6.1 behaviour)', async () => {
     const seenOff: string[][] = [];
     const seenOmitted: string[][] = [];
-    const off = await compactSession(transcriptWithReports(), cfg({ notificationTrim: false }), fetchWith(0.01, seenOff));
-    const omitted = await compactSession(transcriptWithReports(), cfg(), fetchWith(0.01, seenOmitted));
+    const off = await compactSession(transcriptWithReports(), cfg({ proseTrim: false, notificationTrim: false }), fetchWith(0.01, seenOff));
+    const omitted = await compactSession(transcriptWithReports(), cfg({ proseTrim: false, notificationTrim: false }), fetchWith(0.01, seenOmitted));
     expect(strip(off)).toEqual(strip(omitted));
     expect(off.notifications).toBeUndefined();
     expect(seenOff).toEqual(seenOmitted);
@@ -1116,7 +1132,7 @@ describe('notificationTrim rescue', () => {
   });
 
   it('keeps the tool-compaction result when no rung reaches the minimum', async () => {
-    const plain = await compactSession(transcriptWithReports(), cfg(), fetchWith(0.9));
+    const plain = await compactSession(transcriptWithReports(), cfg({ proseTrim: false, notificationTrim: false }), fetchWith(0.9));
     const out = await compactSession(
       transcriptWithReports(),
       cfg({ notificationTrim: true, archiveResults: true, minReductionRatio: 0.99 }),
@@ -1129,7 +1145,7 @@ describe('notificationTrim rescue', () => {
   });
 
   it('keeps the tool-compaction result when the notification request fails', async () => {
-    const plain = await compactSession(transcriptWithReports(), cfg(), fetchWith(0.9));
+    const plain = await compactSession(transcriptWithReports(), cfg({ proseTrim: false, notificationTrim: false }), fetchWith(0.9));
     const out = await compactSession(
       transcriptWithReports(),
       cfg({ notificationTrim: true, archiveResults: true }),
@@ -1252,10 +1268,10 @@ describe('notificationTrim rescue', () => {
 
     it('falls back, saying notification trim was tried, when no rung reaches the minimum', async () => {
       const event = { trigger: 'auto', messages: transcriptWithReports() };
-      const on = hook({ notificationTrim: true, minReductionRatio: 0.99 }, fetchWith(0.9));
+      const on = hook({ notificationTrim: true, proseTrim: false, minReductionRatio: 0.99 }, fetchWith(0.9));
       expect(await on.run(event)).toBe(event);
       expect(on.toasts[0]).toMatch(/^fallback to built-in summary \(below 99% minimum, notification trim tried: /);
-      const never = hook({ notificationTrim: true, minReductionRatio: 0.99, builtinFallback: 'never' }, fetchWith(0.9));
+      const never = hook({ notificationTrim: true, proseTrim: false, minReductionRatio: 0.99, builtinFallback: 'never' }, fetchWith(0.9));
       expect(await never.run(event)).toEqual({ skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' });
       expect(never.toasts[0]).toContain('minimum, notification trim tried, builtin fallback disabled');
       const both = hook({ notificationTrim: true, proseTrim: true, minReductionRatio: 0.99 }, fetchWith(0.9));
@@ -1265,7 +1281,7 @@ describe('notificationTrim rescue', () => {
 
     it('says nothing about notification trim when the option is off', async () => {
       const event = { trigger: 'auto', messages: transcriptWithReports() };
-      const off = hook({ minReductionRatio: 0.99 }, fetchWith(0.9));
+      const off = hook({ notificationTrim: false, minReductionRatio: 0.99 }, fetchWith(0.9));
       expect(await off.run(event)).toBe(event);
       expect(off.toasts[0]).not.toContain('notification');
     });
