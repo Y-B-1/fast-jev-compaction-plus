@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   archiveWriter,
@@ -71,6 +72,7 @@ describe('hook config', () => {
       minReductionRatio: 0.25,
       model: 'jev-latest',
       builtinFallback: 'auto',
+      proseTrim: false,
       jevPruneBashOutput: false,
       jevPruneMinChars: 4_000,
     });
@@ -85,6 +87,7 @@ describe('hook config', () => {
       archiveResults: true,
       minReductionRatio: 0.25,
       builtinFallback: 'auto',
+      proseTrim: false,
       jevPruneBashOutput: false,
       jevPruneMinChars: 4_000,
     });
@@ -707,3 +710,179 @@ describe('register: tool.call (Bash output trimming)', () => {
     return Object.assign(fn, { signal: new AbortController().signal, budget: { ms: 10_000, remainingMs: 10_000 } });
   }
 });
+
+describe('proseTrim rescue', () => {
+  const FLUFF = 'Let me have a good look at the layout of this module now.';
+  const isProse = (key: string) => /^c\d+$/.test(key);
+
+  function proseTranscript(): SessionMessage[] {
+    return [
+      message('user', 'Fix the stale cache.', { handle: 'p-0' }),
+      message('assistant', Array(10).fill(FLUFF).join(' '), { handle: 'p-1' }),
+      message('user', 'thanks', { handle: 'p-2' }),
+      message('assistant', 'Done.', { handle: 'p-3' }),
+      message('user', 'ok', { handle: 'p-4' }),
+    ];
+  }
+
+  /** Prose parts (`c<n>`) get `prose` (or a 500 for 'fail'); every other question gets `tool` (default 0.9). Each request is logged. */
+  function fetchWith(prose: number | 'fail', requests: string[][] = [], tool = 0.9) {
+    return async (_url: string, init?: { body?: string }) => {
+      const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
+      const keys = Object.keys(questions);
+      requests.push(keys);
+      if (prose === 'fail' && keys.some(isProse)) return { status: 500, ok: false, text: 'down' };
+      const answers = Object.fromEntries(
+        keys.map((k) => [k, { type: 'noul', noul: isProse(k) ? prose : tool }]),
+      );
+      return { status: 200, ok: true, text: JSON.stringify({ answers }) };
+    };
+  }
+  const proseRequests = (requests: string[][]) => requests.filter((keys) => keys.some(isProse));
+
+  const cfg = (extra: Record<string, unknown> = {}) => ({
+    ...resolveHookConfig({ preserveRecentMessages: 2, archiveResults: false, ...extra }),
+    apiKey: 'k',
+  });
+  const strip = (r: Awaited<ReturnType<typeof compactSession>>) => ({
+    messages: r.messages,
+    decisions: r.result.decisions,
+    stats: { ...r.result.stats, ms: 0 },
+    prose: r.prose,
+  });
+
+  it('reads proseTrim as a boolean, ignoring other values', () => {
+    expect(resolveHookConfig({}).proseTrim).toBe(false);
+    expect(resolveHookConfig({ proseTrim: true }).proseTrim).toBe(true);
+    expect(resolveHookConfig({ proseTrim: 'trim' }).proseTrim).toBe(false);
+  });
+
+  it('declares proseTrim in the manifest as a boolean defaulting to false', () => {
+    const manifest = JSON.parse(readFileSync(new URL('../.claude-plugin/plugin.json', import.meta.url), 'utf8'));
+    expect(manifest.userConfig.proseTrim).toMatchObject({ type: 'boolean', default: false });
+  });
+
+  it('makes no prose request when tool compaction reaches the minimum', async () => {
+    const requests: string[][] = [];
+    const out = await compactSession(transcript(), cfg({ proseTrim: true }), fetchWith(0.01, requests, 0.01));
+    const plain = await compactSession(transcript(), cfg(), fetchWith(0.01, [], 0.01));
+    expect(reductionRatioOf(out)).toBeGreaterThanOrEqual(0.25);
+    expect(proseRequests(requests)).toHaveLength(0);
+    expect(out.prose).toBeUndefined();
+    expect(strip(out)).toEqual(strip(plain));
+  });
+
+  it('uses the first cut-off that reaches the minimum', async () => {
+    // noul 0.1: the 0.05 cut-off keeps every part, 0.15 drops them all.
+    const requests: string[][] = [];
+    const out = await compactSession(proseTranscript(), cfg({ proseTrim: true }), fetchWith(0.1, requests));
+    expect(out.prose?.cutoff).toBe(0.15);
+    expect(out.prose?.stats.dropped).toBe(10);
+    expect(reductionRatioOf(out)).toBeGreaterThanOrEqual(0.25);
+    expect(out.messages.find((m) => m.handle === 'p-1')).toBeUndefined();
+    expect(out.messages.map((m) => m.handle)).toContain('p-0');
+    expect(summarize(out.result, out.prose)).toContain('; prose trim at 0.15: 10 dropped');
+  });
+
+  it('walks the whole ladder on one round of prose requests', async () => {
+    const requests: string[][] = [];
+    const out = await compactSession(proseTranscript(), cfg({ proseTrim: true }), fetchWith(0.9, requests));
+    expect(out.prose?.cutoff).toBeUndefined();
+    const asked = proseRequests(requests);
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toHaveLength(10);
+    expect(new Set(asked[0]).size).toBe(10);
+    const rescued = await (async () => {
+      const seen: string[][] = [];
+      const r = await compactSession(proseTranscript(), cfg({ proseTrim: true }), fetchWith(0.3, seen));
+      return { r, seen };
+    })();
+    // noul 0.3 passes 0.05 and 0.15 but not 0.35: the third cut-off, still one round.
+    expect(rescued.r.prose?.cutoff).toBe(0.35);
+    expect(proseRequests(rescued.seen)).toHaveLength(1);
+  });
+
+  it('keeps the tool result and records the attempt when no cut-off reaches the minimum', async () => {
+    const plain = await compactSession(proseTranscript(), cfg(), fetchWith(0.9));
+    const out = await compactSession(proseTranscript(), cfg({ proseTrim: true }), fetchWith(0.9));
+    expect(out.prose).toMatchObject({ stats: { requests: 1 } });
+    expect(out.prose?.cutoff).toBeUndefined();
+    expect(strip({ ...out, prose: undefined })).toEqual(strip(plain));
+  });
+
+  it('keeps the tool result when the prose stage fails completely', async () => {
+    const plain = await compactSession(proseTranscript(), cfg(), fetchWith(0.9));
+    const out = await compactSession(proseTranscript(), cfg({ proseTrim: true }), fetchWith('fail'));
+    expect(out.prose?.stats.failed).toBeTruthy();
+    expect(out.prose?.cutoff).toBeUndefined();
+    expect(strip({ ...out, prose: undefined })).toEqual(strip(plain));
+  });
+
+  it('proseTrim false is identical to the option being omitted, with no prose request', async () => {
+    const seenOff: string[][] = [];
+    const seenOmitted: string[][] = [];
+    const off = await compactSession(proseTranscript(), cfg({ proseTrim: false }), fetchWith(0.01, seenOff));
+    const omitted = await compactSession(proseTranscript(), cfg(), fetchWith(0.01, seenOmitted));
+    expect(strip(off)).toEqual(strip(omitted));
+    expect(off.prose).toBeUndefined();
+    expect(seenOff).toEqual(seenOmitted);
+    expect(proseRequests(seenOff)).toHaveLength(0);
+  });
+
+  describe('through the hook', () => {
+    const hook = (options: Record<string, unknown>, fetchFn = fetchWith(0.1)) => {
+      const hooks: Record<string, (...args: any[]) => Promise<any>> = {};
+      (register as any)(
+        (event: string, a: unknown, b?: any) => {
+          hooks[event] = typeof b === 'function' ? b : (a as any);
+        },
+        { apiKey: 'k', preserveRecentMessages: 2, archiveResults: false, ...options },
+      );
+      const toasts: string[] = [];
+      const $ = {
+        clock,
+        http: { fetch: async (url: string, init?: { body?: string }) => fetchFn(url, init) },
+        ui: { log: () => {}, toast: (t: string) => toasts.push(t) },
+      };
+      const next = Object.assign(async (e: unknown) => e, {
+        signal: new AbortController().signal,
+        budget: { ms: 10_000, remainingMs: 10_000 },
+      });
+      return { run: (event: Record<string, unknown>) => hooks['session.compact']!($, event, next), toasts };
+    };
+
+    it('replaces history and names the cut-off', async () => {
+      const event = { trigger: 'auto', messages: proseTranscript() };
+      const on = hook({ proseTrim: true });
+      const out = await on.run(event);
+      expect(Object.keys(out)).toEqual(['messages']);
+      expect(out.messages.length).toBe(4);
+      expect(on.toasts.join('\n')).toContain('prose trim at 0.15');
+      expect(on.toasts.join('\n')).toContain('no summary');
+    });
+
+    it('falls back, saying trim was tried, when no cut-off reaches the minimum', async () => {
+      const event = { trigger: 'auto', messages: proseTranscript() };
+      const on = hook({ proseTrim: true }, fetchWith(0.9));
+      expect(await on.run(event)).toBe(event);
+      expect(on.toasts[0]).toMatch(/^fallback to built-in summary \(below 25% minimum, prose trim tried: /);
+      const never = hook({ proseTrim: true, builtinFallback: 'never' }, fetchWith(0.9));
+      expect(await never.run(event)).toEqual({ skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' });
+      expect(never.toasts[0]).toContain('minimum, prose trim tried, builtin fallback disabled');
+    });
+
+    it('falls back when the prose stage fails, and says nothing about trim with proseTrim off', async () => {
+      const event = { trigger: 'auto', messages: proseTranscript() };
+      const failed = hook({ proseTrim: true }, fetchWith('fail'));
+      expect(await failed.run(event)).toBe(event);
+      expect(failed.toasts[0]).toContain('prose trim tried');
+      const off = hook({}, fetchWith(0.1));
+      expect(await off.run(event)).toBe(event);
+      expect(off.toasts[0]).not.toContain('prose');
+    });
+  });
+});
+
+function reductionRatioOf(r: { result: { stats: { charsBefore: number; charsAfter: number } } }): number {
+  return (r.result.stats.charsBefore - r.result.stats.charsAfter) / r.result.stats.charsBefore;
+}

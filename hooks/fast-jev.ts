@@ -7,7 +7,7 @@ import type {
   ToolUseSummary,
 } from 'claude-code';
 
-import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
+import { compact, messageChars, reductionRatio, resolveOptions } from '../src/compact.js';
 import { trimOutput } from '../src/output.js';
 import {
   buildJevRequest,
@@ -16,6 +16,7 @@ import {
   parseJevResponse,
   retryDelayMs,
 } from '../src/request.js';
+import { applyProse, callActions, PROSE_KEEP_LADDER, scoreProse, type ProseStats } from '../src/prose.js';
 import { redactCompactionState, redactText } from '../src/redact.js';
 import { goalFromMessages } from '../src/state.js';
 import type {
@@ -39,6 +40,8 @@ const HOOK_DEFAULTS = {
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
   builtinFallback: 'auto' as BuiltinFallback,
+  /** Opt-in: when tool compaction falls short of `minReductionRatio`, also drop filler from old assistant prose before falling back. */
+  proseTrim: false,
   /** Opt-in: trims a Bash command's stdout through Jev at tool.call time, before compaction ever sees it. Off by default — a second Jev call site of its own, see `jevPruneBashOutput`. */
   jevPruneBashOutput: false,
   /** stdout shorter than this is never sent to Jev for trimming. */
@@ -69,6 +72,7 @@ export type HookConfig = CompactOptions & {
   minReductionRatio: number;
   model: string;
   builtinFallback: BuiltinFallback;
+  proseTrim: boolean;
   jevPruneBashOutput: boolean;
   jevPruneMinChars: number;
 };
@@ -132,6 +136,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
     builtinFallback: optionFallback(options),
+    proseTrim:
+      typeof options['proseTrim'] === 'boolean' ? options['proseTrim'] : HOOK_DEFAULTS.proseTrim,
     jevPruneBashOutput:
       typeof options['jevPruneBashOutput'] === 'boolean'
         ? options['jevPruneBashOutput']
@@ -337,9 +343,14 @@ export function toSessionMessages(
   });
 }
 
+/** What the prose-trim rescue did: the keep cut-off it settled on, or none when no cut-off reached the minimum or the stage failed. */
+export type ProseOutcome = { cutoff?: number; stats: ProseStats };
+
 export type SessionCompaction = {
   result: CompactResult;
   messages: SessionMessage[];
+  /** Set only when `proseTrim` is on and tool compaction fell short. */
+  prose?: ProseOutcome;
 };
 
 const ARCHIVE_DIR = '.claude/fast-jev-compaction';
@@ -390,19 +401,75 @@ export async function compactSession(
   askerOptions: JevAskerOptions = {},
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model, askerOptions), {
+  const asker = jevAsker(fetchFn, config.apiKey, config.model, askerOptions);
+  const result = await compact(messages, asker, {
     ...config,
     ...(archive ? { archive: archive.cite } : {}),
   });
   if (archive) await archive.flush();
-  return { result, messages: toSessionMessages(messages, result.messages) };
+  const tool = { result, messages: toSessionMessages(messages, result.messages) };
+  if (!config.proseTrim || reductionRatio(result) >= config.minReductionRatio) return tool;
+  return { ...tool, ...(await rescueWithProse(messages, result, asker, config)) };
+}
+
+/**
+ * Scores the prose of tool compaction's result with Jev once, then walks `PROSE_KEEP_LADDER` offline
+ * on those scores and takes the first cut-off whose result reaches `minReductionRatio` against the
+ * original messages. Returns only `prose` when none does or the stage fails, so the caller keeps
+ * tool compaction's result.
+ */
+async function rescueWithProse(
+  messages: readonly SessionMessage[],
+  result: CompactResult,
+  asker: JevAsker,
+  config: HookConfig,
+): Promise<Partial<SessionCompaction> & { prose: ProseOutcome }> {
+  const options = resolveOptions(config);
+  let scores;
+  try {
+    scores = await scoreProse(
+      result.messages,
+      callActions(messages, result.decisions, options.preserveRecentMessages),
+      asker,
+      options,
+    );
+  } catch (error) {
+    return { prose: { stats: failedStats(error) } };
+  }
+  if (scores.stats.failed !== undefined) return { prose: { stats: scores.stats } };
+  for (const cutoff of PROSE_KEEP_LADDER) {
+    const trimmed = applyProse(scores, cutoff);
+    const charsAfter = trimmed.messages.reduce((sum, message) => sum + messageChars(message), 0);
+    const candidate = { ...result, messages: trimmed.messages, stats: { ...result.stats, charsAfter } };
+    if (reductionRatio(candidate) >= config.minReductionRatio) {
+      return {
+        result: candidate,
+        messages: toSessionMessages(messages, trimmed.messages),
+        prose: { cutoff, stats: trimmed.stats },
+      };
+    }
+  }
+  return { prose: { stats: scores.stats } };
+}
+
+function failedStats(error: unknown): ProseStats {
+  return {
+    scored: 0,
+    dropped: 0,
+    inputsElided: 0,
+    proseCharsSaved: 0,
+    inputCharsSaved: 0,
+    requests: 0,
+    failedRequests: 0,
+    failed: error instanceof Error ? error.message : String(error),
+  };
 }
 
 function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
 
-export function summarize(result: CompactResult): string {
+export function summarize(result: CompactResult, prose?: ProseOutcome): string {
   const { stats } = result;
   const parts = [
     stats.kept > 0 ? `${stats.kept} kept` : '',
@@ -412,7 +479,13 @@ export function summarize(result: CompactResult): string {
   ].filter(Boolean);
   return `${percent(reductionRatio(result))} reduction; ${
     parts.join(', ') || 'no tool calls'
-  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
+  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)${
+    prose?.cutoff === undefined
+      ? ''
+      : `; prose trim at ${prose.cutoff}: ${prose.stats.dropped} dropped, ${prose.stats.inputsElided} inputs elided, ${
+          prose.stats.proseCharsSaved + prose.stats.inputCharsSaved
+        } chars`
+  }`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -538,7 +611,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         const goal = config.goal || goalFromMessages(event.messages);
         config.goal = `${goal}\n\nCompaction instructions: ${event.instructions}`;
       }
-      const { result, messages } = await compactSession(
+      const { result, messages, prose } = await compactSession(
         event.messages,
         config,
         async (url, init) => {
@@ -551,22 +624,23 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) log($, line);
       if (reductionRatio(result) < config.minReductionRatio) {
+        const tried = prose ? ', prose trim tried' : '';
         if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
           notify(
             $,
-            `skipped (below ${percent(config.minReductionRatio)} minimum, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result)})`,
+            `skipped (below ${percent(config.minReductionRatio)} minimum${tried}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result)})`,
           );
           return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
         }
         notify(
           $,
-          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
+          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum${tried}: ${summarize(result)})`,
         );
         return next(event);
       }
       notify(
         $,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
+        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose)})`,
       );
       return { messages };
     } catch (error) {
