@@ -48,10 +48,10 @@ const HOOK_DEFAULTS = {
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
   builtinFallback: 'auto' as BuiltinFallback,
-  /** Opt-in: when tool compaction falls short of `minReductionRatio`, also drop filler from old assistant prose before falling back. */
-  proseTrim: false,
-  /** Opt-in: when tool compaction falls short, also strip and fold the reports of finished background workers (`<task-notification>` messages), archiving each original. Needs `archiveResults`. */
-  notificationTrim: false,
+  /** On by default: when tool compaction falls short of `minReductionRatio`, also drop filler from old assistant prose before falling back. */
+  proseTrim: true,
+  /** On by default: when tool compaction falls short, also strip and fold the reports of finished background workers (`<task-notification>` messages), archiving each original. Needs `archiveResults`. */
+  notificationTrim: true,
   /** Opt-in: trims a Bash command's stdout through Jev at tool.call time, before compaction ever sees it. Off by default — a second Jev call site of its own, see `jevPruneBashOutput`. */
   jevPruneBashOutput: false,
   /** stdout shorter than this is never sent to Jev for trimming. */
@@ -83,7 +83,7 @@ export type HookConfig = CompactOptions & {
   model: string;
   builtinFallback: BuiltinFallback;
   proseTrim: boolean;
-  /** Absent unless the user set it; read as `HOOK_DEFAULTS.notificationTrim` (false) then. */
+  /** Absent unless the user set it; read as `HOOK_DEFAULTS.notificationTrim` (true) then. */
   notificationTrim?: boolean;
   jevPruneBashOutput: boolean;
   jevPruneMinChars: number;

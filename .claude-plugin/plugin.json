@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
@@ -73,14 +73,14 @@
     "proseTrim": {
       "type": "boolean",
       "title": "Trim assistant prose when tool compaction falls short",
-      "description": "Opt-in: when tool compaction cuts less than the minimum reduction, drop filler clauses from old assistant text and prose tool inputs and cut old code bodies, before falling back to the built-in summary.",
-      "default": false
+      "description": "On by default: when tool compaction cuts less than the minimum reduction, drop filler clauses from old assistant text and prose tool inputs and cut old code bodies, before falling back to the built-in summary.",
+      "default": true
     },
     "notificationTrim": {
       "type": "boolean",
       "title": "Trim finished-worker reports when tool compaction falls short",
-      "description": "Opt-in: when tool compaction cuts less than the minimum reduction, remove the usage and diagnostics of background-worker reports, and fold the reports Jev scores as stale to a short head, a marker and the errors and paths from the rest; each original is archived and cited. Needs archiveResults.",
-      "default": false
+      "description": "On by default: when tool compaction cuts less than the minimum reduction, remove the usage and diagnostics of background-worker reports, and fold the reports Jev scores as stale to a short head, a marker and the errors and paths from the rest; each original is archived and cited. Needs archiveResults.",
+      "default": true
     },
     "jevPruneBashOutput": {
       "type": "boolean",
