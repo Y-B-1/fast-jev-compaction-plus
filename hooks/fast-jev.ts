@@ -7,7 +7,7 @@ import type {
   ToolUseSummary,
 } from 'claude-code';
 
-import { compact, messageChars, reductionRatio, resolveOptions } from '../src/compact.js';
+import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
 import { trimOutput } from '../src/output.js';
 import {
   buildJevRequest,
@@ -16,7 +16,6 @@ import {
   parseJevResponse,
   retryDelayMs,
 } from '../src/request.js';
-import { callActions, trimProse, type ProseStats } from '../src/prose.js';
 import { redactCompactionState, redactText } from '../src/redact.js';
 import { goalFromMessages } from '../src/state.js';
 import type {
@@ -35,18 +34,11 @@ import type {
  */
 export type BuiltinFallback = 'auto' | 'always' | 'never';
 
-/**
- * Whether compaction also trims old assistant prose and prose tool inputs
- * through Jev: `off` (default) never, `trim` and `tidy` do.
- */
-export type ProseTrim = 'off' | 'trim' | 'tidy';
-
 const HOOK_DEFAULTS = {
   archiveResults: true,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
   builtinFallback: 'auto' as BuiltinFallback,
-  proseTrim: 'off' as ProseTrim,
   /** Opt-in: trims a Bash command's stdout through Jev at tool.call time, before compaction ever sees it. Off by default — a second Jev call site of its own, see `jevPruneBashOutput`. */
   jevPruneBashOutput: false,
   /** stdout shorter than this is never sent to Jev for trimming. */
@@ -77,7 +69,6 @@ export type HookConfig = CompactOptions & {
   minReductionRatio: number;
   model: string;
   builtinFallback: BuiltinFallback;
-  proseTrim: ProseTrim;
   jevPruneBashOutput: boolean;
   jevPruneMinChars: number;
 };
@@ -97,11 +88,6 @@ function optionFallback(options: PluginOptions): BuiltinFallback {
   return value === 'auto' || value === 'always' || value === 'never'
     ? value
     : HOOK_DEFAULTS.builtinFallback;
-}
-
-function optionProseTrim(options: PluginOptions): ProseTrim {
-  const value = options['proseTrim'];
-  return value === 'trim' || value === 'tidy' ? value : HOOK_DEFAULTS.proseTrim;
 }
 
 /**
@@ -146,7 +132,6 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
     builtinFallback: optionFallback(options),
-    proseTrim: optionProseTrim(options),
     jevPruneBashOutput:
       typeof options['jevPruneBashOutput'] === 'boolean'
         ? options['jevPruneBashOutput']
@@ -355,8 +340,6 @@ export function toSessionMessages(
 export type SessionCompaction = {
   result: CompactResult;
   messages: SessionMessage[];
-  /** The prose stage's stats; set only when it ran and did not fail. */
-  prose?: ProseStats;
 };
 
 const ARCHIVE_DIR = '.claude/fast-jev-compaction';
@@ -407,44 +390,19 @@ export async function compactSession(
   askerOptions: JevAskerOptions = {},
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const asker = jevAsker(fetchFn, config.apiKey, config.model, askerOptions);
-  const result = await compact(messages, asker, {
+  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model, askerOptions), {
     ...config,
     ...(archive ? { archive: archive.cite } : {}),
   });
   if (archive) await archive.flush();
-  if (config.proseTrim === 'off') return { result, messages: toSessionMessages(messages, result.messages) };
-  const resolved = resolveOptions(config);
-  const trimmed = await trimProse(
-    result.messages,
-    callActions(messages, result.decisions, resolved.preserveRecentMessages),
-    asker,
-    resolved,
-  );
-  // A stage that failed completely is discarded: today's tool-only result stands.
-  if (trimmed.stats.failed !== undefined) {
-    return { result, messages: toSessionMessages(messages, result.messages) };
-  }
-  const charsAfter = trimmed.messages.reduce((sum, message) => sum + messageChars(message), 0);
-  return {
-    result: { ...result, messages: trimmed.messages, stats: { ...result.stats, charsAfter } },
-    messages: toSessionMessages(messages, trimmed.messages),
-    prose: trimmed.stats,
-  };
-}
-
-/** What the core summarizer is told after a tidy trim: the old messages already lost their filler. */
-export function tidyInstructions(user?: string): string {
-  const base =
-    'The older messages were already trimmed by deleting filler and eliding old file contents; every remaining word is original. Condense them without losing any fact, decision or its reason, file path, command, number or version, identifier, error message, user instruction or constraint, or open task. Copy code, paths, commands and error text exactly. Add nothing that is not in the messages.';
-  return user ? `${base}\n\nUser instructions: ${user}` : base;
+  return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
 function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
 
-export function summarize(result: CompactResult, prose?: ProseStats): string {
+export function summarize(result: CompactResult): string {
   const { stats } = result;
   const parts = [
     stats.kept > 0 ? `${stats.kept} kept` : '',
@@ -454,13 +412,7 @@ export function summarize(result: CompactResult, prose?: ProseStats): string {
   ].filter(Boolean);
   return `${percent(reductionRatio(result))} reduction; ${
     parts.join(', ') || 'no tool calls'
-  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)${
-    prose
-      ? `; prose: ${prose.scored} scored, ${prose.dropped} dropped; inputs: ${prose.inputsElided} elided; ${
-          prose.proseCharsSaved + prose.inputCharsSaved
-        } chars`
-      : ''
-  }`;
+  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -580,14 +532,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
     if (event.trigger === 'precompute') {
       return { skip: 'fast-jev-compaction does not handle speculative compactions' };
     }
-    let handoff: { messages: readonly SessionMessage[]; instructions: string } | undefined;
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
       if (event.instructions?.trim()) {
         const goal = config.goal || goalFromMessages(event.messages);
         config.goal = `${goal}\n\nCompaction instructions: ${event.instructions}`;
       }
-      const { result, messages, prose } = await compactSession(
+      const { result, messages } = await compactSession(
         event.messages,
         config,
         async (url, init) => {
@@ -599,30 +550,25 @@ export const register: Register = (on: On, options: PluginOptions) => {
       );
       if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) log($, line);
-      if (config.proseTrim === 'tidy' && prose) {
-        notify($, `trimmed to ${messages.length}/${event.messages.length} messages, summary by core (${summarize(result, prose)})`);
-        handoff = { messages, instructions: tidyInstructions(event.instructions?.trim() || undefined) };
-      } else {
-        if (reductionRatio(result) < config.minReductionRatio) {
-          if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
-            notify(
-              $,
-              `skipped (below ${percent(config.minReductionRatio)} minimum, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result, prose)})`,
-            );
-            return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
-          }
+      if (reductionRatio(result) < config.minReductionRatio) {
+        if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
           notify(
             $,
-            `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result, prose)})`,
+            `skipped (below ${percent(config.minReductionRatio)} minimum, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result)})`,
           );
-          return next(event);
+          return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
         }
         notify(
           $,
-          `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose)})`,
+          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
         );
-        return { messages };
+        return next(event);
       }
+      notify(
+        $,
+        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
+      );
+      return { messages };
     } catch (error) {
       if (next.signal.aborted) return interrupted($);
       if (!mayUseBuiltin(event.trigger, configured.builtinFallback)) {
@@ -638,8 +584,6 @@ export const register: Register = (on: On, options: PluginOptions) => {
       );
       return next(event);
     }
-    // Outside the try: a throw from core must not reach the fallback's second `next`.
-    return next({ ...event, messages: handoff!.messages, instructions: handoff!.instructions });
   });
 
   // Opt-in (see HOOK_DEFAULTS.jevPruneBashOutput): trims a Bash command's

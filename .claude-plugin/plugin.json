@@ -70,12 +70,6 @@
       "description": "Characters of identifiers and error lines recovered from the dropped part of a tool result and kept alongside its truncation note; 0 disables.",
       "default": 300
     },
-    "proseTrim": {
-      "type": "string",
-      "title": "Trim assistant prose",
-      "description": "off (default), trim or tidy: also drop filler clauses from old assistant text and prose tool inputs, and cut old code bodies in tool inputs.",
-      "default": "off"
-    },
     "jevPruneBashOutput": {
       "type": "boolean",
       "title": "Trim Bash output with Jev",
