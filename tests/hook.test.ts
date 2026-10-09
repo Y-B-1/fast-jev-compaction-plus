@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
+  archiveDir,
   archiveWriter,
   compactSession,
   decisionLog,
@@ -349,10 +350,55 @@ describe('archiveWriter', () => {
     expect(stub.files.get(path!)).toBe(text);
   });
 
+  it('names and writes files under the directory it is given', async () => {
+    const stub = fsStub();
+    const writer = archiveWriter(stub, '/repo/.claude/fast-jev-compaction');
+    const path = writer.cite('toolu_4', 'text');
+    expect(path).toBe('/repo/.claude/fast-jev-compaction/toolu_4.txt');
+    expect(writer.pathOf('toolu_4')).toBe(path);
+    await writer.flush();
+    expect(stub.files.get('/repo/.claude/fast-jev-compaction/.gitignore')).toBe('*\n');
+    expect(stub.files.get(path!)).toBe('text');
+  });
+
   it('writes nothing when nothing was cited', async () => {
     const stub = fsStub();
     await archiveWriter(stub).flush();
     expect(stub.files.size).toBe(0);
+  });
+});
+
+describe('archiveDir', () => {
+  const engine = (git: { exitCode: number; stdout: string } | Error) => {
+    const runs: { argv: readonly string[]; cwd?: string }[] = [];
+    return {
+      runs,
+      $: {
+        session: { cwd: async () => '/repo/plugins/sub', root: async () => '/started' },
+        process: {
+          run: async (argv: readonly string[], init?: { cwd?: string }) => {
+            runs.push({ argv, cwd: init?.cwd });
+            if (git instanceof Error) throw git;
+            return { ...git, stderr: '' };
+          },
+        },
+      },
+    };
+  };
+
+  it('anchors the archive at the git toplevel of the session directory, not the directory itself', async () => {
+    const e = engine({ exitCode: 0, stdout: '/repo\n' });
+    expect(await archiveDir(e.$)).toBe('/repo/.claude/fast-jev-compaction');
+    expect(e.runs).toEqual([{ argv: ['git', 'rev-parse', '--show-toplevel'], cwd: '/repo/plugins/sub' }]);
+  });
+
+  it('falls back to the session root outside a git repository', async () => {
+    expect(await archiveDir(engine({ exitCode: 128, stdout: '' }).$)).toBe('/started/.claude/fast-jev-compaction');
+  });
+
+  it('falls back to the relative directory when the engine cannot answer', async () => {
+    expect(await archiveDir(engine(new Error('no git')).$)).toBe('.claude/fast-jev-compaction');
+    expect(await archiveDir({} as never)).toBe('.claude/fast-jev-compaction');
   });
 });
 
