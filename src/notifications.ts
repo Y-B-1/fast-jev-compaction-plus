@@ -1,7 +1,7 @@
 import { messageChars, reductionRatio, splitsSurrogatePair } from './compact.js';
 import { PROSE_KEEP_LADDER } from './prose.js';
 import { noulAnswer } from './request.js';
-import { salvageBlock } from './salvage.js';
+import { ERROR_LINE, capped, redact, salvageErrorLines, salvageIdentifiers } from './salvage.js';
 import { collectToolCalls, estimateTokens, fitState, isPinned, resultPreview } from './state.js';
 import type {
   CompactResult,
@@ -94,9 +94,10 @@ function eligible(message: Message, index: number, total: number, preserve: numb
   if (message.toolUses.length > 0 || (message.toolResults?.length ?? 0) > 0) return undefined;
   const text = message.text;
   if (!text.trimStart().startsWith(OPEN) || text.includes(MARKER)) return undefined;
-  if (!text.includes('<status>completed</status>')) return undefined;
-  const id = /<task-id>([^<]+)<\/task-id>/.exec(text)?.[1];
+  if (text.indexOf(OPEN, text.indexOf(OPEN) + 1) !== -1) return undefined;
   const open = text.indexOf('<result>');
+  if (open === -1 || /<status>([^<]*)<\/status>/.exec(text.slice(0, open))?.[1]?.trim() !== 'completed') return undefined;
+  const id = /<task-id>([^<]+)<\/task-id>/.exec(text)?.[1];
   const close = text.lastIndexOf('</result>');
   if (id === undefined || open === -1 || close < open + '<result>'.length) return undefined;
   return { index, key: '', archiveId: '', taskId: id, body: [open + '<result>'.length, close] };
@@ -252,10 +253,65 @@ function strip(segment: string, marker?: string): { text: string; removed: boole
   return { text, removed };
 }
 
+/** The longest error clause kept from a line that is too long to keep whole. */
+const CLAUSE_MAX = 160;
+const CLAUSE_END = /\\n|\\r|\r|\n|[.!?](?=\s|$)/;
+
+/**
+ * The error items of `tail`. A short line that reports a failure is kept whole, as tool compaction
+ * does. A longer line (a one-line body is the real shape: escaped JSON) keeps each error token with
+ * its text instead, up to `CLAUSE_MAX` characters, a line break (real or escaped) or a sentence end.
+ * Every item is a slice of `tail`.
+ */
+function errorItems(tail: string, budget: number): string[] {
+  const max = Math.max(1, Math.min(CLAUSE_MAX, budget - 2));
+  const items = new Set<string>();
+  for (const raw of tail.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.length <= max) {
+      for (const item of salvageErrorLines(line)) items.add(item);
+      continue;
+    }
+    let from = 0;
+    while (from < line.length) {
+      const hit = ERROR_LINE.exec(line.slice(from));
+      if (!hit) break;
+      let start = from + hit.index;
+      while (start > from && /\w/.test(line.charAt(start - 1))) start--;
+      const window = line.slice(start, start + max);
+      const stop = CLAUSE_END.exec(window);
+      let end = stop ? start + stop.index + (/[.!?]/.test(stop[0]) ? 1 : 0) : start + window.length;
+      if (!stop && end - start === max && splitsSurrogatePair(line, end)) end--;
+      const clause = line.slice(start, end).trim();
+      if (clause) items.add(redact(clause));
+      from = Math.max(end, from + hit.index + hit[0].length);
+    }
+  }
+  return [...items];
+}
+
+/** The salvage block of the cut tail: the same `errors:` and `refs:` lines as `salvageBlock`, with `errorItems` in place of whole lines. */
+function foldSalvage(tail: string, maxChars: number): string {
+  if (maxChars <= 0) return '';
+  try {
+    const errors = capped(errorItems(tail, maxChars), maxChars);
+    const spent = errors.reduce((sum, line) => sum + line.length + 2, 0);
+    const refs = capped(salvageIdentifiers(tail), maxChars - spent);
+    return [
+      errors.length > 0 ? `errors: ${errors.join(' | ')}` : '',
+      refs.length > 0 ? `refs: ${refs.join(' ')}` : '',
+    ]
+      .filter((line) => line.length > 0)
+      .join('\n');
+  } catch {
+    return '';
+  }
+}
+
 function fold(body: string, headChars: number, salvageChars: number, say: (cut: number) => string): string {
   const cut = Math.max(0, splitsSurrogatePair(body, headChars) ? headChars - 1 : headChars);
   const head = cut > 0 ? `${body.slice(0, cut)}\n` : '';
-  const salvaged = salvageBlock(body.slice(cut), salvageChars);
+  const salvaged = foldSalvage(body.slice(cut), salvageChars);
   return `${head}${say(body.length - cut)}\n${salvaged ? `${salvaged}\n` : ''}`;
 }
 

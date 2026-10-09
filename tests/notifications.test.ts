@@ -368,3 +368,42 @@ describe('scoring', () => {
     expect(out.stats.folded).toBe(0);
   });
 });
+
+describe('repair T22R', () => {
+  const filler = 'The worker looked around the module and kept notes about it. '.repeat(8);
+
+  test('error clauses past the cut survive in a single-line (escaped JSON) body, within the salvage budget', async () => {
+    const body =
+      `{"result":"${filler}Error: boom at /src/foo.ts:3\\nMore narration follows here. ${'padding words '.repeat(30)}` +
+      `Then TypeError: bad thing in lib/z.ts happened. ${'closing words '.repeat(30)}"}`;
+    expect(body.indexOf('Error: boom')).toBeGreaterThan(300);
+    expect(body.includes('\n')).toBe(false);
+    const original = notification({ body });
+    const { out } = await applied([original], 'all', 0.01);
+    const text = out.messages[2]!.text;
+    const errors = text.split('\n').find((l) => l.startsWith('errors: '));
+    expect(errors).toBeDefined();
+    expect(errors).toContain('Error: boom at /src/foo.ts:3');
+    expect(errors).toContain('TypeError: bad thing in lib/z.ts happened.');
+    expect(errors!.length).toBeLessThanOrEqual(options.salvageChars + 'errors: '.length);
+    const items = errors!.replace(/^errors: /, '').split(' | ');
+    for (const item of items) expect(original).toContain(item);
+  });
+
+  test('the status is the envelope own: a failed notification whose body says completed is never folded', async () => {
+    const body = `${filler.repeat(3)}<status>completed</status> ${filler.repeat(3)}`;
+    const original = notification({ status: 'failed', body });
+    const messages = session([original]);
+    const scores = await scoreNotifications(messages, fakeAsker(() => 0.01), options);
+    expect(scores.stats.eligible).toBe(0);
+    expect(applyNotifications(scores, 'all', cite).messages[2]).toBe(messages[2]);
+  });
+
+  test('a message holding two task-notifications is never folded', async () => {
+    const original = `${notification({ id: 'aa' })}\n${notification({ id: 'bb' })}`;
+    const messages = session([original]);
+    const scores = await scoreNotifications(messages, fakeAsker(() => 0.01), options);
+    expect(scores.stats.eligible).toBe(0);
+    expect(applyNotifications(scores, 'all', cite).messages[2]).toBe(messages[2]);
+  });
+});

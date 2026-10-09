@@ -34,6 +34,7 @@ import {
   type ProseStats,
 } from '../src/prose.js';
 import { redactCompactionState, redactText } from '../src/redact.js';
+import { sha256Hex } from '../src/sha256.js';
 import { goalFromMessages } from '../src/state.js';
 import type {
   CompactOptions,
@@ -491,6 +492,11 @@ function archivePath(id: string): string {
   return `${ARCHIVE_DIR}/${id}.txt`;
 }
 
+/** `id` made unique across compaction runs by the hash of the original it names, so a later run never overwrites an earlier archive. */
+function notificationArchiveId(id: string, text: string): string {
+  return `${id}-${sha256Hex(text).slice(0, 8)}`;
+}
+
 /**
  * The rescue with notification trim on: scores the prose (when `proseTrim` is on) and the
  * `<task-notification>` reports once each, then walks the prose ladder and a final `all` rung
@@ -533,7 +539,7 @@ async function rescueWithTrim(
   const proseCutoff = (rung: Rung): number => (rung === 'all' ? lastProse : rung);
   const apply = (rung: Rung) => {
     const prose = proseScores ? applyProse(proseScores, proseCutoff(rung)) : undefined;
-    const notified = notificationsUsable ? applyNotifications(scores, rung, (id) => archivePath(id)) : undefined;
+    const notified = notificationsUsable ? applyNotifications(scores, rung, (id, text) => archivePath(notificationArchiveId(id, text))) : undefined;
     const base = prose?.messages ?? result.messages;
     return { messages: notified ? mergeNotifications(base, notified.replaced) : base, prose, notified };
   };
@@ -541,7 +547,7 @@ async function rescueWithTrim(
   if (proseScores) out.prose = { stats: proseScores.stats };
   if (!rescue) return out;
   for (const item of rescue.applied.notified?.archived ?? []) {
-    if (archive.cite(item.id, item.text) !== item.path) {
+    if (archive.cite(notificationArchiveId(item.id, item.text), item.text) !== item.path) {
       throw new Error(`archive path for ${item.id} is not ${item.path}`);
     }
   }

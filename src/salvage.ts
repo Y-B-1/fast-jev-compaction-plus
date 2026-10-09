@@ -38,7 +38,7 @@ const ASSIGNMENT = /\b([A-Za-z_][A-Za-z0-9_]{2,})=\S+/g;
  * often the one carrying a credential ("auth failed for TOKEN=..."), and the
  * name is the useful part; the value must not survive into the context.
  */
-function redact(line: string): string {
+export function redact(line: string): string {
   return line.replace(ASSIGNMENT, '$1=<redacted>');
 }
 
@@ -74,7 +74,7 @@ export function salvageErrorLines(text: string): string[] {
 }
 
 /** As many items as fit `budget`, in order. */
-function capped(items: readonly string[], budget: number): string[] {
+export function capped(items: readonly string[], budget: number): string[] {
   const out: string[] = [];
   let used = 0;
   for (const item of items) {

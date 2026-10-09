@@ -11,6 +11,7 @@ import {
   summarize,
   toSessionMessages,
 } from '../hooks/fast-jev.ts';
+import { sha256Hex } from '../src/sha256.js';
 import { applyDecisions, collectToolCalls, decideCall, type Message } from '../src/index.js';
 
 type SessionMessage = Message & { handle?: string };
@@ -1076,6 +1077,35 @@ describe('notificationTrim rescue', () => {
     );
   });
 
+  it('keeps the archived originals of the same task id from two compaction runs in separate files', async () => {
+    const { files, writer } = memoryArchive();
+    const run = async (variant: string) => {
+      const messages = [
+        message('user', 'Fix the stale cache.', { handle: 'n-0' }),
+        ...['w1', 'w2', 'w3'].flatMap((id) => [
+          message('assistant', 'Dispatching a worker.'),
+          message('user', notification(id, `${REPORT}${variant}`)),
+        ]),
+        message('assistant', 'Done.'),
+        message('user', 'ok'),
+      ];
+      const out = await compactSession(messages, cfg({ notificationTrim: true, archiveResults: true }), fetchWith(0.9), writer);
+      expect(out.notifications?.rung).toBe('all');
+      return out;
+    };
+    const first = await run('FIRST-RUN-MARK');
+    const second = await run('SECOND-RUN-MARK');
+    const w1Files = [...files.keys()].filter((p) => p.includes('notif-w1'));
+    expect(w1Files).toHaveLength(2);
+    for (const [out, mark] of [[first, 'FIRST-RUN-MARK'], [second, 'SECOND-RUN-MARK']] as const) {
+      const cited = /full notification: (\S*notif-w1\S*) \(Read/.exec(textOf(out))?.[1];
+      expect(cited).toBeDefined();
+      expect(files.get(cited!)).toContain(mark);
+    }
+    expect(w1Files.map((p) => files.get(p)).join('')).not.toBe('');
+    expect(new Set(w1Files.map((p) => files.get(p)!.includes('FIRST-RUN-MARK'))).size).toBe(2);
+  });
+
   it('falls to the all rung when Jev keeps every report', async () => {
     const requests: string[][] = [];
     const out = await compactSession(transcriptWithReports(), cfg({ notificationTrim: true, archiveResults: true }), fetchWith(0.9, requests), memoryArchive().writer);
@@ -1126,7 +1156,7 @@ describe('notificationTrim rescue', () => {
     expect(cited).toHaveLength(3);
     expect(written.sort()).toEqual([...cited].sort());
     const original = notification('w2');
-    expect(files.get('.claude/fast-jev-compaction/notif-w2.txt')).toBe(original);
+    expect(files.get(cited.find((p) => /notif-w2-[0-9a-f]{8}\.txt$/.test(p ?? '')) ?? '')).toBe(original);
   });
 
   it('writes no notification archive when no rung reaches the minimum', async () => {
@@ -1250,5 +1280,14 @@ describe('notificationTrim rescue', () => {
       expect(logs.filter((l) => l === 'notification trim skipped: archiveResults is off')).toHaveLength(1);
       expect(notifRequests(requests)).toHaveLength(0);
     });
+  });
+});
+
+describe('sha256Hex', () => {
+  it('matches node:crypto, including across block boundaries and non-ASCII text', async () => {
+    const { createHash } = await import('node:crypto');
+    for (const text of ['', 'abc', 'a'.repeat(55), 'a'.repeat(56), 'a'.repeat(64), 'a'.repeat(1000), 'héllo 😀 wörld'.repeat(9)]) {
+      expect(sha256Hex(text)).toBe(createHash('sha256').update(text).digest('hex'));
+    }
   });
 });
