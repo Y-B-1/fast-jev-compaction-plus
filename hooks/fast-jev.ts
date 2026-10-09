@@ -16,7 +16,23 @@ import {
   parseJevResponse,
   retryDelayMs,
 } from '../src/request.js';
-import { callActions, ladderRescue, scoreProse, type ProseStats } from '../src/prose.js';
+import {
+  applyNotifications,
+  ladderRescueWith,
+  mergeNotifications,
+  scoreNotifications,
+  type NotificationStats,
+  type Rung,
+} from '../src/notifications.js';
+import {
+  PROSE_KEEP_LADDER,
+  applyProse,
+  callActions,
+  ladderRescue,
+  scoreProse,
+  type ProseScores,
+  type ProseStats,
+} from '../src/prose.js';
 import { redactCompactionState, redactText } from '../src/redact.js';
 import { goalFromMessages } from '../src/state.js';
 import type {
@@ -42,6 +58,8 @@ const HOOK_DEFAULTS = {
   builtinFallback: 'auto' as BuiltinFallback,
   /** Opt-in: when tool compaction falls short of `minReductionRatio`, also drop filler from old assistant prose before falling back. */
   proseTrim: false,
+  /** Opt-in: when tool compaction falls short, also strip and fold the reports of finished background workers (`<task-notification>` messages), archiving each original. Needs `archiveResults`. */
+  notificationTrim: false,
   /** Opt-in: trims a Bash command's stdout through Jev at tool.call time, before compaction ever sees it. Off by default — a second Jev call site of its own, see `jevPruneBashOutput`. */
   jevPruneBashOutput: false,
   /** stdout shorter than this is never sent to Jev for trimming. */
@@ -73,6 +91,8 @@ export type HookConfig = CompactOptions & {
   model: string;
   builtinFallback: BuiltinFallback;
   proseTrim: boolean;
+  /** Absent unless the user set it; read as `HOOK_DEFAULTS.notificationTrim` (false) then. */
+  notificationTrim?: boolean;
   jevPruneBashOutput: boolean;
   jevPruneMinChars: number;
 };
@@ -138,6 +158,9 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     builtinFallback: optionFallback(options),
     proseTrim:
       typeof options['proseTrim'] === 'boolean' ? options['proseTrim'] : HOOK_DEFAULTS.proseTrim,
+    ...(typeof options['notificationTrim'] === 'boolean'
+      ? { notificationTrim: options['notificationTrim'] }
+      : {}),
     jevPruneBashOutput:
       typeof options['jevPruneBashOutput'] === 'boolean'
         ? options['jevPruneBashOutput']
@@ -346,11 +369,16 @@ export function toSessionMessages(
 /** What the prose-trim rescue did: the keep cut-off it settled on, or none when no cut-off reached the minimum or the stage failed. */
 export type ProseOutcome = { cutoff?: number; stats: ProseStats };
 
+/** What the notification-trim rescue did: the rung it settled on, or none when no rung reached the minimum or the stage failed. */
+export type NotificationOutcome = { rung?: Rung; stats: NotificationStats };
+
 export type SessionCompaction = {
   result: CompactResult;
   messages: SessionMessage[];
   /** Set only when `proseTrim` is on and tool compaction fell short. */
   prose?: ProseOutcome;
+  /** Set only when `notificationTrim` is on, an archive writer is given and tool compaction fell short. */
+  notifications?: NotificationOutcome;
 };
 
 const ARCHIVE_DIR = '.claude/fast-jev-compaction';
@@ -408,8 +436,15 @@ export async function compactSession(
   });
   if (archive) await archive.flush();
   const tool = { result, messages: toSessionMessages(messages, result.messages) };
-  if (!config.proseTrim || reductionRatio(result) >= config.minReductionRatio) return tool;
-  const rescue = await rescueWithProse(messages, result, asker, config, archive);
+  const trimNotifications =
+    (config.notificationTrim ?? HOOK_DEFAULTS.notificationTrim) && archive !== undefined;
+  if ((!config.proseTrim && !trimNotifications) || reductionRatio(result) >= config.minReductionRatio) {
+    return tool;
+  }
+  const rescue =
+    trimNotifications && archive
+      ? await rescueWithTrim(messages, result, asker, config, archive)
+      : await rescueWithProse(messages, result, asker, config, archive);
   if (archive) await archive.flush();
   return { ...tool, ...rescue };
 }
@@ -451,6 +486,74 @@ async function rescueWithProse(
   return { prose: { stats: scores.stats } };
 }
 
+/** The path the archive writer will use for `id`; the rescue ladder names it before it knows which rung it keeps. */
+function archivePath(id: string): string {
+  return `${ARCHIVE_DIR}/${id}.txt`;
+}
+
+/**
+ * The rescue with notification trim on: scores the prose (when `proseTrim` is on) and the
+ * `<task-notification>` reports once each, then walks the prose ladder and a final `all` rung
+ * offline, applying both stages at each rung, and takes the first whose result reaches
+ * `minReductionRatio` against the original messages. Only the chosen rung's archive files are
+ * handed to the writer. A stage that fails is skipped and the other still runs.
+ */
+async function rescueWithTrim(
+  messages: readonly SessionMessage[],
+  result: CompactResult,
+  asker: JevAsker,
+  config: HookConfig,
+  archive: ArchiveWriter,
+): Promise<Partial<SessionCompaction>> {
+  const options = resolveOptions(config);
+  const out: Partial<SessionCompaction> = {};
+  let proseScores: ProseScores | undefined;
+  if (config.proseTrim) {
+    try {
+      proseScores = await scoreProse(
+        result.messages,
+        callActions(messages, result.decisions, options.preserveRecentMessages),
+        asker,
+        { ...options, archive: archive.cite },
+      );
+    } catch (error) {
+      out.prose = { stats: failedStats(error) };
+    }
+    if (proseScores?.stats.failed !== undefined) {
+      out.prose = { stats: proseScores.stats };
+      proseScores = undefined;
+    }
+  }
+  const scores = await scoreNotifications(result.messages, asker, options);
+  out.notifications = { stats: scores.stats };
+  const notificationsUsable = scores.stats.failed === undefined && scores.entries.length > 0;
+  if (!proseScores && !notificationsUsable) return out;
+
+  const lastProse = PROSE_KEEP_LADDER[PROSE_KEEP_LADDER.length - 1] as number;
+  const proseCutoff = (rung: Rung): number => (rung === 'all' ? lastProse : rung);
+  const apply = (rung: Rung) => {
+    const prose = proseScores ? applyProse(proseScores, proseCutoff(rung)) : undefined;
+    const notified = notificationsUsable ? applyNotifications(scores, rung, (id) => archivePath(id)) : undefined;
+    const base = prose?.messages ?? result.messages;
+    return { messages: notified ? mergeNotifications(base, notified.replaced) : base, prose, notified };
+  };
+  const rescue = ladderRescueWith(apply, result, config.minReductionRatio);
+  if (proseScores) out.prose = { stats: proseScores.stats };
+  if (!rescue) return out;
+  for (const item of rescue.applied.notified?.archived ?? []) {
+    if (archive.cite(item.id, item.text) !== item.path) {
+      throw new Error(`archive path for ${item.id} is not ${item.path}`);
+    }
+  }
+  const { prose, notified } = rescue.applied;
+  return {
+    result: rescue.result,
+    messages: toSessionMessages(messages, rescue.result.messages),
+    ...(prose ? { prose: { cutoff: proseCutoff(rescue.rung), stats: prose.stats } } : out.prose ? { prose: out.prose } : {}),
+    ...(notified ? { notifications: { rung: rescue.rung, stats: notified.stats } } : { notifications: out.notifications }),
+  };
+}
+
 function failedStats(error: unknown): ProseStats {
   return {
     scored: 0,
@@ -468,7 +571,11 @@ function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
 
-export function summarize(result: CompactResult, prose?: ProseOutcome): string {
+export function summarize(
+  result: CompactResult,
+  prose?: ProseOutcome,
+  notifications?: NotificationOutcome,
+): string {
   const { stats } = result;
   const parts = [
     stats.kept > 0 ? `${stats.kept} kept` : '',
@@ -484,6 +591,10 @@ export function summarize(result: CompactResult, prose?: ProseOutcome): string {
       : `; prose trim at ${prose.cutoff}: ${prose.stats.dropped} dropped, ${prose.stats.inputsElided} inputs elided, ${
           prose.stats.proseCharsSaved + prose.stats.inputCharsSaved
         } chars`
+  }${
+    notifications?.rung === undefined
+      ? ''
+      : `; notification trim at ${notifications.rung}: ${notifications.stats.folded} folded, ${notifications.stats.stripped} stripped, ${notifications.stats.charsSaved} chars`
   }`;
 }
 
@@ -594,6 +705,7 @@ function notify(
 
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
+  let inertNoticeLogged = false;
 
   on('session.compact', async ($, event, next) => {
     // A subagent's or a fork's own transcript is not the main conversation
@@ -610,7 +722,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
         const goal = config.goal || goalFromMessages(event.messages);
         config.goal = `${goal}\n\nCompaction instructions: ${event.instructions}`;
       }
-      const { result, messages, prose } = await compactSession(
+      if (config.notificationTrim && !config.archiveResults && !inertNoticeLogged) {
+        inertNoticeLogged = true;
+        log($, 'notification trim skipped: archiveResults is off');
+      }
+      const { result, messages, prose, notifications } = await compactSession(
         event.messages,
         config,
         async (url, init) => {
@@ -623,7 +739,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) log($, line);
       if (reductionRatio(result) < config.minReductionRatio) {
-        const tried = prose ? ', prose trim tried' : '';
+        const tried = `${prose ? ', prose trim tried' : ''}${notifications ? ', notification trim tried' : ''}`;
         if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
           notify(
             $,
@@ -639,7 +755,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       }
       notify(
         $,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose)})`,
+        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose, notifications)})`,
       );
       return { messages };
     } catch (error) {

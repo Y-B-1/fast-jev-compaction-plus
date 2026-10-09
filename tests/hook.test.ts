@@ -940,3 +940,315 @@ describe('proseTrim rescue', () => {
 function reductionRatioOf(r: { result: { stats: { charsBefore: number; charsAfter: number } } }): number {
   return (r.result.stats.charsBefore - r.result.stats.charsAfter) / r.result.stats.charsBefore;
 }
+
+describe('notificationTrim rescue', () => {
+  const isNotif = (key: string) => /^n\d+$/.test(key);
+  const isProse = (key: string) => /^c\d+$/.test(key);
+  const REPORT = 'The worker examined the module and found the cache stale. '.repeat(25);
+  const SECRET = 'sk-abcdefghijklmnopqrstuvwxyz0123456789';
+
+  function notification(id: string, body = REPORT, summary = 'Worker finished the audit'): string {
+    return [
+      '<task-notification>',
+      `<task-id>${id}</task-id>`,
+      `<tool-use-id>toolu_${id}</tool-use-id>`,
+      `<output-file>/tmp/tasks/${id}.output</output-file>`,
+      '<status>completed</status>',
+      `<summary>${summary}</summary>`,
+      `<result>${body}\nerror: build failed in src/cache/store.ts at 4f3a9c2\n${body}</result>`,
+      '<usage><total_tokens>81234</total_tokens><tool_uses>31</tool_uses></usage>',
+      '<diagnostics>Output file is missing: /tmp/tasks/gone.output</diagnostics>',
+      '</task-notification>',
+    ].join('\n');
+  }
+
+  /** Message 0, a kept Read, three finished workers, then a short pinned tail. */
+  function transcriptWithReports(extra: SessionMessage[] = []): SessionMessage[] {
+    const note = (id: string) => [message('assistant', 'Dispatching a worker.'), message('user', notification(id))];
+    return [
+      message('user', 'Fix the stale cache.', { handle: 'n-0' }),
+      call('rd1', 'Read', { file_path: 'src/a.ts' }, 'const a = 1;'),
+      result('rd1', 'const a = 1;'),
+      ...extra,
+      ...note('w1'),
+      ...note('w2'),
+      ...note('w3'),
+      message('assistant', 'Done.'),
+      message('user', 'ok'),
+    ];
+  }
+
+  /** Notification questions (`n<k>`) get `notif`, prose parts `prose`, tool questions 0.9; 'fail' answers notification requests with a 500. Each request is logged. */
+  function fetchWith(notif: number | 'fail', requests: string[][] = [], prose = 0.9, bodies: string[] = []) {
+    return async (_url: string, init?: { body?: string }) => {
+      bodies.push(init?.body ?? '');
+      const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
+      const keys = Object.keys(questions);
+      requests.push(keys);
+      if (notif === 'fail' && keys.some(isNotif)) return { status: 500, ok: false, text: 'down' };
+      const answers = Object.fromEntries(
+        keys.map((k) => [k, { type: 'noul', noul: isNotif(k) ? notif : isProse(k) ? prose : 0.9 }]),
+      );
+      return { status: 200, ok: true, text: JSON.stringify({ answers }) };
+    };
+  }
+  const notifRequests = (requests: string[][]) => requests.filter((keys) => keys.some(isNotif));
+
+  const cfg = (extra: Record<string, unknown> = {}) => ({
+    ...resolveHookConfig({ preserveRecentMessages: 2, archiveResults: false, ...extra }),
+    apiKey: 'k',
+  });
+  const memoryArchive = () => {
+    const files = new Map<string, string>();
+    return {
+      files,
+      writer: archiveWriter({
+        fs: { exists: async (p: string) => files.has(p), write: async (p: string, t: string) => void files.set(p, t) },
+      }),
+    };
+  };
+  const strip = (r: Awaited<ReturnType<typeof compactSession>>) => ({
+    messages: r.messages,
+    decisions: r.result.decisions,
+    stats: { ...r.result.stats, ms: 0 },
+  });
+  const textOf = (r: Awaited<ReturnType<typeof compactSession>>) => r.messages.map((m) => m.text).join('\n');
+
+  it('reads notificationTrim as a boolean, off unless true', () => {
+    expect(resolveHookConfig({}).notificationTrim).toBeFalsy();
+    expect(resolveHookConfig({ notificationTrim: true }).notificationTrim).toBe(true);
+    expect(resolveHookConfig({ notificationTrim: 'yes' }).notificationTrim).toBeFalsy();
+  });
+
+  it('declares notificationTrim in the manifest as a boolean defaulting to false', () => {
+    const manifest = JSON.parse(readFileSync(new URL('../.claude-plugin/plugin.json', import.meta.url), 'utf8'));
+    expect(manifest.userConfig.notificationTrim).toMatchObject({ type: 'boolean', default: false });
+  });
+
+  it('asks nothing extra when the option is off', async () => {
+    const seenOff: string[][] = [];
+    const seenOmitted: string[][] = [];
+    const off = await compactSession(transcriptWithReports(), cfg({ notificationTrim: false }), fetchWith(0.01, seenOff));
+    const omitted = await compactSession(transcriptWithReports(), cfg(), fetchWith(0.01, seenOmitted));
+    expect(strip(off)).toEqual(strip(omitted));
+    expect(off.notifications).toBeUndefined();
+    expect(seenOff).toEqual(seenOmitted);
+    expect(notifRequests(seenOff)).toHaveLength(0);
+  });
+
+  it('asks nothing extra when tool compaction already reaches the minimum', async () => {
+    const big = 'x'.repeat(20_000);
+    const messages = [
+      message('user', 'Fix the stale cache.'),
+      call('rd1', 'Read', { file_path: 'src/a.ts' }, big),
+      result('rd1', big),
+      message('assistant', 'Dispatching a worker.'),
+      message('user', notification('w1')),
+      message('assistant', 'Done.'),
+      message('user', 'ok'),
+    ];
+    const requests: string[][] = [];
+    const tool = (key: string) => key.startsWith('result_') || key.startsWith('call_');
+    const fetchFn = async (_u: string, init?: { body?: string }) => {
+      const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
+      requests.push(Object.keys(questions));
+      const answers = Object.fromEntries(Object.keys(questions).map((k) => [k, { type: 'noul', noul: tool(k) ? 0.01 : 0.9 }]));
+      return { status: 200, ok: true, text: JSON.stringify({ answers }) };
+    };
+    const out = await compactSession(messages, cfg({ notificationTrim: true }), fetchFn, memoryArchive().writer);
+    expect(reductionRatioOf(out)).toBeGreaterThanOrEqual(0.25);
+    expect(notifRequests(requests)).toHaveLength(0);
+    expect(out.notifications).toBeUndefined();
+  });
+
+  it('scores every report in exactly one request and folds at the first rung that reaches the minimum', async () => {
+    const requests: string[][] = [];
+    const { writer } = memoryArchive();
+    const out = await compactSession(transcriptWithReports(), cfg({ notificationTrim: true, archiveResults: true }), fetchWith(0.1, requests), writer);
+    expect(notifRequests(requests)).toEqual([['n1', 'n2', 'n3']]);
+    expect(out.notifications?.rung).toBe(0.15);
+    expect(out.notifications?.stats).toMatchObject({ folded: 3, stripped: 0, requests: 1 });
+    expect(reductionRatioOf(out)).toBeGreaterThanOrEqual(0.25);
+    expect(textOf(out)).toContain('[fast-jev-compaction folded');
+    expect(textOf(out)).not.toContain('<usage>');
+    expect(summarize(out.result, out.prose, out.notifications)).toMatch(
+      /; notification trim at 0\.15: 3 folded, 0 stripped, \d+ chars$/,
+    );
+  });
+
+  it('falls to the all rung when Jev keeps every report', async () => {
+    const requests: string[][] = [];
+    const out = await compactSession(transcriptWithReports(), cfg({ notificationTrim: true, archiveResults: true }), fetchWith(0.9, requests), memoryArchive().writer);
+    expect(notifRequests(requests)).toHaveLength(1);
+    expect(out.notifications?.rung).toBe('all');
+    expect(out.notifications?.stats.folded).toBe(3);
+    expect(summarize(out.result, out.prose, out.notifications)).toContain('; notification trim at all: 3 folded');
+  });
+
+  it('keeps the tool-compaction result when no rung reaches the minimum', async () => {
+    const plain = await compactSession(transcriptWithReports(), cfg(), fetchWith(0.9));
+    const out = await compactSession(
+      transcriptWithReports(),
+      cfg({ notificationTrim: true, archiveResults: true, minReductionRatio: 0.99 }),
+      fetchWith(0.9),
+      memoryArchive().writer,
+    );
+    expect(out.notifications).toMatchObject({ stats: { requests: 1 } });
+    expect(out.notifications?.rung).toBeUndefined();
+    expect(strip(out)).toEqual(strip(plain));
+  });
+
+  it('keeps the tool-compaction result when the notification request fails', async () => {
+    const plain = await compactSession(transcriptWithReports(), cfg(), fetchWith(0.9));
+    const out = await compactSession(
+      transcriptWithReports(),
+      cfg({ notificationTrim: true, archiveResults: true }),
+      fetchWith('fail'),
+      memoryArchive().writer,
+    );
+    expect(out.notifications?.stats.failed).toBeTruthy();
+    expect(out.notifications?.rung).toBeUndefined();
+    expect(strip(out)).toEqual(strip(plain));
+  });
+
+  it('is inert, and asks nothing, when there is no archive writer', async () => {
+    const requests: string[][] = [];
+    const out = await compactSession(transcriptWithReports(), cfg({ notificationTrim: true }), fetchWith(0.1, requests));
+    expect(notifRequests(requests)).toHaveLength(0);
+    expect(out.notifications).toBeUndefined();
+  });
+
+  it('writes exactly the archive files its output cites', async () => {
+    const { files, writer } = memoryArchive();
+    const out = await compactSession(transcriptWithReports(), cfg({ notificationTrim: true, archiveResults: true }), fetchWith(0.1), writer);
+    const cited = [...textOf(out).matchAll(/full notification: (\S+) \(Read or grep it if needed\)/g)].map((m) => m[1]);
+    const written = [...files.keys()].filter((p) => !p.endsWith('.gitignore'));
+    expect(cited).toHaveLength(3);
+    expect(written.sort()).toEqual([...cited].sort());
+    const original = notification('w2');
+    expect(files.get('.claude/fast-jev-compaction/notif-w2.txt')).toBe(original);
+  });
+
+  it('writes no notification archive when no rung reaches the minimum', async () => {
+    const { files, writer } = memoryArchive();
+    await compactSession(
+      transcriptWithReports(),
+      cfg({ notificationTrim: true, archiveResults: true, minReductionRatio: 0.99 }),
+      fetchWith(0.1),
+      writer,
+    );
+    expect([...files.keys()].filter((p) => p.includes('notif-'))).toEqual([]);
+  });
+
+  it('redacts a key-like string in a report, its summary and its preview before the request leaves', async () => {
+    const bodies: string[] = [];
+    const leaky = [
+      message('user', 'Fix the stale cache.'),
+      message('assistant', 'Dispatching a worker.'),
+      message('user', notification('w1', `${REPORT} key ${SECRET} ${REPORT}`, `Worker used ${SECRET}`)),
+      message('assistant', 'Dispatching a worker.'),
+      message('user', notification('w2')),
+      message('assistant', 'Done.'),
+      message('user', 'ok'),
+    ];
+    const { files, writer } = memoryArchive();
+    await compactSession(leaky, cfg({ notificationTrim: true, archiveResults: true }), fetchWith(0.1, [], 0.9, bodies), writer);
+    expect(bodies.some((b) => b.includes('"n1"'))).toBe(true);
+    for (const body of bodies) expect(body).not.toContain(SECRET);
+    for (const text of files.values()) expect(text).not.toContain(SECRET);
+  });
+
+  it('composes with proseTrim by identity: a message prose drops does not shift the folded reports', async () => {
+    const FLUFF = 'Let me have a good look at the layout of this module now.';
+    const extra = [message('assistant', Array(10).fill(FLUFF).join(' '))];
+    const proseOnly = await compactSession(
+      transcriptWithReports(extra),
+      cfg({ proseTrim: true, minReductionRatio: 0.01 }),
+      fetchWith(0.1, [], 0.1),
+    );
+    const both = await compactSession(
+      transcriptWithReports(extra),
+      cfg({ proseTrim: true, notificationTrim: true, archiveResults: true }),
+      fetchWith(0.1, [], 0.1),
+      memoryArchive().writer,
+    );
+    expect(proseOnly.prose?.cutoff).toBe(0.15);
+    expect(both.prose?.cutoff).toBe(0.15);
+    expect(both.notifications?.rung).toBe(0.15);
+    expect(both.messages).toHaveLength(proseOnly.messages.length);
+    expect(both.messages.some((m) => m.text.startsWith(FLUFF))).toBe(false);
+    expect(both.messages.filter((m) => m.text.includes('[fast-jev-compaction folded'))).toHaveLength(3);
+    expect(both.messages.filter((m) => m.text.startsWith('<task-notification>'))).toHaveLength(3);
+    expect(both.messages.map((m) => m.role)).toEqual(proseOnly.messages.map((m) => m.role));
+  });
+
+  describe('through the hook', () => {
+    const hook = (options: Record<string, unknown>, fetchFn = fetchWith(0.1), logs: string[] = []) => {
+      const hooks: Record<string, (...args: any[]) => Promise<any>> = {};
+      (register as any)(
+        (event: string, a: unknown, b?: any) => {
+          hooks[event] = typeof b === 'function' ? b : (a as any);
+        },
+        { apiKey: 'k', preserveRecentMessages: 2, ...options },
+      );
+      const toasts: string[] = [];
+      const files = new Map<string, string>();
+      const $ = {
+        clock,
+        http: { fetch: async (url: string, init?: { body?: string }) => fetchFn(url, init) },
+        ui: { log: (t: string) => logs.push(t), toast: (t: string) => toasts.push(t) },
+        fs: {
+          exists: async (p: string) => files.has(p),
+          write: async (p: string, t: string) => void files.set(p, t),
+        },
+      };
+      const next = Object.assign(async (e: unknown) => e, {
+        signal: new AbortController().signal,
+        budget: { ms: 10_000, remainingMs: 10_000 },
+      });
+      return { run: (event: Record<string, unknown>) => hooks['session.compact']!($, event, next), toasts, files };
+    };
+
+    it('replaces history and names the rung in the notice', async () => {
+      const event = { trigger: 'auto', messages: transcriptWithReports() };
+      const on = hook({ notificationTrim: true });
+      const out = await on.run(event);
+      expect(Object.keys(out)).toEqual(['messages']);
+      expect(out.messages).toHaveLength(event.messages.length);
+      expect(on.toasts[0]).toMatch(
+        /^kept \d+\/\d+ messages, no summary \(\d+% reduction; .*; notification trim at 0\.15: 3 folded, 0 stripped, \d+ chars\)$/,
+      );
+    });
+
+    it('falls back, saying notification trim was tried, when no rung reaches the minimum', async () => {
+      const event = { trigger: 'auto', messages: transcriptWithReports() };
+      const on = hook({ notificationTrim: true, minReductionRatio: 0.99 }, fetchWith(0.9));
+      expect(await on.run(event)).toBe(event);
+      expect(on.toasts[0]).toMatch(/^fallback to built-in summary \(below 99% minimum, notification trim tried: /);
+      const never = hook({ notificationTrim: true, minReductionRatio: 0.99, builtinFallback: 'never' }, fetchWith(0.9));
+      expect(await never.run(event)).toEqual({ skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' });
+      expect(never.toasts[0]).toContain('minimum, notification trim tried, builtin fallback disabled');
+      const both = hook({ notificationTrim: true, proseTrim: true, minReductionRatio: 0.99 }, fetchWith(0.9));
+      expect(await both.run(event)).toBe(event);
+      expect(both.toasts[0]).toContain('minimum, prose trim tried, notification trim tried: ');
+    });
+
+    it('says nothing about notification trim when the option is off', async () => {
+      const event = { trigger: 'auto', messages: transcriptWithReports() };
+      const off = hook({ minReductionRatio: 0.99 }, fetchWith(0.9));
+      expect(await off.run(event)).toBe(event);
+      expect(off.toasts[0]).not.toContain('notification');
+    });
+
+    it('logs once that archiveResults off makes the option inert, and leaves the history alone', async () => {
+      const logs: string[] = [];
+      const event = { trigger: 'auto', messages: transcriptWithReports() };
+      const requests: string[][] = [];
+      const on = hook({ notificationTrim: true, archiveResults: false }, fetchWith(0.1, requests), logs);
+      await on.run(event);
+      await on.run(event);
+      expect(logs.filter((l) => l === 'notification trim skipped: archiveResults is off')).toHaveLength(1);
+      expect(notifRequests(requests)).toHaveLength(0);
+    });
+  });
+});
