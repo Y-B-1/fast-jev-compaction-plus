@@ -16,26 +16,17 @@ import {
   parseJevResponse,
   retryDelayMs,
 } from '../src/request.js';
-import {
-  applyNotifications,
-  ladderRescueWith,
-  mergeNotifications,
-  scoreNotifications,
-  type NotificationStats,
-  type Rung,
-} from '../src/notifications.js';
+import type { NotificationStats, Rung } from '../src/notifications.js';
 import {
   PROSE_KEEP_LADDER,
-  applyProse,
   callActions,
   ladderRescue,
   scoreProse,
-  type ProseScores,
   type ProseStats,
 } from '../src/prose.js';
 import { redactCompactionState, redactText } from '../src/redact.js';
-import { sha256Hex } from '../src/sha256.js';
 import { goalFromMessages } from '../src/state.js';
+import { failedProseStats, trimRescue } from '../src/trim.js';
 import type {
   CompactOptions,
   CompactResult,
@@ -473,7 +464,7 @@ async function rescueWithProse(
       archive ? { ...options, archive: archive.cite } : options,
     );
   } catch (error) {
-    return { prose: { stats: failedStats(error) } };
+    return { prose: { stats: failedProseStats(error) } };
   }
   if (scores.stats.failed !== undefined) return { prose: { stats: scores.stats } };
   const rescue = ladderRescue(scores, result, config.minReductionRatio);
@@ -488,13 +479,8 @@ async function rescueWithProse(
 }
 
 /** The path the archive writer will use for `id`; the rescue ladder names it before it knows which rung it keeps. */
-function archivePath(id: string): string {
+export function archivePath(id: string): string {
   return `${ARCHIVE_DIR}/${id}.txt`;
-}
-
-/** `id` made unique across compaction runs by the hash of the original it names, so a later run never overwrites an earlier archive. */
-function notificationArchiveId(id: string, text: string): string {
-  return `${id}-${sha256Hex(text).slice(0, 8)}`;
 }
 
 /**
@@ -511,65 +497,24 @@ async function rescueWithTrim(
   config: HookConfig,
   archive: ArchiveWriter,
 ): Promise<Partial<SessionCompaction>> {
-  const options = resolveOptions(config);
-  const out: Partial<SessionCompaction> = {};
-  let proseScores: ProseScores | undefined;
-  if (config.proseTrim) {
-    try {
-      proseScores = await scoreProse(
-        result.messages,
-        callActions(messages, result.decisions, options.preserveRecentMessages),
-        asker,
-        { ...options, archive: archive.cite },
-      );
-    } catch (error) {
-      out.prose = { stats: failedStats(error) };
-    }
-    if (proseScores?.stats.failed !== undefined) {
-      out.prose = { stats: proseScores.stats };
-      proseScores = undefined;
-    }
-  }
-  const scores = await scoreNotifications(result.messages, asker, options);
-  out.notifications = { stats: scores.stats };
-  const notificationsUsable = scores.stats.failed === undefined && scores.entries.length > 0;
-  if (!proseScores && !notificationsUsable) return out;
-
-  const lastProse = PROSE_KEEP_LADDER[PROSE_KEEP_LADDER.length - 1] as number;
-  const proseCutoff = (rung: Rung): number => (rung === 'all' ? lastProse : rung);
-  const apply = (rung: Rung) => {
-    const prose = proseScores ? applyProse(proseScores, proseCutoff(rung)) : undefined;
-    const notified = notificationsUsable ? applyNotifications(scores, rung, (id, text) => archivePath(notificationArchiveId(id, text))) : undefined;
-    const base = prose?.messages ?? result.messages;
-    return { messages: notified ? mergeNotifications(base, notified.replaced) : base, prose, notified };
-  };
-  const rescue = ladderRescueWith(apply, result, config.minReductionRatio);
-  if (proseScores) out.prose = { stats: proseScores.stats };
+  const { out, rescue } = await trimRescue({
+    messages,
+    result,
+    asker,
+    options: resolveOptions(config),
+    proseTrim: config.proseTrim,
+    minRatio: config.minReductionRatio,
+    archive,
+    pathOf: archivePath,
+  });
   if (!rescue) return out;
-  for (const item of rescue.applied.notified?.archived ?? []) {
-    if (archive.cite(notificationArchiveId(item.id, item.text), item.text) !== item.path) {
-      throw new Error(`archive path for ${item.id} is not ${item.path}`);
-    }
-  }
   const { prose, notified } = rescue.applied;
+  const lastProse = PROSE_KEEP_LADDER[PROSE_KEEP_LADDER.length - 1] as number;
   return {
     result: rescue.result,
     messages: toSessionMessages(messages, rescue.result.messages),
-    ...(prose ? { prose: { cutoff: proseCutoff(rescue.rung), stats: prose.stats } } : out.prose ? { prose: out.prose } : {}),
+    ...(prose ? { prose: { cutoff: rescue.rung === 'all' ? lastProse : rescue.rung, stats: prose.stats } } : out.prose ? { prose: out.prose } : {}),
     ...(notified ? { notifications: { rung: rescue.rung, stats: notified.stats } } : { notifications: out.notifications }),
-  };
-}
-
-function failedStats(error: unknown): ProseStats {
-  return {
-    scored: 0,
-    dropped: 0,
-    inputsElided: 0,
-    proseCharsSaved: 0,
-    inputCharsSaved: 0,
-    requests: 0,
-    failedRequests: 0,
-    failed: error instanceof Error ? error.message : String(error),
   };
 }
 
