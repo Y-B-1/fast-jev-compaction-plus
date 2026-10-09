@@ -861,6 +861,60 @@ describe('proseTrim rescue', () => {
       expect(on.toasts.join('\n')).toContain('no summary');
     });
 
+    describe('archiving cut code bodies', () => {
+      const body = 'const value = compute();\n'.repeat(80);
+      const withWrite = (): SessionMessage[] => [
+        message('user', 'Fix the stale cache.', { handle: 'w-0' }),
+        call('wr1', 'Write', { file_path: 'src/app.ts', content: body }, 'ok'),
+        result('wr1', 'ok'),
+        message('user', 'thanks', { handle: 'w-3' }),
+        message('assistant', 'Done.', { handle: 'w-4' }),
+        message('user', 'ok', { handle: 'w-5' }),
+      ];
+      const run = async (archiveResults: boolean) => {
+        const files = new Map<string, string>();
+        const hooks: Record<string, (...args: any[]) => Promise<any>> = {};
+        (register as any)(
+          (event: string, a: unknown, b?: any) => {
+            hooks[event] = typeof b === 'function' ? b : (a as any);
+          },
+          { apiKey: 'k', preserveRecentMessages: 2, archiveResults, proseTrim: true },
+        );
+        const $ = {
+          clock,
+          http: { fetch: async (url: string, init?: { body?: string }) => fetchWith(0.9)(url, init) },
+          ui: { log: () => {}, toast: () => {} },
+          fs: {
+            exists: async (path: string) => files.has(path),
+            write: async (path: string, text: string) => void files.set(path, text),
+          },
+        };
+        const next = Object.assign(async (e: unknown) => e, {
+          signal: new AbortController().signal,
+          budget: { ms: 10_000, remainingMs: 10_000 },
+        });
+        const out = await hooks['session.compact']!($, { trigger: 'auto', messages: withWrite() }, next);
+        return { out, files };
+      };
+      const written = (out: { messages: SessionMessage[] }) =>
+        out.messages.flatMap((m) => m.toolUses).find((t) => t.tool === 'Write')?.input['content'] as string;
+
+      it('archives the cut body and cites it when archiveResults is on', async () => {
+        const { out, files } = await run(true);
+        const cut = written(out);
+        const path = /full output: (\S+) \(Read or grep it if needed\)/.exec(cut)?.[1];
+        expect(path).toBeDefined();
+        expect(files.get(path!)).toBe(body);
+        expect(files.get('.claude/fast-jev-compaction/.gitignore')).toBe('*\n');
+      });
+
+      it('writes nothing and keeps the old marker when archiveResults is off', async () => {
+        const { out, files } = await run(false);
+        expect(written(out)).toContain('Read the file if needed]');
+        expect(files.size).toBe(0);
+      });
+    });
+
     it('falls back, saying trim was tried, when no cut-off reaches the minimum', async () => {
       const event = { trigger: 'auto', messages: proseTranscript() };
       const on = hook({ proseTrim: true }, fetchWith(0.9));

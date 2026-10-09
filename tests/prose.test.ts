@@ -473,6 +473,74 @@ describe('scoreProse + applyProse (Jev trim stage)', () => {
     expect(cut.length).toBeLessThan(command.length);
   });
 
+  describe('archiving cut bodies', () => {
+    const writeMessages = (): Message[] => [
+      msg('user', 'go'),
+      msg('assistant', '', [use('w1', 'Write', { file_path: 'src/app.ts', content: body })]),
+      res('w1'),
+      ...pad(),
+      msg('assistant', 'end'),
+      msg('user', 'end'),
+    ];
+    const recorder = (path: string | null = 'arch/out.txt') => {
+      const calls: Array<[string, string]> = [];
+      const archive = (id: string, text: string): string | undefined => {
+        calls.push([id, text]);
+        return path === null ? undefined : `${path}#${calls.length}`;
+      };
+      return { calls, archive };
+    };
+
+    test('a cut Write body is archived whole and the marker cites the path', async () => {
+      const messages = writeMessages();
+      const { calls, archive } = recorder();
+      const out = await trimProse(messages, actionsOf(messages), asker(() => 0.9), { ...OPTS, archive });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]![0]).toContain('w1');
+      expect(calls[0]![1]).toBe(body);
+      const cut = out.messages[1]!.toolUses[0]!.input['content'] as string;
+      expect(cut).toContain('; full output: arch/out.txt#1 (Read or grep it if needed)]');
+      expect(cut).not.toContain('Read the file if needed');
+    });
+
+    test('a cut heredoc body is archived whole under its own id', async () => {
+      const command = `cat > src/x.ts <<'EOF'\n${body}EOF\necho done`;
+      const messages = [msg('user', 'go'), msg('assistant', '', [use('b1', 'Bash', { command })]), res('b1'), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
+      const { calls, archive } = recorder();
+      const out = await trimProse(messages, actionsOf(messages), asker(() => 0.9), { ...OPTS, archive });
+      expect(calls.map(([, text]) => text)).toEqual([body]);
+      const cut = out.messages[1]!.toolUses[0]!.input['command'] as string;
+      expect(cut).toContain('full output: arch/out.txt#1 (Read or grep it if needed)');
+      expect(cut.endsWith('\nEOF\necho done')).toBe(true);
+    });
+
+    test('each cut field gets a distinct archive id', async () => {
+      const messages = [
+        msg('user', 'go'),
+        msg('assistant', '', [use('e1', 'Edit', { file_path: 'a.ts', old_string: body, new_string: body + 'x' })]),
+        res('e1'),
+        ...pad(),
+        msg('assistant', 'end'),
+        msg('user', 'end'),
+      ];
+      const { calls, archive } = recorder();
+      await trimProse(messages, actionsOf(messages), asker(() => 0.9), { ...OPTS, archive });
+      expect(calls).toHaveLength(2);
+      expect(new Set(calls.map(([id]) => id)).size).toBe(2);
+    });
+
+    test.each([
+      ['no archive', undefined],
+      ['an archive that returns undefined', recorder(null).archive],
+    ])('with %s the output equals the unarchived output', async (_name, archive) => {
+      const messages = writeMessages();
+      const plain = await trimProse(messages, actionsOf(messages), asker(() => 0.9), OPTS);
+      const out = await trimProse(messages, actionsOf(messages), asker(() => 0.9), { ...OPTS, ...(archive ? { archive } : {}) });
+      expect(out.messages).toEqual(plain.messages);
+      expect(out.messages[1]!.toolUses[0]!.input['content']).toContain('Read the file if needed');
+    });
+  });
+
   test('a missing answer keeps the unit', async () => {
     const messages = [msg('user', 'go'), msg('assistant', FLUFF), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
     const out = await trimProse(messages, new Map(), asker(() => undefined), OPTS);

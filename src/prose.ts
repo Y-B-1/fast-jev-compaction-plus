@@ -2,7 +2,7 @@ import { splitsSurrogatePair } from './compact.js';
 import { noulAnswer } from './request.js';
 import { ERROR_LINE, SCAN, salvageBlock } from './salvage.js';
 import { collectToolCalls, estimateTokens, goalFromMessages, isPinned, truncate } from './state.js';
-import type { CallDecision, JevAsker, JevQuestions, Message, ToolUse } from './types.js';
+import type { ArchiveResult, CallDecision, JevAsker, JevQuestions, Message, ToolUse } from './types.js';
 
 /**
  * Clause splitter for assistant prose and prose tool inputs, plus rule-based
@@ -256,11 +256,19 @@ function withCommas(n: number): string {
  * A code body cut to its first `headChars`, a note naming what was elided (`label` is
  * "Tool.field for path"), and a salvage block for the tail. The original when that is not shorter.
  */
-export function elideBody(text: string, label: string, headChars: number, salvageChars: number): string {
+export function elideBody(
+  text: string,
+  label: string,
+  headChars: number,
+  salvageChars: number,
+  archivedPath?: string,
+): string {
   if (text.length <= headChars + 120) return text;
   const cut = Math.max(0, splitsSurrogatePair(text, headChars) ? headChars - 1 : headChars);
   const head = cut > 0 ? `${text.slice(0, cut)}\n` : '';
-  const note = `[fast-jev-compaction elided ${withCommas(text.length - cut)} chars of ${label}; Read the file if needed]`;
+  const note = `[fast-jev-compaction elided ${withCommas(text.length - cut)} chars of ${label}${
+    archivedPath ? `; full output: ${archivedPath} (Read or grep it if needed)` : '; Read the file if needed'
+  }]`;
   const salvaged = salvageBlock(text.slice(cut), salvageChars);
   const out = salvaged ? `${head}${note}\n${salvaged}` : `${head}${note}`;
   return out.length < text.length ? out : text;
@@ -277,6 +285,8 @@ export type ProseTrimOptions = {
   goal: string;
   /** Library only, not a plugin option. Estimated tokens per window. Default 20000. */
   windowTokens?: number;
+  /** Saves a cut code body whole; the returned path is cited in the marker. Undefined (or a result of undefined) leaves the marker as it is. */
+  archive?: ArchiveResult;
 };
 
 /** One scored unit's outcome. `message` is the index in the input messages. */
@@ -343,15 +353,20 @@ function pathOf(input: Record<string, unknown>): string | undefined {
 }
 
 /** The input of `tool` with its code bodies cut, or undefined when no body is long enough. */
-function elideInput(tool: ToolUse, head: number, salvage: number): Elision | undefined {
+function elideInput(tool: ToolUse, head: number, salvage: number, archive?: ArchiveResult): Elision | undefined {
   const where = pathOf(tool.input);
   const label = (field: string): string => `${tool.tool}.${field}${where ? ` for ${where}` : ''}`;
   const input: Record<string, unknown> = { ...tool.input };
   let fields = 0;
   let saved = 0;
   const cut = (text: string, name: string): string => {
-    const out = elideBody(text, label(name), head, salvage);
+    let out = elideBody(text, label(name), head, salvage);
     if (out !== text) {
+      const path = archive?.(`${tool.tool_use_id}-${name.replace(/[^A-Za-z0-9]+/g, '-')}-${fields + 1}`, text);
+      if (path) {
+        const cited = elideBody(text, label(name), head, salvage, path);
+        if (cited !== text) out = cited;
+      }
       fields++;
       saved += text.length - out.length;
     }
@@ -474,7 +489,7 @@ export async function scoreProse(
           slotsOf(units, value, k, plan.slots);
           return;
         }
-        const elision = elideInput(tool, options.truncateHeadChars, options.salvageChars);
+        const elision = elideInput(tool, options.truncateHeadChars, options.salvageChars, options.archive);
         if (elision) plan.elided.set(k, elision);
       });
       if (plan.slots.length > 0 || plan.elided.size > 0) plans.set(i, plan);

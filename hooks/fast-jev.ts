@@ -409,7 +409,9 @@ export async function compactSession(
   if (archive) await archive.flush();
   const tool = { result, messages: toSessionMessages(messages, result.messages) };
   if (!config.proseTrim || reductionRatio(result) >= config.minReductionRatio) return tool;
-  return { ...tool, ...(await rescueWithProse(messages, result, asker, config)) };
+  const rescue = await rescueWithProse(messages, result, asker, config, archive);
+  if (archive) await archive.flush();
+  return { ...tool, ...rescue };
 }
 
 /**
@@ -423,6 +425,7 @@ async function rescueWithProse(
   result: CompactResult,
   asker: JevAsker,
   config: HookConfig,
+  archive?: ArchiveWriter,
 ): Promise<Partial<SessionCompaction> & { prose: ProseOutcome }> {
   const options = resolveOptions(config);
   let scores;
@@ -431,7 +434,7 @@ async function rescueWithProse(
       result.messages,
       callActions(messages, result.decisions, options.preserveRecentMessages),
       asker,
-      options,
+      archive ? { ...options, archive: archive.cite } : options,
     );
   } catch (error) {
     return { prose: { stats: failedStats(error) } };
