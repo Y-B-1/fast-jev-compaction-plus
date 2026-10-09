@@ -65,8 +65,9 @@ built-in compaction summary with the original messages.
    removed, untouched messages are returned as the same objects, and no result
    is ever left without its call. With `archiveResults` on (the default), the
    full text a call or result loses is first written to
-   `.claude/fast-jev-compaction/<tool_use_id>.txt` (a `.gitignore` there keeps
-   the directory out of version control), and the marker left in its place
+   `.claude/fast-jev-compaction/<tool_use_id>.txt` at the project root (the git
+   toplevel of the session's directory, else the session root; a `.gitignore`
+   there keeps the directory out of version control), and the marker left in its place
    cites the file so it can be `Read` or grepped back later. Text that looks
    like a credential is never archived.
 

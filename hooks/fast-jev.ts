@@ -380,10 +380,34 @@ export type ArchiveWriter = {
   cite: (toolUseId: string, text: string) => string | undefined;
   /** Writes the files named so far. */
   flush: () => Promise<void>;
+  /** The path `cite` returns for an archive id. */
+  pathOf: (id: string) => string;
 };
 
 /**
- * Saves what compaction drops to `.claude/fast-jev-compaction/`, so a detail
+ * The archive directory, absolute: under the git toplevel of the session's
+ * directory, else under the session root. A relative path would resolve under
+ * whatever directory the session runs in and scatter archives across a repo.
+ * Falls back to the relative directory when the engine cannot answer.
+ */
+export async function archiveDir($: {
+  session: { cwd: () => Promise<string>; root: () => Promise<string> };
+  process: {
+    run: (argv: readonly string[], init?: { cwd?: string }) => Promise<{ exitCode: number; stdout: string }>;
+  };
+}): Promise<string> {
+  try {
+    const cwd = await $.session.cwd();
+    const git = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd });
+    const top = git.exitCode === 0 ? git.stdout.trim() : '';
+    return `${top || (await $.session.root())}/${ARCHIVE_DIR}`;
+  } catch {
+    return ARCHIVE_DIR;
+  }
+}
+
+/**
+ * Saves what compaction drops to `dir` (default `.claude/fast-jev-compaction/`), so a detail
  * buried in a dropped call or result can still be read back later. The text is
  * written with the same redaction the Jev request applies, so a credential in
  * it is replaced by `[REDACTED]` rather than stored, and the rest is kept.
@@ -393,18 +417,20 @@ export function archiveWriter($: {
     exists: (path: string) => Promise<boolean>;
     write: (path: string, text: string) => Promise<void>;
   };
-}): ArchiveWriter {
+}, dir: string = ARCHIVE_DIR): ArchiveWriter {
   const pending = new Map<string, string>();
+  const pathOf = (id: string) => `${dir}/${id}.txt`;
   return {
+    pathOf,
     cite(toolUseId, text) {
       if (!text) return undefined;
-      const path = `${ARCHIVE_DIR}/${toolUseId}.txt`;
+      const path = pathOf(toolUseId);
       pending.set(path, redactText(text, undefined));
       return path;
     },
     async flush() {
       if (pending.size === 0) return;
-      const ignorePath = `${ARCHIVE_DIR}/.gitignore`;
+      const ignorePath = `${dir}/.gitignore`;
       if (!(await $.fs.exists(ignorePath))) await $.fs.write(ignorePath, '*\n');
       for (const [path, text] of pending) await $.fs.write(path, text);
       pending.clear();
@@ -478,11 +504,6 @@ async function rescueWithProse(
   return { prose: { stats: scores.stats } };
 }
 
-/** The path the archive writer will use for `id`; the rescue ladder names it before it knows which rung it keeps. */
-export function archivePath(id: string): string {
-  return `${ARCHIVE_DIR}/${id}.txt`;
-}
-
 /**
  * The rescue with notification trim on: scores the prose (when `proseTrim` is on) and the
  * `<task-notification>` reports once each, then walks the prose ladder and a final `all` rung
@@ -505,7 +526,7 @@ async function rescueWithTrim(
     proseTrim: config.proseTrim,
     minRatio: config.minReductionRatio,
     archive,
-    pathOf: archivePath,
+    pathOf: archive.pathOf,
   });
   if (!rescue) return out;
   const { prose, notified } = rescue.applied;
@@ -684,7 +705,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
           const response = await $.http.fetch(url, init);
           return { status: response.status, ok: response.ok, text: response.text, headers: response.headers };
         },
-        config.archiveResults ? archiveWriter($) : undefined,
+        config.archiveResults ? archiveWriter($, await archiveDir($)) : undefined,
         { signal: next.signal, sleep: clockSleep($), remainingMs: () => next.budget.remainingMs },
       );
       if (next.signal.aborted) return interrupted($);

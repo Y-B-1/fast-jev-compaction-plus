@@ -366,7 +366,8 @@ export function applyNotifications(
       const message = scores.messages[entry.index] as Message;
       const n = scores.noul.get(entry.key);
       const wantFold = rung === 'all' || (n !== undefined && n < rung);
-      // The placeholder is as long as a real path, so the length check below holds for the real one.
+      // The placeholder stands in for the real path before `cite` is asked; a longer real path
+      // (an absolute archive directory) can still fail the rewrite, which skips the entry below.
       const probe = rewrite(message.text, entry, wantFold, `${ARCHIVE_ID_DIR}/${entry.archiveId}.txt`, scores.headChars, scores.salvageChars);
       if (!probe) continue;
       const path = cite(entry.archiveId, message.text);
