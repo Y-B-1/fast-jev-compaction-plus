@@ -7,7 +7,7 @@ import type {
   ToolUseSummary,
 } from 'claude-code';
 
-import { compact, messageChars, reductionRatio, resolveOptions } from '../src/compact.js';
+import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
 import { trimOutput } from '../src/output.js';
 import {
   buildJevRequest,
@@ -16,7 +16,7 @@ import {
   parseJevResponse,
   retryDelayMs,
 } from '../src/request.js';
-import { applyProse, callActions, PROSE_KEEP_LADDER, scoreProse, type ProseStats } from '../src/prose.js';
+import { callActions, ladderRescue, scoreProse, type ProseStats } from '../src/prose.js';
 import { redactCompactionState, redactText } from '../src/redact.js';
 import { goalFromMessages } from '../src/state.js';
 import type {
@@ -440,17 +440,13 @@ async function rescueWithProse(
     return { prose: { stats: failedStats(error) } };
   }
   if (scores.stats.failed !== undefined) return { prose: { stats: scores.stats } };
-  for (const cutoff of PROSE_KEEP_LADDER) {
-    const trimmed = applyProse(scores, cutoff);
-    const charsAfter = trimmed.messages.reduce((sum, message) => sum + messageChars(message), 0);
-    const candidate = { ...result, messages: trimmed.messages, stats: { ...result.stats, charsAfter } };
-    if (reductionRatio(candidate) >= config.minReductionRatio) {
-      return {
-        result: candidate,
-        messages: toSessionMessages(messages, trimmed.messages),
-        prose: { cutoff, stats: trimmed.stats },
-      };
-    }
+  const rescue = ladderRescue(scores, result, config.minReductionRatio);
+  if (rescue) {
+    return {
+      result: rescue.result,
+      messages: toSessionMessages(messages, rescue.result.messages),
+      prose: { cutoff: rescue.cutoff, stats: rescue.stats },
+    };
   }
   return { prose: { stats: scores.stats } };
 }

@@ -1,8 +1,8 @@
-import { splitsSurrogatePair } from './compact.js';
+import { messageChars, reductionRatio, splitsSurrogatePair } from './compact.js';
 import { noulAnswer } from './request.js';
 import { ERROR_LINE, SCAN, salvageBlock } from './salvage.js';
 import { collectToolCalls, estimateTokens, goalFromMessages, isPinned, truncate } from './state.js';
-import type { ArchiveResult, CallDecision, JevAsker, JevQuestions, Message, ToolUse } from './types.js';
+import type { ArchiveResult, CallDecision, CompactResult, JevAsker, JevQuestions, Message, ToolUse } from './types.js';
 
 /**
  * Clause splitter for assistant prose and prose tool inputs, plus rule-based
@@ -712,4 +712,22 @@ export function applyProse(
     out.push(rebuilt);
   });
   return { messages: out, decisions, stats };
+}
+
+/**
+ * Walks `PROSE_KEEP_LADDER` on one set of scores and takes the first cut-off whose result reaches
+ * `minRatio` against the original `charsBefore` of `result`. Undefined when none does.
+ */
+export function ladderRescue(
+  scores: ProseScores,
+  result: CompactResult,
+  minRatio: number,
+): { cutoff: number; result: CompactResult; stats: ProseStats } | undefined {
+  for (const cutoff of PROSE_KEEP_LADDER) {
+    const trimmed = applyProse(scores, cutoff);
+    const charsAfter = trimmed.messages.reduce((sum, message) => sum + messageChars(message), 0);
+    const candidate = { ...result, messages: trimmed.messages, stats: { ...result.stats, charsAfter } };
+    if (reductionRatio(candidate) >= minRatio) return { cutoff, result: candidate, stats: trimmed.stats };
+  }
+  return undefined;
 }

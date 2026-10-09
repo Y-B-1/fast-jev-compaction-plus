@@ -2,9 +2,10 @@ import { describe, expect, test } from 'vitest';
 
 import { ERROR_LINE, SCAN } from '../src/salvage.js';
 import { elideBody, heredocBodies, reassemble, splitProse } from '../src/prose.js';
-import { applyProse, callActions, scoreProse, type ProseTrimOptions } from '../src/prose.js';
+import { applyProse, callActions, ladderRescue, scoreProse, type ProseTrimOptions } from '../src/prose.js';
+import { messageChars } from '../src/compact.js';
 import { collectToolCalls } from '../src/state.js';
-import type { CallAction, CallDecision, JevAsker, JevQuestions, Message, ToolUse } from '../src/types.js';
+import type { CallAction, CallDecision, CompactResult, JevAsker, JevQuestions, Message, ToolUse } from '../src/types.js';
 
 /** One entry per unit: `c` scored, `k` kept, then the unit's text without its separators. */
 function view(text: string): string[] {
@@ -607,5 +608,29 @@ describe('scoreProse + applyProse (Jev trim stage)', () => {
     expect(applyProse(scores, 0.15).stats).toMatchObject({ scored: 1, dropped: 1 });
     expect(applyProse(scores, 0.05).stats).toMatchObject({ scored: 1, dropped: 0 });
     expect(seen).toHaveLength(1);
+  });
+  describe('ladderRescue', () => {
+    const base = (messages: Message[]): CompactResult => {
+      const chars = messages.reduce((n, m) => n + messageChars(m), 0);
+      return { messages, decisions: [], stats: { charsBefore: chars, charsAfter: chars } } as unknown as CompactResult;
+    };
+    const fluffy = (): Message[] => [msg('user', 'go'), msg('assistant', Array(10).fill(FLUFF).join(' ')), ...pad(), msg('assistant', 'end'), msg('user', 'end')];
+
+    test('takes the first cut-off whose result reaches the minimum, measured against charsBefore', async () => {
+      const messages = fluffy();
+      const result = base(messages);
+      const scores = await scoreProse(messages, new Map(), asker(() => 0.1), OPTS);
+      const out = ladderRescue(scores, result, 0.25);
+      expect(out?.cutoff).toBe(0.15);
+      expect(out?.result.stats.charsAfter).toBeLessThan(result.stats.charsAfter);
+      expect(out?.result.stats.charsBefore).toBe(result.stats.charsBefore);
+      expect(out?.stats.dropped).toBe(10);
+    });
+
+    test('is undefined when no cut-off reaches the minimum', async () => {
+      const messages = fluffy();
+      const scores = await scoreProse(messages, new Map(), asker(() => 0.9), OPTS);
+      expect(ladderRescue(scores, base(messages), 0.25)).toBeUndefined();
+    });
   });
 });
