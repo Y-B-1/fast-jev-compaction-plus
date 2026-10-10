@@ -164,6 +164,38 @@ describe('resume-safe handles (#89, #137)', () => {
     expect(assistants[0]!.handle).toBeUndefined();
   });
 
+  it('merges the newest response whole when a call in the middle of it was dropped (re-review 2)', async () => {
+    const big = 'x'.repeat(4000);
+    const ids = ['n0', 'n1', 'n2', 'n3', 'n4'];
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'go', toolUses: [] },
+      ...ids.map((id, i): SessionMessage => ({
+        role: 'assistant',
+        text: '',
+        toolUses: [{ tool_use_id: id, tool: 'Read', input: { p: i }, text: big }],
+        handle: `m-${id}`,
+      })),
+      ...ids.map((id): SessionMessage => ({
+        role: 'user',
+        text: '',
+        toolUses: [],
+        toolResults: [{ tool_use_id: id, text: big }],
+        handle: `r-${id}`,
+      })),
+    ];
+    const config = {
+      ...resolveHookConfig({ preserveRecentMessages: 1, archiveResults: false, minResultChars: 0, minKeepSignalCalls: 0 }),
+      apiKey: 'k',
+    };
+    // Drop the second call (t2) outright; keep the others whole.
+    const out = await compactSession(messages, config, jevFetch((name) => (name.endsWith('_t2') ? 0 : 0.99)));
+    expect(out.result.decisions.find((d) => d.id === 't2')?.action).toBe('drop_call');
+    const assistants = out.messages.filter((m) => m.role === 'assistant');
+    expect(assistants).toHaveLength(1);
+    expect(assistants[0]!.toolUses.map((t) => t.tool_use_id)).toEqual(['n0', 'n2', 'n3', 'n4']);
+    expect(assistants[0]!.handle).toBeUndefined();
+  });
+
   it('keeps a result row with text of its own apart, so its results stay first', () => {
     const messages: SessionMessage[] = [
       { role: 'user', text: 'go', toolUses: [], handle: 'u0' },

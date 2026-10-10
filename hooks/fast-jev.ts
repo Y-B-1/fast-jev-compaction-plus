@@ -408,23 +408,19 @@ function mergeRun(run: readonly SessionMessage[]): SessionMessage {
  * whole response is merged like any other.
  */
 export function resumeSafeMessages(messages: readonly SessionMessage[]): SessionMessage[] {
-  // The newest response: the trailing assistant rows of the last assistant
-  // run, back to a dropped call's note (a row with neither a handle nor a
-  // tool call). Such a note belongs to an older response and is never merged
-  // into this one. A row rebuilt around a truncated result keeps its call and
-  // stays part of the response, which mergeRuns then merges whole.
+  // The newest response: the trailing run of assistant rows, less any
+  // leading dropped-call notes (rows with neither a handle nor a tool call).
+  // Rows of an older response can only sit in this run when their results
+  // were removed, i.e. as such notes; a note after a call of the run belongs
+  // to the newest response itself, and mergeRuns then merges it whole.
   let newestRun = messages.length;
   let last = messages.length - 1;
   while (last >= 0 && messages[last]!.role !== 'assistant') last -= 1;
   if (last >= 0) {
-    newestRun = last + 1;
-    while (
-      newestRun > 0 &&
-      messages[newestRun - 1]!.role === 'assistant' &&
-      (messages[newestRun - 1]!.handle !== undefined || messages[newestRun - 1]!.toolUses.length > 0)
-    ) {
-      newestRun -= 1;
-    }
+    newestRun = last;
+    while (newestRun > 0 && messages[newestRun - 1]!.role === 'assistant') newestRun -= 1;
+    const isNote = (m: SessionMessage) => m.handle === undefined && m.toolUses.length === 0;
+    while (newestRun < last && isNote(messages[newestRun]!)) newestRun += 1;
   }
   const stripped = messages.map((message, index) => {
     if (message.handle === undefined) return message;
