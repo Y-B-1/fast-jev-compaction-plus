@@ -402,16 +402,26 @@ function mergeRun(run: readonly SessionMessage[]): SessionMessage {
  *
  * What a message loses with its handle is what the engine kept beside its
  * text and tool blocks: hidden reasoning, and images inside tool results.
- * The newest assistant run keeps its handles, so a tool loop in progress
- * keeps its reasoning.
+ * The newest response (the trailing assistant rows that still carry a
+ * handle) keeps its handles, so a tool loop in progress keeps its reasoning.
  */
 export function resumeSafeMessages(messages: readonly SessionMessage[]): SessionMessage[] {
+  // The newest response: the trailing assistant rows of the last assistant
+  // run that still carry their handle. A row the compaction rebuilt (a
+  // dropped call's note) has none, so it belongs to an older response and
+  // is never merged into this one.
   let newestRun = messages.length;
   let last = messages.length - 1;
   while (last >= 0 && messages[last]!.role !== 'assistant') last -= 1;
   if (last >= 0) {
-    newestRun = last;
-    while (newestRun > 0 && messages[newestRun - 1]!.role === 'assistant') newestRun -= 1;
+    newestRun = last + 1;
+    while (
+      newestRun > 0 &&
+      messages[newestRun - 1]!.role === 'assistant' &&
+      messages[newestRun - 1]!.handle !== undefined
+    ) {
+      newestRun -= 1;
+    }
   }
   const stripped = messages.map((message, index) => {
     if (message.handle === undefined) return message;
@@ -422,20 +432,27 @@ export function resumeSafeMessages(messages: readonly SessionMessage[]): Session
     if (message.toolResults) copy.toolResults = message.toolResults;
     return copy;
   });
+  return [...mergeRuns(stripped.slice(0, newestRun)), ...mergeRuns(stripped.slice(newestRun))];
+}
+
+/**
+ * Merges each run of consecutive assistant rows, and each run of consecutive
+ * text-less tool-result rows, that has a row without a handle. A result row
+ * with text of its own stays apart, so its tool_result blocks still come
+ * first in its message.
+ */
+function mergeRuns(messages: readonly SessionMessage[]): SessionMessage[] {
+  const isAssistant = (m: SessionMessage) => m.role === 'assistant';
+  const isResultRow = (m: SessionMessage) =>
+    m.role === 'user' && (m.toolResults?.length ?? 0) > 0 && m.text.length === 0;
   const out: SessionMessage[] = [];
   let index = 0;
-  while (index < stripped.length) {
-    const message = stripped[index]!;
-    const isResultRow = (m: SessionMessage) => m.role === 'user' && (m.toolResults?.length ?? 0) > 0;
-    const sameRun =
-      message.role === 'assistant'
-        ? (m: SessionMessage) => m.role === 'assistant'
-        : isResultRow(message)
-          ? isResultRow
-          : undefined;
+  while (index < messages.length) {
+    const message = messages[index]!;
+    const sameRun = isAssistant(message) ? isAssistant : isResultRow(message) ? isResultRow : undefined;
     let end = index + 1;
-    if (sameRun) while (end < stripped.length && sameRun(stripped[end]!)) end += 1;
-    const run = stripped.slice(index, end);
+    if (sameRun) while (end < messages.length && sameRun(messages[end]!)) end += 1;
+    const run = messages.slice(index, end);
     if (run.length > 1 && run.some((m) => m.handle === undefined)) out.push(mergeRun(run));
     else out.push(...run);
     index = end;
@@ -443,7 +460,7 @@ export function resumeSafeMessages(messages: readonly SessionMessage[]): Session
   return out;
 }
 
-/** What the prose-trim rescue did:the keep cut-off it settled on, or none when no cut-off reached the minimum or the stage failed. */
+/** What the prose-trim rescue did: the keep cut-off it settled on, or none when no cut-off reached the minimum or the stage failed. */
 export type ProseOutcome = { cutoff?: number; stats: ProseStats };
 
 /** What the notification-trim rescue did: the rung it settled on, or none when no rung reached the minimum or the stage failed. */

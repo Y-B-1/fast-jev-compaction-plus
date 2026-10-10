@@ -119,6 +119,57 @@ describe('resume-safe handles (#89, #137)', () => {
     expect(messages.filter((m) => m.toolUses.length + (m.toolResults?.length ?? 0) > 0).every((m) => m.handle === undefined)).toBe(true);
   });
 
+  it('never merges a dropped call\'s note into the newest response (review finding 1)', async () => {
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'go', toolUses: [], handle: 'u0' },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'x', tool: 'Read', input: { file_path: 'x.md' }, text: BIG }], handle: 'm-x' },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'x', text: BIG }], handle: 'r-x' },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'n1', tool: 'Bash', input: { command: 'a' } }], handle: 'm2-n1' },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'n2', tool: 'Bash', input: { command: 'b' } }], handle: 'm2-n2' },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'n1', text: 'one' }], handle: 'r-n1' },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'n2', text: 'two' }], handle: 'r-n2' },
+    ];
+    const config = {
+      ...resolveHookConfig({ preserveRecentMessages: 2, archiveResults: false, minResultChars: 0, minKeepSignalCalls: 0 }),
+      apiKey: 'k',
+    };
+    // x loses call and result; n1 and n2 are kept
+    const { messages: out } = await compactSession(messages, config, jevFetch((key) => (key.endsWith('_t1') ? 0 : 0.9)));
+    const note = out.find((m) => m.text.includes('[fast-jev-compaction removed the Read call'));
+    expect(note?.toolUses).toEqual([]);
+    const newest = out.filter((m) => m.role === 'assistant' && m.toolUses.length > 0);
+    expect(newest.map((m) => m.handle)).toEqual(['m2-n1', 'm2-n2']);
+    expect(newest[0]).toBe(messages[3]);
+  });
+
+  it('keeps a result row with text of its own apart, so its results stay first', () => {
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'go', toolUses: [], handle: 'u0' },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'a', tool: 'Read', input: {} }], handle: 'm-a' },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'b', tool: 'Read', input: {} }], handle: 'm-b' },
+      { role: 'user', text: '<system-reminder>x</system-reminder>', toolUses: [], toolResults: [{ tool_use_id: 'a', text: '1' }], handle: 'r-a' },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'b', text: '2' }], handle: 'r-b' },
+      { role: 'user', text: 'next', toolUses: [], handle: 'u2' },
+      { role: 'assistant', text: 'ok', toolUses: [], handle: 'm3' },
+    ];
+    const out = resumeSafeMessages(messages);
+    expect(out[1]?.toolUses.map((t) => t.tool_use_id)).toEqual(['a', 'b']);
+    expect(out[2]).toMatchObject({ text: '<system-reminder>x</system-reminder>', toolResults: [{ tool_use_id: 'a' }] });
+    expect(out[3]).toMatchObject({ text: '', toolResults: [{ tool_use_id: 'b' }] });
+    expect(out.slice(1, 4).every((m) => m.handle === undefined)).toBe(true);
+  });
+
+  it('applies to the prose-trim rescue path too', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 2, archiveResults: false }), apiKey: 'k' };
+    expect(config.proseTrim).toBe(true);
+    // everything kept: the tool cut is 0, so the prose rescue runs
+    const out = await compactSession(parallel(), config, jevFetch(() => 0.9));
+    expect(out.prose).toBeDefined();
+    const withTools = out.messages.filter((m) => m.toolUses.length + (m.toolResults?.length ?? 0) > 0);
+    expect(withTools.length).toBeGreaterThan(0);
+    expect(withTools.every((m) => m.handle === undefined)).toBe(true);
+  });
+
   it('leaves handles alone when stripHandles is off', async () => {
     const config = {
       ...resolveHookConfig({ preserveRecentMessages: 2, archiveResults: false, stripHandles: false }),
@@ -196,7 +247,7 @@ describe('exact repeats', () => {
   it('replaces earlier copies of a repeated injected block and keeps the latest', () => {
     const messages: SessionMessage[] = [
       { role: 'user', text: 'start', toolUses: [], handle: 'u0' },
-      { role: 'user', text: `first ${reminder}`, toolUses: [], handle: 'u1' },
+      { role: 'user', text: `first ${reminder}`, toolUses: [] },
       { role: 'assistant', text: 'ok', toolUses: [] },
       { role: 'user', text: `second ${reminder}`, toolUses: [], handle: 'u3' },
       { role: 'assistant', text: 'ok', toolUses: [] },
@@ -224,6 +275,23 @@ describe('exact repeats', () => {
     expect(removed).toBe(1);
     expect(out[1]?.text).toBe(`[fast-jev-compaction removed a repeated message (${skill.length} chars); a later copy is kept]`);
     expect(out[3]).toBe(messages[3]);
+  });
+
+  it('keeps the tool results of a rebuilt result row, and never rewrites an engine-held user prompt', () => {
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'start', toolUses: [], handle: 'u0' },
+      { role: 'user', text: `prompt ${reminder}`, toolUses: [], handle: 'u1' },
+      { role: 'user', text: reminder, toolUses: [], toolResults: [{ tool_use_id: 'a', text: 'r' }], handle: 'r-a' },
+      { role: 'assistant', text: 'ok', toolUses: [] },
+      { role: 'user', text: `again ${reminder}`, toolUses: [], handle: 'u3' },
+      { role: 'assistant', text: 'ok', toolUses: [] },
+    ];
+    const { messages: out, removed } = dedupeBlocks(messages, 2);
+    expect(removed).toBe(1);
+    // the prompt may hold images the hook cannot see: left as is
+    expect(out[1]).toBe(messages[1]);
+    expect(out[2]?.text).toMatch(/^\[fast-jev-compaction removed a repeated <system-reminder> block/);
+    expect(out[2]?.toolResults).toEqual([{ tool_use_id: 'a', text: 'r' }]);
   });
 
   it('leaves short blocks, single copies and assistant text alone', () => {

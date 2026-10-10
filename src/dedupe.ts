@@ -28,8 +28,9 @@ function messageMarker(chars: number): string {
 /**
  * Replaces the earlier copies of text that repeats verbatim in user messages:
  * a whole long message (a skill body loaded twice) or an injected block.
- * The newest copy always stays, and pinned messages are never changed,
- * though their copies count as the later one. A changed message is a new
+ * The newest copy always stays. Pinned messages and user prompts that carry
+ * an engine handle are never changed, though their copies count as the
+ * later one. A changed message is a new
  * object built from `role`, `text` and the tool blocks only, so no engine
  * identity carries over to it; every other message is returned as is.
  */
@@ -46,7 +47,11 @@ export function dedupeBlocks(
     if (message.role !== 'user' || !message.text) continue;
     const original = message.text;
     const blocks = original.match(INJECTED_BLOCK) ?? [];
-    if (!isPinned(index, messages.length, preserveRecentMessages)) {
+    // A user prompt that still carries the engine's handle may hold images
+    // the hook API does not show; rebuilding it would drop them. Tool-result
+    // rows and messages without a handle carry nothing beyond their text.
+    const engineHeld = 'handle' in message && (message.toolResults?.length ?? 0) === 0;
+    if (!engineHeld && !isPinned(index, messages.length, preserveRecentMessages)) {
       let text = original;
       if (original.length >= MIN_REPEATED_MESSAGE_CHARS && seenMessages.has(original)) {
         text = messageMarker(original.length);
