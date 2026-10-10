@@ -25,6 +25,14 @@ built-in compaction summary with the original messages.
 1. Every `tool_use` is paired with its `tool_result` by `tool_use_id`. Calls in
    the first message or in the newest `preserveRecentMessages` messages are
    pinned and never touched.
+   Before anything is asked, exact repeats are settled for free
+   (`dedupeRepeats`): an earlier copy of a repeated `<system-reminder>` or
+   `<local-command-stdout>` block, or of a long repeated user message such as
+   a skill loaded twice, becomes a one-line marker, and the result of an
+   earlier call with the same tool and input as a later one is truncated (the
+   latest copy always stays). Results under `minResultChars` (1500) are kept
+   without a question, and results an earlier compaction already truncated
+   are kept as they are, so their archive is never overwritten.
 2. The **state** sent to Jev is the whole conversation so far, oldest first,
    with every tool result replaced by a short note (`ok, 4213 chars (omitted)`).
    Tool inputs are included, texts are included, nothing is summarized.
@@ -71,8 +79,20 @@ built-in compaction summary with the original messages.
    cites the file so it can be `Read` or grepped back later. Text that looks
    like a credential is never archived.
 
-Jev failures, malformed answers, a missing key, or a history that cannot be
-fitted throw; the caller (or the Claude Code hook) decides what to fall back to.
+8. The Claude Code hook hands the result back **resume-safe**
+   (`stripHandles`, on by default): tool-result messages and every assistant
+   message but the newest run go back without the engine's `handle`, and the
+   rows of one parallel tool-call response (and its result rows) are merged
+   into one message. A kept message with its handle makes `--resume` restore
+   the history the compaction removed (anthropics/claude-code#95328), and a
+   handle-less row inside a parallel group splits it, after which Claude Code
+   reports a sibling's result as missing. The cost: hidden reasoning and
+   tool-result images of the older messages are dropped.
+
+Jev failures, malformed answers, a missing key, a history that cannot be
+fitted, or answers that drop every call they score (at least
+`minKeepSignalCalls`, default 3 — Jev answering 0 to everything is a failure,
+not a verdict) throw; the caller (or the Claude Code hook) decides what to fall back to.
 
 ## Install and usage
 
@@ -134,6 +154,10 @@ put it in a source file.
 | `salvageChars` | `300` | Characters of identifiers and error lines recovered from the dropped part of a tool result and kept next to its truncation note; `0` disables |
 | `proseTrim` | `true` | Plugin hook only. On by default (set `false` to turn it off). Rescue: when tool compaction cuts less than `minReductionRatio`, Jev scores the clauses of old assistant text and prose tool inputs once, then drops the filler at the first fixed keep cut-off (`0.05`, `0.15`, `0.35`) that reaches the minimum, and cuts old code bodies in tool inputs. User messages, pinned messages and protected spans (code, paths, identifiers, numbers) are never trimmed. If no cut-off reaches the minimum, the built-in fallback runs as before |
 | `notificationTrim` | `true` | Plugin hook only. On by default (set `false` to turn it off; it needs `archiveResults`, and does nothing while that is off). Rescue, run only when tool compaction cuts less than `minReductionRatio` and `archiveResults` is on: removes the `<usage>` and `<diagnostics>` of finished background-worker reports (`<task-notification>` messages), and folds the reports Jev scores as stale to a `truncateHeadChars` head, a marker and the errors, paths, urls, shas and names from the rest, at the first keep cut-off (`0.05`, `0.15`, `0.35`, then every report) that reaches the minimum. Each original is archived whole under `.claude/fast-jev-compaction/notif-<task-id>.txt` and cited in the marker. Nothing is reworded; bare numbers in a folded tail are recoverable only from the archive. Costs one extra Jev request on a shortfall. User text, pinned messages and reports that are not `completed` are never touched |
+| `minResultChars` | `1500` | Tool results shorter than this are always kept and never asked about |
+| `dedupeRepeats` | `true` | Remove exact repeats without asking Jev: earlier identical calls (same tool and input) get their result truncated, and earlier copies of repeated injected blocks or long repeated user messages become a marker |
+| `minKeepSignalCalls` | `3` | When Jev scores at least this many calls and drops them all, call and result, the answers count as a failure and the fallback rules apply; `0` disables |
+| `stripHandles` | `true` | Plugin hook only. Return older messages without the engine's handle and merge parallel tool-call rows, so `--resume` keeps the compaction and parallel calls stay paired; costs the hidden reasoning and tool-result images of those messages |
 | `jevPruneBashOutput` | `false` | Opt-in: before a Bash tool result reaches the transcript, trim its stdout through Jev when it is long (`src/output.ts`). A second, separate Jev call site from compaction — leave it off unless you want the extra cost |
 | `jevPruneMinChars` | `4000` | Stdout shorter than this is left untouched even when `jevPruneBashOutput` is on |
 

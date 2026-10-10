@@ -643,6 +643,10 @@ export function summarize(
     stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
     stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
+    stats.small > 0 ? `${stats.small} small kept` : '',
+    stats.compacted > 0 ? `${stats.compacted} already compacted` : '',
+    stats.duplicates > 0 ? `${stats.duplicates} repeat calls truncated` : '',
+    stats.blocksDeduped > 0 ? `${stats.blocksDeduped} repeat blocks removed` : '',
   ].filter(Boolean);
   return `${percent(reductionRatio(result))} reduction; ${
     parts.join(', ') || 'no tool calls'
@@ -663,10 +667,11 @@ const UI_LOG_MAX_CHARS = 4096;
 
 export function decisionLog(result: CompactResult): string {
   return result.decisions
-    .filter((d) => d.reason !== 'pinned')
-    .map(
-      (d) =>
-        `${d.id}:${d.tool}:${d.action}/call=${d.keepCall.toFixed(2)}/result=${d.keepResult.toFixed(2)}`,
+    .filter((d) => d.reason !== 'pinned' && d.reason !== 'small' && d.reason !== 'compacted')
+    .map((d) =>
+      d.reason === 'duplicate'
+        ? `${d.id}:${d.tool}:${d.action}/duplicate`
+        : `${d.id}:${d.tool}:${d.action}/call=${d.keepCall.toFixed(2)}/result=${d.keepResult.toFixed(2)}`,
     )
     .join(' ');
 }

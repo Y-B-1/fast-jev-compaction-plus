@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
@@ -99,6 +99,30 @@
       "title": "Jev model",
       "description": "TypeSafe Jev model name (default jev-latest).",
       "default": "jev-latest"
+    },
+    "minResultChars": {
+      "type": "number",
+      "title": "Smallest tool result Jev is asked about",
+      "description": "Tool results shorter than this many characters are always kept and never sent to Jev as a question: keeping them costs little and cutting them saves almost nothing.",
+      "default": 1500
+    },
+    "dedupeRepeats": {
+      "type": "boolean",
+      "title": "Remove exact repeats without asking Jev",
+      "description": "On by default: an earlier call with the same tool and input as a later one has its result truncated (archived as usual), and earlier copies of repeated <system-reminder> or <local-command-stdout> blocks and long repeated user messages (a skill loaded twice) become a one-line marker. The latest copy always stays.",
+      "default": true
+    },
+    "minKeepSignalCalls": {
+      "type": "number",
+      "title": "Keep-signal guard",
+      "description": "When Jev answers at least this many calls and drops every one of them, call and result, the answers are treated as a failure and the built-in fallback rules apply. 0 disables.",
+      "default": 3
+    },
+    "stripHandles": {
+      "type": "boolean",
+      "title": "Resume-safe messages",
+      "description": "On by default: hand tool-result messages and older assistant messages back without the engine's handle, merging the rows of a parallel tool call, so --resume does not restore the removed history (anthropics/claude-code#95328) and a parallel call group is not split. Costs the hidden reasoning and tool-result images of those older messages.",
+      "default": true
     }
   },
   "author": {
