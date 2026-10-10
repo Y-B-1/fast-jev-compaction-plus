@@ -104,7 +104,7 @@
       "type": "number",
       "title": "Smallest tool result Jev is asked about",
       "description": "Tool results shorter than this many characters are always kept and never sent to Jev as a question: keeping them costs little and cutting them saves almost nothing.",
-      "default": 1500
+      "default": 500
     },
     "dedupeRepeats": {
       "type": "boolean",

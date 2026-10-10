@@ -37,7 +37,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   truncateHeadChars: 300,
   resultPreviewChars: 300,
   salvageChars: 300,
-  minResultChars: 1500,
+  minResultChars: 500,
   dedupeRepeats: true,
   minKeepSignalCalls: 3,
 };

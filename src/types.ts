@@ -159,7 +159,7 @@ export interface CompactOptions {
   salvageChars?: number;
   /**
    * A tool result shorter than this is always kept and never asked about: it
-   * costs little to keep, and dropping it saves next to nothing. Default 1500.
+   * costs little to keep, and dropping it saves next to nothing (a 300-char head plus the marker is about 420). Default 500; a live run on 8 cases showed 1500 cost 1-3 points of reduction, 500 none.
    */
   minResultChars?: number;
   /**

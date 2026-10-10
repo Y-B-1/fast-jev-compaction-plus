@@ -402,14 +402,17 @@ function mergeRun(run: readonly SessionMessage[]): SessionMessage {
  *
  * What a message loses with its handle is what the engine kept beside its
  * text and tool blocks: hidden reasoning, and images inside tool results.
- * The newest response (the trailing assistant rows that still carry a
- * handle) keeps its handles, so a tool loop in progress keeps its reasoning.
+ * The newest response (the trailing assistant rows, up to a dropped call's
+ * note) keeps its handles when compaction left all of it whole, so a tool
+ * loop in progress keeps its reasoning; if a row of it was rebuilt, the
+ * whole response is merged like any other.
  */
 export function resumeSafeMessages(messages: readonly SessionMessage[]): SessionMessage[] {
   // The newest response: the trailing assistant rows of the last assistant
-  // run that still carry their handle. A row the compaction rebuilt (a
-  // dropped call's note) has none, so it belongs to an older response and
-  // is never merged into this one.
+  // run, back to a dropped call's note (a row with neither a handle nor a
+  // tool call). Such a note belongs to an older response and is never merged
+  // into this one. A row rebuilt around a truncated result keeps its call and
+  // stays part of the response, which mergeRuns then merges whole.
   let newestRun = messages.length;
   let last = messages.length - 1;
   while (last >= 0 && messages[last]!.role !== 'assistant') last -= 1;
@@ -418,7 +421,7 @@ export function resumeSafeMessages(messages: readonly SessionMessage[]): Session
     while (
       newestRun > 0 &&
       messages[newestRun - 1]!.role === 'assistant' &&
-      messages[newestRun - 1]!.handle !== undefined
+      (messages[newestRun - 1]!.handle !== undefined || messages[newestRun - 1]!.toolUses.length > 0)
     ) {
       newestRun -= 1;
     }

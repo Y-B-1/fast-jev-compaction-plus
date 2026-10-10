@@ -142,6 +142,28 @@ describe('resume-safe handles (#89, #137)', () => {
     expect(newest[0]).toBe(messages[3]);
   });
 
+  it('merges the newest response whole when one of its results was truncated (re-review N1)', async () => {
+    const big = 'x'.repeat(4000);
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'go', toolUses: [] },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'n1', tool: 'Read', input: { p: 1 }, text: big }], handle: 'm-n1' },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'n2', tool: 'Read', input: { p: 2 }, text: big }], handle: 'm-n2' },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'n3', tool: 'Read', input: { p: 3 }, text: big }], handle: 'm-n3' },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'n1', text: big }], handle: 'r-n1' },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'n2', text: big }], handle: 'r-n2' },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'n3', text: big }], handle: 'r-n3' },
+    ];
+    const config = {
+      ...resolveHookConfig({ preserveRecentMessages: 2, archiveResults: false, minResultChars: 0, minKeepSignalCalls: 0 }),
+      apiKey: 'k',
+    };
+    const out = await compactSession(messages, config, jevFetch((name) => (name.startsWith('result_') ? 0 : 0.99)));
+    const assistants = out.messages.filter((m) => m.role === 'assistant');
+    expect(assistants).toHaveLength(1);
+    expect(assistants[0]!.toolUses.map((t) => t.tool_use_id)).toEqual(['n1', 'n2', 'n3']);
+    expect(assistants[0]!.handle).toBeUndefined();
+  });
+
   it('keeps a result row with text of its own apart, so its results stay first', () => {
     const messages: SessionMessage[] = [
       { role: 'user', text: 'go', toolUses: [], handle: 'u0' },

@@ -50,7 +50,7 @@ export function dedupeBlocks(
     // A user prompt that still carries the engine's handle may hold images
     // the hook API does not show; rebuilding it would drop them. Tool-result
     // rows and messages without a handle carry nothing beyond their text.
-    const engineHeld = 'handle' in message && (message.toolResults?.length ?? 0) === 0;
+    const engineHeld = (message as { handle?: string }).handle !== undefined && (message.toolResults?.length ?? 0) === 0;
     if (!engineHeld && !isPinned(index, messages.length, preserveRecentMessages)) {
       let text = original;
       if (original.length >= MIN_REPEATED_MESSAGE_CHARS && seenMessages.has(original)) {

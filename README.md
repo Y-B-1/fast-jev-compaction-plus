@@ -31,7 +31,7 @@ built-in compaction summary with the original messages.
    a skill loaded twice, becomes a one-line marker, and the result of an
    earlier call with the same tool and input as a later one is truncated (the
    latest copy always stays; a user prompt Claude Code still holds whole is
-   never rewritten, since it may carry images the hook cannot see). Results under `minResultChars` (1500) are kept
+   never rewritten, since it may carry images the hook cannot see). Results under `minResultChars` (500) are kept
    without a question, and results an earlier compaction already truncated
    are kept as they are, so their archive is never overwritten.
 2. The **state** sent to Jev is the whole conversation so far, oldest first,
@@ -155,7 +155,7 @@ put it in a source file.
 | `salvageChars` | `300` | Characters of identifiers and error lines recovered from the dropped part of a tool result and kept next to its truncation note; `0` disables |
 | `proseTrim` | `true` | Plugin hook only. On by default (set `false` to turn it off). Rescue: when tool compaction cuts less than `minReductionRatio`, Jev scores the clauses of old assistant text and prose tool inputs once, then drops the filler at the first fixed keep cut-off (`0.05`, `0.15`, `0.35`) that reaches the minimum, and cuts old code bodies in tool inputs. User messages, pinned messages and protected spans (code, paths, identifiers, numbers) are never trimmed. If no cut-off reaches the minimum, the built-in fallback runs as before |
 | `notificationTrim` | `true` | Plugin hook only. On by default (set `false` to turn it off; it needs `archiveResults`, and does nothing while that is off). Rescue, run only when tool compaction cuts less than `minReductionRatio` and `archiveResults` is on: removes the `<usage>` and `<diagnostics>` of finished background-worker reports (`<task-notification>` messages), and folds the reports Jev scores as stale to a `truncateHeadChars` head, a marker and the errors, paths, urls, shas and names from the rest, at the first keep cut-off (`0.05`, `0.15`, `0.35`, then every report) that reaches the minimum. Each original is archived whole under `.claude/fast-jev-compaction/notif-<task-id>.txt` and cited in the marker. Nothing is reworded; bare numbers in a folded tail are recoverable only from the archive. Costs one extra Jev request on a shortfall. User text, pinned messages and reports that are not `completed` are never touched |
-| `minResultChars` | `1500` | Tool results shorter than this are always kept and never asked about |
+| `minResultChars` | `500` | Tool results shorter than this are always kept and never asked about |
 | `dedupeRepeats` | `true` | Remove exact repeats without asking Jev: earlier identical calls (same tool and input) get their result truncated, and earlier copies of repeated injected blocks or long repeated user messages become a marker; a user prompt Claude Code still holds whole is never rewritten, since it may carry images the hook cannot see |
 | `minKeepSignalCalls` | `3` | When Jev scores at least this many calls and drops them all, call and result, the answers count as a failure and the fallback rules apply; `0` disables |
 | `stripHandles` | `true` | Plugin hook only. Return older messages without the engine's handle and merge parallel tool-call rows, so `--resume` keeps the compaction and parallel calls stay paired; costs the hidden reasoning and tool-result images of those messages |
