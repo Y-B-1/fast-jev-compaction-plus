@@ -8,7 +8,8 @@ import {
   decisionLogLines,
   getApiKey,
   register,
-  resolveHookConfig,
+  resolveHookConfig as resolveHookConfigLib,
+  resumeSafeMessages,
   summarize,
   toSessionMessages,
 } from '../hooks/fast-jev.ts';
@@ -16,6 +17,13 @@ import { sha256Hex } from '../src/sha256.js';
 import { applyDecisions, collectToolCalls, decideCall, type Message } from '../src/index.js';
 
 type SessionMessage = Message & { handle?: string };
+
+// These fixtures use short results and check handles directly; they predate
+// the small-result floor, duplicate removal, the keep-signal guard and the
+// resume-safe handle policy, which have their own tests.
+const LEGACY = { minResultChars: 0, dedupeRepeats: false, minKeepSignalCalls: 0, stripHandles: false };
+const resolveHookConfig = (options: Record<string, unknown>) =>
+  resolveHookConfigLib({ ...LEGACY, ...options });
 
 /** The engine's `$.clock`: a sleep that never elapses, only aborts. */
 const clock = {
@@ -69,7 +77,7 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({
+    expect(resolveHookConfigLib({})).toEqual({
       archiveResults: true,
       minReductionRatio: 0.25,
       model: 'jev-latest',
@@ -77,9 +85,10 @@ describe('hook config', () => {
       proseTrim: true,
       jevPruneBashOutput: false,
       jevPruneMinChars: 4_000,
+      stripHandles: true,
     });
     expect(
-      resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g' }),
+      resolveHookConfigLib({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g' }),
     ).toEqual({
       apiKey: 'k',
       keepThreshold: 0.3,
@@ -92,6 +101,7 @@ describe('hook config', () => {
       proseTrim: true,
       jevPruneBashOutput: false,
       jevPruneMinChars: 4_000,
+      stripHandles: true,
     });
   });
 
@@ -452,7 +462,7 @@ describe('register', () => {
     const hooks: Record<string, Hook> = {};
     (register as any)((event: string, matcherOrHook: unknown, maybeHook?: Hook) => {
       hooks[event] = typeof maybeHook === 'function' ? maybeHook : (matcherOrHook as Hook);
-    }, { apiKey: 'k', ...options });
+    }, { apiKey: 'k', ...LEGACY, ...options });
     return hooks;
   }
   function engine(fetchFn: ReturnType<typeof jevFetch>) {

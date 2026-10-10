@@ -69,7 +69,13 @@ export interface CallDecision extends CallAnswer {
   id: string;
   tool: string;
   action: CallAction;
-  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped';
+  /**
+   * `small`: the result is under `minResultChars`, kept without asking.
+   * `compacted`: an earlier compaction already truncated the result, kept as is.
+   * `duplicate`: a later call has the same tool and input, so this result is
+   * truncated without asking.
+   */
+  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped' | 'small' | 'compacted' | 'duplicate';
 }
 
 export interface HistoryToolCall {
@@ -151,6 +157,26 @@ export interface CompactOptions {
    * 300.
    */
   salvageChars?: number;
+  /**
+   * A tool result shorter than this is always kept and never asked about: it
+   * costs little to keep, and dropping it saves next to nothing. Default 1500.
+   */
+  minResultChars?: number;
+  /**
+   * Removes exact repeats without asking Jev: an earlier copy of a call with
+   * the same tool and input as a later one has its result truncated, and an
+   * earlier copy of a repeated injected block (`<system-reminder>`,
+   * `<local-command-stdout>`, a repeated long user message such as a skill
+   * body) is replaced by a one-line marker. The latest copy always stays.
+   * Default true.
+   */
+  dedupeRepeats?: boolean;
+  /**
+   * When Jev answers at least this many calls and keeps none of them, the
+   * answers are treated as a failure (compact throws), so the caller can fall
+   * back. 0 disables. Default 3.
+   */
+  minKeepSignalCalls?: number;
 }
 
 export interface ResolvedCompactOptions {
@@ -164,6 +190,9 @@ export interface ResolvedCompactOptions {
   truncateHeadChars: number;
   resultPreviewChars: number;
   salvageChars: number;
+  minResultChars: number;
+  dedupeRepeats: boolean;
+  minKeepSignalCalls: number;
 }
 
 export interface CompactResult {
@@ -180,6 +209,14 @@ export interface CompactResult {
     resultsDropped: number;
     callsDropped: number;
     pinned: number;
+    /** Results under `minResultChars`, kept without asking. */
+    small: number;
+    /** Results an earlier compaction already truncated, kept as is. */
+    compacted: number;
+    /** Earlier copies of a repeated call whose results were truncated without asking. */
+    duplicates: number;
+    /** Earlier copies of repeated injected blocks replaced by a marker. */
+    blocksDeduped: number;
     stateTokens: number;
     /** Which fitting stage the state needed, '' when no request was made. */
     stateStage: string;

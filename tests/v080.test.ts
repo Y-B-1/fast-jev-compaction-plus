@@ -1,0 +1,280 @@
+import { describe, expect, it } from 'vitest';
+import { compactSession, resolveHookConfig, resumeSafeMessages } from '../hooks/fast-jev.ts';
+import {
+  COMPACTED_MARKER,
+  compact,
+  dedupeBlocks,
+  type JevAsker,
+  type JevQuestions,
+  type Message,
+} from '../src/index.js';
+
+type SessionMessage = Message & { handle?: string };
+
+const BIG = 'line of tool output\n'.repeat(120); // 2400 chars
+
+function asker(answer: (name: string) => number, asked: string[] = []): JevAsker {
+  return {
+    async ask(_state, questions: JevQuestions) {
+      asked.push(...Object.keys(questions));
+      return {
+        answers: Object.fromEntries(
+          Object.keys(questions).map((key) => [key, { type: 'noul' as const, noul: answer(key) }]),
+        ),
+      };
+    },
+  };
+}
+
+function jevFetch(answer: (name: string) => number) {
+  return async (_url: string, init?: { body?: string }) => {
+    const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
+    const answers = Object.fromEntries(
+      Object.keys(questions).map((key) => [key, { type: 'noul', noul: answer(key) }]),
+    );
+    return { status: 200, ok: true, text: JSON.stringify({ answers }) };
+  };
+}
+
+/** One call and its result, as two messages. */
+function call(id: string, text: string, input: Record<string, unknown> = { file_path: `${id}.ts` }): Message[] {
+  return [
+    { role: 'assistant', text: '', toolUses: [{ tool_use_id: id, tool: 'Read', input, text }] },
+    { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: id, text }] },
+  ];
+}
+
+const tail: Message[] = [
+  { role: 'user', text: 'next step', toolUses: [] },
+  { role: 'assistant', text: 'done', toolUses: [] },
+];
+
+describe('resume-safe handles (#89, #137)', () => {
+  function parallel(): SessionMessage[] {
+    const rows = ['a', 'b', 'c', 'd'];
+    return [
+      { role: 'user', text: 'read the docs', toolUses: [], handle: 'u0' },
+      { role: 'assistant', text: 'Reading them.', toolUses: [], handle: 'm1-text' },
+      ...rows.map((id): SessionMessage => ({
+        role: 'assistant',
+        text: '',
+        toolUses: [{ tool_use_id: id, tool: 'Read', input: { file_path: `${id}.md` }, text: BIG }],
+        handle: `m1-${id}`,
+      })),
+      ...rows.map((id): SessionMessage => ({
+        role: 'user',
+        text: '',
+        toolUses: [],
+        toolResults: [{ tool_use_id: id, text: BIG }],
+        handle: `r-${id}`,
+      })),
+      { role: 'user', text: 'thanks', toolUses: [], handle: 'u2' },
+      { role: 'assistant', text: 'ok', toolUses: [], handle: 'm3' },
+    ];
+  }
+
+  it('merges an older parallel response and its results into single handle-less messages', () => {
+    const out = resumeSafeMessages(parallel());
+    expect(out).toHaveLength(5);
+    expect(out[0]?.handle).toBe('u0');
+    expect(out[1]).toMatchObject({ role: 'assistant', text: 'Reading them.' });
+    expect(out[1]?.handle).toBeUndefined();
+    expect(out[1]?.toolUses.map((t) => t.tool_use_id)).toEqual(['a', 'b', 'c', 'd']);
+    expect(out[2]?.handle).toBeUndefined();
+    expect(out[2]?.toolResults?.map((r) => r.tool_use_id)).toEqual(['a', 'b', 'c', 'd']);
+    expect(out[3]?.handle).toBe('u2');
+    // the newest assistant run keeps its handle, and with it its reasoning
+    expect(out[4]?.handle).toBe('m3');
+  });
+
+  it('keeps the newest assistant run whole, with handles, and strips its results', () => {
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'go', toolUses: [], handle: 'u0' },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'x', tool: 'Bash', input: {} }], handle: 'm-x' },
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'y', tool: 'Bash', input: {} }], handle: 'm-y' },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'x', text: '1' }], handle: 'r-x' },
+    ];
+    const out = resumeSafeMessages(messages);
+    expect(out.map((m) => m.handle)).toEqual(['u0', 'm-x', 'm-y', undefined]);
+    expect(out[1]).toBe(messages[1]);
+  });
+
+  it('keeps one parallel group together when compaction truncates only one of its results', async () => {
+    const config = {
+      ...resolveHookConfig({ preserveRecentMessages: 2, archiveResults: false }),
+      apiKey: 'k',
+    };
+    // c's result is dropped; the rest are kept
+    const { messages } = await compactSession(
+      parallel(),
+      config,
+      jevFetch((key) => (key === 'result_t3' ? 0 : 0.9)),
+    );
+    const assistants = messages.filter((m) => m.role === 'assistant' && m.toolUses.length > 0);
+    expect(assistants).toHaveLength(1);
+    expect(assistants[0]?.toolUses.map((t) => t.tool_use_id)).toEqual(['a', 'b', 'c', 'd']);
+    const results = messages.filter((m) => (m.toolResults?.length ?? 0) > 0);
+    expect(results).toHaveLength(1);
+    expect(results[0]?.toolResults?.[2]?.text).toContain('[fast-jev-compaction truncated');
+    expect(messages.filter((m) => m.toolUses.length + (m.toolResults?.length ?? 0) > 0).every((m) => m.handle === undefined)).toBe(true);
+  });
+
+  it('leaves handles alone when stripHandles is off', async () => {
+    const config = {
+      ...resolveHookConfig({ preserveRecentMessages: 2, archiveResults: false, stripHandles: false }),
+      apiKey: 'k',
+    };
+    const { messages } = await compactSession(parallel(), config, jevFetch(() => 0.9));
+    expect(messages.map((m) => m.handle)).toEqual(parallel().map((m) => m.handle));
+  });
+});
+
+describe('small-result floor', () => {
+  it('keeps results under minResultChars without asking Jev', async () => {
+    const asked: string[] = [];
+    const messages = [{ role: 'user' as const, text: 'go', toolUses: [] }, ...call('s', 'short'), ...call('b', BIG), ...tail];
+    const result = await compact(messages, asker(() => 0, asked), { preserveRecentMessages: 2, minKeepSignalCalls: 0 });
+    expect(asked).toEqual(['call_t2', 'result_t2']);
+    expect(result.decisions[0]).toMatchObject({ reason: 'small', action: 'keep' });
+    expect(result.stats.small).toBe(1);
+    expect(result.messages[1]).toBe(messages[1]);
+  });
+
+  it('asks about every result when the floor is 0', async () => {
+    const asked: string[] = [];
+    const messages = [{ role: 'user' as const, text: 'go', toolUses: [] }, ...call('s', 'short'), ...tail];
+    await compact(messages, asker(() => 0.9, asked), { preserveRecentMessages: 2, minResultChars: 0 });
+    expect(asked).toEqual(['call_t1', 'result_t1']);
+  });
+});
+
+describe('already-compacted results', () => {
+  it('never asks about or re-archives a result an earlier compaction cut', async () => {
+    const cut = `${BIG.slice(0, 300)}\n${COMPACTED_MARKER}9000 chars of this tool result]\n${BIG}`;
+    const asked: string[] = [];
+    const archived: string[] = [];
+    const messages = [{ role: 'user' as const, text: 'go', toolUses: [] }, ...call('old', cut), ...tail];
+    const result = await compact(messages, asker(() => 0, asked), {
+      preserveRecentMessages: 2,
+      archive: (id) => (archived.push(id), `/a/${id}.txt`),
+    });
+    expect(asked).toEqual([]);
+    expect(archived).toEqual([]);
+    expect(result.decisions[0]).toMatchObject({ reason: 'compacted', action: 'keep' });
+    expect(result.stats.compacted).toBe(1);
+  });
+});
+
+describe('exact repeats', () => {
+  it('truncates the earlier copy of an identical call without asking, and asks about the latest', async () => {
+    const asked: string[] = [];
+    const first = call('r1', BIG, { file_path: 'same.ts' });
+    const second = call('r2', `${BIG}changed`, { file_path: 'same.ts' });
+    const messages = [{ role: 'user' as const, text: 'go', toolUses: [] }, ...first, ...second, ...tail];
+    const result = await compact(messages, asker(() => 0.9, asked), { preserveRecentMessages: 2 });
+    expect(asked).toEqual(['call_t2', 'result_t2']);
+    expect(result.decisions[0]).toMatchObject({ reason: 'duplicate', action: 'drop_result' });
+    expect(result.decisions[1]).toMatchObject({ reason: 'kept' });
+    expect(result.messages[2]?.toolResults?.[0]?.text).toContain('[fast-jev-compaction truncated');
+    expect(result.stats.duplicates).toBe(1);
+  });
+
+  it('leaves identical calls alone when dedupeRepeats is off', async () => {
+    const asked: string[] = [];
+    const messages = [
+      { role: 'user' as const, text: 'go', toolUses: [] },
+      ...call('r1', BIG, { file_path: 'same.ts' }),
+      ...call('r2', BIG, { file_path: 'same.ts' }),
+      ...tail,
+    ];
+    await compact(messages, asker(() => 0.9, asked), { preserveRecentMessages: 2, dedupeRepeats: false });
+    expect(asked).toHaveLength(4);
+  });
+
+  const reminder = `<system-reminder>${'Remember the rules. '.repeat(20)}</system-reminder>`;
+
+  it('replaces earlier copies of a repeated injected block and keeps the latest', () => {
+    const messages: SessionMessage[] = [
+      { role: 'user', text: 'start', toolUses: [], handle: 'u0' },
+      { role: 'user', text: `first ${reminder}`, toolUses: [], handle: 'u1' },
+      { role: 'assistant', text: 'ok', toolUses: [] },
+      { role: 'user', text: `second ${reminder}`, toolUses: [], handle: 'u3' },
+      { role: 'assistant', text: 'ok', toolUses: [] },
+    ];
+    const { messages: out, removed } = dedupeBlocks(messages, 2);
+    expect(removed).toBe(1);
+    expect(out[1]?.text).toMatch(/^first \[fast-jev-compaction removed a repeated <system-reminder> block \(\d+ chars\); a later copy is kept\]$/);
+    // a changed message carries no engine identity
+    expect((out[1] as SessionMessage).handle).toBeUndefined();
+    expect(out[3]).toBe(messages[3]);
+    expect(out[2]).toBe(messages[2]);
+  });
+
+  it('replaces an earlier copy of a long repeated user message, such as a skill body', () => {
+    const skill = `Base directory for this skill: /x\n${'Step. '.repeat(120)}`;
+    const messages: Message[] = [
+      { role: 'user', text: 'start', toolUses: [] },
+      { role: 'user', text: skill, toolUses: [] },
+      { role: 'assistant', text: 'ok', toolUses: [] },
+      { role: 'user', text: skill, toolUses: [] },
+      { role: 'assistant', text: 'ok', toolUses: [] },
+      { role: 'user', text: 'more', toolUses: [] },
+    ];
+    const { messages: out, removed } = dedupeBlocks(messages, 0);
+    expect(removed).toBe(1);
+    expect(out[1]?.text).toBe(`[fast-jev-compaction removed a repeated message (${skill.length} chars); a later copy is kept]`);
+    expect(out[3]).toBe(messages[3]);
+  });
+
+  it('leaves short blocks, single copies and assistant text alone', () => {
+    const short = '<system-reminder>be brief</system-reminder>';
+    const messages: Message[] = [
+      { role: 'user', text: 'start', toolUses: [] },
+      { role: 'user', text: short, toolUses: [] },
+      { role: 'assistant', text: reminder, toolUses: [] },
+      { role: 'user', text: short, toolUses: [] },
+      { role: 'assistant', text: reminder, toolUses: [] },
+    ];
+    const { messages: out, removed } = dedupeBlocks(messages, 0);
+    expect(removed).toBe(0);
+    out.forEach((message, index) => expect(message).toBe(messages[index]));
+  });
+});
+
+describe('keep-signal guard', () => {
+  const three = () => [
+    { role: 'user' as const, text: 'go', toolUses: [] },
+    ...call('a', BIG),
+    ...call('b', `${BIG}b`),
+    ...call('c', `${BIG}c`),
+    ...tail,
+  ];
+
+  it('treats answers that drop every call as a failure', async () => {
+    await expect(compact(three(), asker(() => 0), { preserveRecentMessages: 2 })).rejects.toThrow(
+      /no keep signal: Jev dropped all 3 calls it answered/,
+    );
+  });
+
+  it('accepts answers that keep at least the calls', async () => {
+    const result = await compact(
+      three(),
+      asker((key) => (key.startsWith('call_') ? 0.9 : 0)),
+      { preserveRecentMessages: 2 },
+    );
+    expect(result.stats.resultsDropped).toBe(3);
+  });
+
+  it('does not fire under minKeepSignalCalls answered calls, or when disabled', async () => {
+    const two = [{ role: 'user' as const, text: 'go', toolUses: [] }, ...call('a', BIG), ...call('b', `${BIG}b`), ...tail];
+    await expect(compact(two, asker(() => 0), { preserveRecentMessages: 2 })).resolves.toBeDefined();
+    await expect(
+      compact(three(), asker(() => 0), { preserveRecentMessages: 2, minKeepSignalCalls: 0 }),
+    ).resolves.toBeDefined();
+  });
+
+  it('makes the hook fall back instead of installing an all-dropped history', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 2, archiveResults: false }), apiKey: 'k' };
+    await expect(compactSession(three(), config, jevFetch(() => 0))).rejects.toThrow(/no keep signal/);
+  });
+});

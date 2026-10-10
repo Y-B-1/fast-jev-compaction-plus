@@ -1,3 +1,4 @@
+import { COMPACTED_MARKER, dedupeBlocks, supersededCalls } from './dedupe.js';
 import { noulAnswer } from './request.js';
 import { salvageBlock } from './salvage.js';
 import { collectToolCalls, estimateTokens, fitState } from './state.js';
@@ -36,6 +37,9 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   truncateHeadChars: 300,
   resultPreviewChars: 300,
   salvageChars: 300,
+  minResultChars: 1500,
+  dedupeRepeats: true,
+  minKeepSignalCalls: 3,
 };
 
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
@@ -92,6 +96,15 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
     salvageChars: Math.max(
       0,
       Math.floor(finite(options.salvageChars, DEFAULT_OPTIONS.salvageChars)),
+    ),
+    minResultChars: Math.max(
+      0,
+      Math.floor(finite(options.minResultChars, DEFAULT_OPTIONS.minResultChars)),
+    ),
+    dedupeRepeats: options.dedupeRepeats ?? DEFAULT_OPTIONS.dedupeRepeats,
+    minKeepSignalCalls: Math.max(
+      0,
+      Math.floor(finite(options.minKeepSignalCalls, DEFAULT_OPTIONS.minKeepSignalCalls)),
     ),
   };
 }
@@ -459,13 +472,38 @@ export async function compact(
 ): Promise<CompactResult> {
   const started = Date.now();
   const resolved = resolveOptions(options);
+  const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
+  const deduped = resolved.dedupeRepeats
+    ? dedupeBlocks(messages, resolved.preserveRecentMessages)
+    : { messages: messages.slice(), removed: 0 };
+  const source = deduped.messages;
   const calls = collectToolCalls(
-    messages,
+    source,
     resolved.preserveRecentMessages,
     resolved.resultPreviewChars,
   );
-  const candidates = calls.filter((call) => !call.pinned);
-  const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
+  // Settled without asking Jev, most protective first: a result an earlier
+  // compaction already cut (cutting it again would overwrite its archived
+  // full output with the stub), a result too small to be worth a question,
+  // then an earlier copy of a call a later identical call supersedes.
+  const resultTexts = new Map<string, string>();
+  for (const message of source) {
+    for (const result of message.toolResults ?? []) resultTexts.set(result.tool_use_id, result.text);
+  }
+  const superseded = resolved.dedupeRepeats ? supersededCalls(calls) : new Set<string>();
+  const settled = new Map<string, CallDecision>();
+  for (const call of calls) {
+    if (call.pinned) continue;
+    const base = { id: call.id, tool: call.tool, keepCall: 1, keepResult: 1 };
+    if ((resultTexts.get(call.tool_use_id) ?? '').includes(COMPACTED_MARKER)) {
+      settled.set(call.id, { ...base, action: 'keep', reason: 'compacted' });
+    } else if (call.resultChars < resolved.minResultChars) {
+      settled.set(call.id, { ...base, action: 'keep', reason: 'small' });
+    } else if (superseded.has(call.id)) {
+      settled.set(call.id, { ...base, keepResult: 0, action: 'drop_result', reason: 'duplicate' });
+    }
+  }
+  const candidates = calls.filter((call) => !call.pinned && !settled.has(call.id));
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let batches: ToolCall[][] = [];
@@ -483,7 +521,7 @@ export async function compact(
     if (stateBudget < 1) {
       throw new Error('request budget leaves no room for state and questions');
     }
-    const state = fitState(messages, calls, {
+    const state = fitState(source, calls, {
       ...resolved,
       maxStateTokens: Math.min(resolved.maxStateTokens, stateBudget),
     });
@@ -499,11 +537,27 @@ export async function compact(
     for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
   }
 
-  const decisions = calls.map((call) =>
-    decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
+  const decisions = calls.map(
+    (call) =>
+      settled.get(call.id) ??
+      decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
   );
+  // Answers that keep nothing at all, not even a call, are what a Jev
+  // answering 0 to every question produces: they say nothing about the
+  // transcript, yet they pass any reduction floor with the largest cut there
+  // is. Treat them as a failure so the caller can fall back.
+  const answered = decisions.filter((decision) => answers.has(decision.id));
+  if (
+    resolved.minKeepSignalCalls > 0 &&
+    answered.length >= resolved.minKeepSignalCalls &&
+    answered.every((decision) => decision.action === 'drop_call')
+  ) {
+    throw new Error(
+      `no keep signal: Jev dropped all ${answered.length} calls it answered`,
+    );
+  }
   const kept = applyDecisions(
-    messages,
+    source,
     decisions,
     calls,
     resolved.truncateHeadChars,
@@ -523,6 +577,10 @@ export async function compact(
       resultsDropped: count(decisions, 'result_dropped'),
       callsDropped: count(decisions, 'call_dropped'),
       pinned: count(decisions, 'pinned'),
+      small: count(decisions, 'small'),
+      compacted: count(decisions, 'compacted'),
+      duplicates: count(decisions, 'duplicate'),
+      blocksDeduped: deduped.removed,
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length,

@@ -56,6 +56,8 @@ const HOOK_DEFAULTS = {
   jevPruneBashOutput: false,
   /** stdout shorter than this is never sent to Jev for trimming. */
   jevPruneMinChars: 4_000,
+  /** On by default: hand messages back in the shape that survives `--resume`; see `resumeSafeMessages`. */
+  stripHandles: true,
 };
 
 
@@ -87,6 +89,8 @@ export type HookConfig = CompactOptions & {
   notificationTrim?: boolean;
   jevPruneBashOutput: boolean;
   jevPruneMinChars: number;
+  /** See `resumeSafeMessages`. */
+  stripHandles: boolean;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -131,6 +135,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     'truncateHeadChars',
     'resultPreviewChars',
     'salvageChars',
+    'minResultChars',
+    'minKeepSignalCalls',
   ] as const) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
@@ -161,6 +167,13 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       0,
       Math.floor(optionNumber(options, 'jevPruneMinChars', HOOK_DEFAULTS.jevPruneMinChars)),
     ),
+    stripHandles:
+      typeof options['stripHandles'] === 'boolean'
+        ? options['stripHandles']
+        : HOOK_DEFAULTS.stripHandles,
+    ...(typeof options['dedupeRepeats'] === 'boolean'
+      ? { dedupeRepeats: options['dedupeRepeats'] }
+      : {}),
   };
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
@@ -358,7 +371,79 @@ export function toSessionMessages(
   });
 }
 
-/** What the prose-trim rescue did: the keep cut-off it settled on, or none when no cut-off reached the minimum or the stage failed. */
+function mergeRun(run: readonly SessionMessage[]): SessionMessage {
+  const first = run[0]!;
+  const merged: SessionMessage = {
+    role: first.role,
+    text: run.map((message) => message.text).filter((text) => text.length > 0).join('\n\n'),
+    toolUses: run.flatMap((message) => message.toolUses),
+  };
+  const toolResults = run.flatMap((message) => message.toolResults ?? []);
+  if (toolResults.length > 0) merged.toolResults = toolResults;
+  return merged;
+}
+
+/**
+ * Puts the compacted conversation in the shape that survives `--resume` and
+ * keeps parallel tool calls paired. Two engine behaviours drive it
+ * (anthropics/claude-code#95328, fast-jev-compaction#89 and #137):
+ *
+ * - A kept message that still carries its `handle` is re-saved pointing
+ *   behind the compaction, and on `--resume` the engine walks back through it
+ *   and restores the whole history the compaction removed. Every message
+ *   holding tool results and every assistant message except the newest run
+ *   therefore goes back without its handle. User text keeps its handle: it
+ *   is not one of the two causes, and it carries the user's images.
+ * - One API response with parallel calls is several assistant rows sharing
+ *   one engine id. A row without a handle gets a new id, which splits the
+ *   response, and the engine then reports a sibling's result as missing. So a
+ *   run of consecutive assistant rows with any row lacking a handle is merged
+ *   into one message, and likewise the run of tool-result rows after it.
+ *
+ * What a message loses with its handle is what the engine kept beside its
+ * text and tool blocks: hidden reasoning, and images inside tool results.
+ * The newest assistant run keeps its handles, so a tool loop in progress
+ * keeps its reasoning.
+ */
+export function resumeSafeMessages(messages: readonly SessionMessage[]): SessionMessage[] {
+  let newestRun = messages.length;
+  let last = messages.length - 1;
+  while (last >= 0 && messages[last]!.role !== 'assistant') last -= 1;
+  if (last >= 0) {
+    newestRun = last;
+    while (newestRun > 0 && messages[newestRun - 1]!.role === 'assistant') newestRun -= 1;
+  }
+  const stripped = messages.map((message, index) => {
+    if (message.handle === undefined) return message;
+    const carriesResults = (message.toolResults?.length ?? 0) > 0;
+    const olderAssistant = message.role === 'assistant' && index < newestRun;
+    if (!carriesResults && !olderAssistant) return message;
+    const copy: SessionMessage = { role: message.role, text: message.text, toolUses: message.toolUses };
+    if (message.toolResults) copy.toolResults = message.toolResults;
+    return copy;
+  });
+  const out: SessionMessage[] = [];
+  let index = 0;
+  while (index < stripped.length) {
+    const message = stripped[index]!;
+    const isResultRow = (m: SessionMessage) => m.role === 'user' && (m.toolResults?.length ?? 0) > 0;
+    const sameRun =
+      message.role === 'assistant'
+        ? (m: SessionMessage) => m.role === 'assistant'
+        : isResultRow(message)
+          ? isResultRow
+          : undefined;
+    let end = index + 1;
+    if (sameRun) while (end < stripped.length && sameRun(stripped[end]!)) end += 1;
+    const run = stripped.slice(index, end);
+    if (run.length > 1 && run.some((m) => m.handle === undefined)) out.push(mergeRun(run));
+    else out.push(...run);
+    index = end;
+  }
+  return out;
+}
+
+/** What the prose-trim rescue did:the keep cut-off it settled on, or none when no cut-off reached the minimum or the stage failed. */
 export type ProseOutcome = { cutoff?: number; stats: ProseStats };
 
 /** What the notification-trim rescue did: the rung it settled on, or none when no rung reached the minimum or the stage failed. */
@@ -456,15 +541,19 @@ export async function compactSession(
   const tool = { result, messages: toSessionMessages(messages, result.messages) };
   const trimNotifications =
     (config.notificationTrim ?? HOOK_DEFAULTS.notificationTrim) && archive !== undefined;
+  const finish = (out: SessionCompaction): SessionCompaction =>
+    (config.stripHandles ?? HOOK_DEFAULTS.stripHandles)
+      ? { ...out, messages: resumeSafeMessages(out.messages) }
+      : out;
   if ((!config.proseTrim && !trimNotifications) || reductionRatio(result) >= config.minReductionRatio) {
-    return tool;
+    return finish(tool);
   }
   const rescue =
     trimNotifications && archive
       ? await rescueWithTrim(messages, result, asker, config, archive)
       : await rescueWithProse(messages, result, asker, config, archive);
   if (archive) await archive.flush();
-  return { ...tool, ...rescue };
+  return finish({ ...tool, ...rescue });
 }
 
 /**

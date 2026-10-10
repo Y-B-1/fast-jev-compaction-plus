@@ -4,7 +4,7 @@ import {
   batchCalls,
   buildJevRequest,
   collectToolCalls,
-  compact,
+  compact as compactLib,
   compactMessages,
   decideCall,
   estimateTokens,
@@ -23,6 +23,12 @@ import {
   type Message,
   type ToolCall,
 } from '../src/index.js';
+
+// These fixtures use short results; they predate the small-result floor,
+// duplicate removal and the keep-signal guard, which have their own tests.
+const LEGACY = { minResultChars: 0, dedupeRepeats: false, minKeepSignalCalls: 0 };
+const compact: typeof compactLib = (messages, asker, options = {}) =>
+  compactLib(messages, asker, { ...LEGACY, ...options });
 
 function message(role: Message['role'], text: string, extra: Partial<Message> = {}): Message {
   return { role, text, toolUses: [], ...extra };
@@ -725,7 +731,7 @@ describe('HTTP client', () => {
     const keyless = new JevClient({ apiKey: '' });
     await expect(keyless.ask('s', {})).rejects.toThrow(/TYPESAFE_API_KEY is not configured/);
     await expect(
-      compactMessages(transcript(), { apiKey: '', preserveRecentMessages: 1 }),
+      compactMessages(transcript(), { apiKey: '', preserveRecentMessages: 1, ...LEGACY }),
     ).rejects.toThrow(/TYPESAFE_API_KEY is not configured/);
   });
 
