@@ -7,6 +7,8 @@ import {
   decisionLog,
   decisionLogLines,
   getApiKey,
+  messageTarget,
+  messageTokens,
   register,
   resolveHookConfig as resolveHookConfigLib,
   resumeSafeMessages,
@@ -903,7 +905,7 @@ describe('proseTrim rescue', () => {
   });
 
   describe('through the hook', () => {
-    const hook = (options: Record<string, unknown>, fetchFn = fetchWith(0.1)) => {
+    const hook = (options: Record<string, unknown>, fetchFn = fetchWith(0.1), usageTokens?: number) => {
       const hooks: Record<string, (...args: any[]) => Promise<any>> = {};
       (register as any)(
         (event: string, a: unknown, b?: any) => {
@@ -916,6 +918,9 @@ describe('proseTrim rescue', () => {
         clock,
         http: { fetch: async (url: string, init?: { body?: string }) => fetchFn(url, init) },
         ui: { log: () => {}, toast: (t: string) => toasts.push(t) },
+        ...(usageTokens === undefined
+          ? {}
+          : { session: { usage: async () => ({ context: { tokens: usageTokens, window: 200_000 } }) } }),
       };
       const next = Object.assign(async (e: unknown) => e, {
         signal: new AbortController().signal,
@@ -923,6 +928,31 @@ describe('proseTrim rescue', () => {
       });
       return { run: (event: Record<string, unknown>) => hooks['session.compact']!($, event, next), toasts };
     };
+
+    describe('measured against the real context', () => {
+      const history = () => messageTokens(proseTranscript());
+
+      it('compacts as before when the context is no larger than the history', async () => {
+        const out = await hook({ proseTrim: true }, fetchWith(0.1), history()).run({ trigger: 'auto', messages: proseTranscript() });
+        expect(Object.keys(out)).toEqual(['messages']);
+      });
+
+      it('falls back without asking Jev when no history cut can free the minimum', async () => {
+        const requests: string[][] = [];
+        const event = { trigger: 'auto', messages: proseTranscript() };
+        const on = hook({ proseTrim: true }, fetchWith(0.1, requests), history() * 10);
+        expect(await on.run(event)).toBe(event);
+        expect(requests).toHaveLength(0);
+        expect(on.toasts[0]).toBe('fallback to built-in summary (history is too small a share of the context to free 25%)');
+      });
+
+      it('falls back when the history cut frees too little of the context', async () => {
+        const event = { trigger: 'auto', messages: proseTranscript() };
+        const on = hook({ proseTrim: true }, fetchWith(0.1), Math.round(history() * 3.9));
+        expect(await on.run(event)).toBe(event);
+        expect(on.toasts[0]).toMatch(/^fallback to built-in summary \(below 25% minimum, prose trim tried, history needs 9\d% to free 25% of context: /);
+      });
+    });
 
     it('replaces history and names the cut-off', async () => {
       const event = { trigger: 'auto', messages: proseTranscript() };
@@ -1361,5 +1391,17 @@ describe('sha256Hex', () => {
     for (const text of ['', 'abc', 'a'.repeat(55), 'a'.repeat(56), 'a'.repeat(64), 'a'.repeat(1000), 'héllo 😀 wörld'.repeat(9)]) {
       expect(sha256Hex(text)).toBe(createHash('sha256').update(text).digest('hex'));
     }
+  });
+});
+
+describe('messageTarget', () => {
+  it('scales the minimum by the share of the context the history fills', () => {
+    expect(messageTarget(160_000, 80_000, 0.25)).toBeCloseTo(0.5);
+  });
+  it('keeps the minimum without a reading or when the history fills the context', () => {
+    expect(messageTarget(undefined, 80_000, 0.25)).toBe(0.25);
+    expect(messageTarget(80_000, 80_000, 0.25)).toBe(0.25);
+    expect(messageTarget(70_000, 80_000, 0.25)).toBe(0.25);
+    expect(messageTarget(160_000, 0, 0.25)).toBe(0.25);
   });
 });

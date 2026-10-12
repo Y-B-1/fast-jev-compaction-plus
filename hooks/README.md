@@ -72,7 +72,13 @@ library; see the root README for what they do. The `session.compact` hook runs t
 the response is malformed, the key is unavailable, the history cannot be
 fitted into the state budget, or the estimated reduction is below
 `minReductionRatio`, the hook logs a fallback and delegates to Claude Code's
-built-in compaction. The outcome is shown as a toast and logged with the
+built-in compaction. The minimum is measured against the real context that
+`$.session.usage()` reports, not the history alone: the system prompt, tool
+schemas and attachments count toward Claude Code's trigger but are never
+compacted, so a cut of 25% of the history can free as little as 10% of the
+context and the next compaction fires minutes later. When the history is too
+small a share of the context to free the minimum even if all of it went, the
+hook falls back without asking Jev. The outcome is shown as a toast and logged with the
 reduction, per-reason counts, state size and request count; a per-call
 `decisions:` line with both probabilities is logged for diagnosis.
 The plugin installs no compaction trigger of its own: compaction runs whenever

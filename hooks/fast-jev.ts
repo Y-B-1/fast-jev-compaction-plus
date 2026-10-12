@@ -25,7 +25,7 @@ import {
   type ProseStats,
 } from '../src/prose.js';
 import { redactCompactionState, redactText } from '../src/redact.js';
-import { goalFromMessages } from '../src/state.js';
+import { estimateTokens, goalFromMessages } from '../src/state.js';
 import { failedProseStats, trimRescue } from '../src/trim.js';
 import type {
   CompactOptions,
@@ -762,6 +762,29 @@ function log($: { ui: { log: (text: string) => void } }, text: string): void {
   }
 }
 
+/** Estimated tokens of the compactable history: text, tool inputs and results. */
+export function messageTokens(messages: readonly Message[]): number {
+  let total = 0;
+  for (const message of messages) {
+    total += estimateTokens(message.text);
+    for (const tool of message.toolUses) total += estimateTokens(JSON.stringify(tool.input ?? {}));
+    for (const result of message.toolResults ?? []) total += estimateTokens(result.text);
+  }
+  return total;
+}
+
+/**
+ * The message-level cut that frees `minRatio` of the real context. The system
+ * prompt, tool schemas and attachments count toward the engine's trigger but
+ * are never compacted, so a cut measured on messages alone overstates the
+ * headroom it buys and the next compaction fires minutes later. Without a
+ * context reading, or when it is not larger than the history, `minRatio` stands.
+ */
+export function messageTarget(contextTokens: number | undefined, historyTokens: number, minRatio: number): number {
+  if (!contextTokens || historyTokens <= 0 || contextTokens <= historyTokens) return minRatio;
+  return (minRatio * contextTokens) / historyTokens;
+}
+
 /** An interrupted dispatch is vetoed quietly: no summary, nothing replaced. */
 function interrupted($: { ui: { log: (text: string) => void } }): { skip: string } {
   log($, 'compaction interrupted; nothing changed');
@@ -800,6 +823,28 @@ export const register: Register = (on: On, options: PluginOptions) => {
     }
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
+      // The last response's input tokens: the size the engine compacts at.
+      let contextTokens: number | undefined;
+      try {
+        contextTokens = (await $.session.usage()).context.tokens;
+      } catch {
+        contextTokens = undefined;
+      }
+      const historyTokens = messageTokens(event.messages);
+      const target = messageTarget(contextTokens, historyTokens, configured.minReductionRatio);
+      if (contextTokens !== undefined) {
+        log($, `context ${contextTokens} tokens, history ~${historyTokens} tokens, history cut needed ${percent(target)}`);
+      }
+      if (target >= 1 && target > configured.minReductionRatio) {
+        const reason = `history is too small a share of the context to free ${percent(configured.minReductionRatio)}`;
+        if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
+          notify($, `skipped (${reason}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger)`);
+          return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
+        }
+        notify($, `fallback to built-in summary (${reason})`);
+        return next(event);
+      }
+      config.minReductionRatio = target;
       if (event.instructions?.trim()) {
         const goal = config.goal || goalFromMessages(event.messages);
         config.goal = `${goal}\n\nCompaction instructions: ${event.instructions}`;
@@ -821,17 +866,19 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) log($, line);
       if (reductionRatio(result) < config.minReductionRatio) {
-        const tried = `${prose ? ', prose trim tried' : ''}${notifications ? ', notification trim tried' : ''}`;
+        const tried = `${prose ? ', prose trim tried' : ''}${notifications ? ', notification trim tried' : ''}${
+          target > configured.minReductionRatio ? `, history needs ${percent(target)} to free ${percent(configured.minReductionRatio)} of context` : ''
+        }`;
         if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
           notify(
             $,
-            `skipped (below ${percent(config.minReductionRatio)} minimum${tried}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result)})`,
+            `skipped (below ${percent(configured.minReductionRatio)} minimum${tried}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result)})`,
           );
           return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
         }
         notify(
           $,
-          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum${tried}: ${summarize(result)})`,
+          `fallback to built-in summary (below ${percent(configured.minReductionRatio)} minimum${tried}: ${summarize(result)})`,
         );
         return next(event);
       }
