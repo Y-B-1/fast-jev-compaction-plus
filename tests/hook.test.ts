@@ -1316,8 +1316,9 @@ describe('notificationTrim rescue', () => {
     const extra = [message('assistant', Array(10).fill(FLUFF).join(' '))];
     const proseOnly = await compactSession(
       transcriptWithReports(extra),
-      cfg({ proseTrim: true, minReductionRatio: 0.01 }),
+      cfg({ proseTrim: true, notificationTrim: false, injectTrim: false, replyTrim: false, archiveResults: true, minReductionRatio: 0.01 }),
       fetchWith(0.1, [], 0.1),
+      memoryArchive().writer,
     );
     const both = await compactSession(
       transcriptWithReports(extra),
@@ -1325,7 +1326,7 @@ describe('notificationTrim rescue', () => {
       fetchWith(0.1, [], 0.1),
       memoryArchive().writer,
     );
-    expect(proseOnly.prose?.cutoff).toBe(0.15);
+    expect(proseOnly.prose?.stats.dropped).toBeGreaterThan(0);
     expect(both.prose?.cutoff).toBe(0.15);
     expect(both.notifications?.rung).toBe(0.15);
     expect(both.messages).toHaveLength(proseOnly.messages.length);

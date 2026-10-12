@@ -110,7 +110,7 @@ export async function trimRescue(input: {
 
   const lastProse = PROSE_KEEP_LADDER[PROSE_KEEP_LADDER.length - 1] as number;
   const apply = (rung: Rung): TrimApplied => {
-    const prose = proseScores ? applyProse(proseScores, rung === 'all' ? lastProse : rung) : undefined;
+    const prose = proseScores ? applyProse(proseScores, rung === 'all' ? lastProse : rung, (id) => pathOf(id)) : undefined;
     const notified = notificationsUsable && scores ? applyNotifications(scores, rung, (id, text) => pathOf(notificationArchiveId(id, text))) : undefined;
     const injected = injectUsable && injectScores ? applyInjected(injectScores, rung, (id) => pathOf(id)) : undefined;
     let merged = prose?.messages ?? result.messages;
@@ -125,6 +125,9 @@ export async function trimRescue(input: {
     if (archive.cite(notificationArchiveId(item.id, item.text), item.text) !== item.path) {
       throw new Error(`archive path for ${item.id} is not ${item.path}`);
     }
+  }
+  for (const item of rescue.applied.prose?.archived ?? []) {
+    if (archive.cite(item.id, item.text) !== item.path) throw new Error(`archive path for ${item.id} is not ${item.path}`);
   }
   for (const item of rescue.applied.injected?.archived ?? []) {
     if (archive.cite(item.id, item.text) !== item.path) throw new Error(`archive path for ${item.id} is not ${item.path}`);

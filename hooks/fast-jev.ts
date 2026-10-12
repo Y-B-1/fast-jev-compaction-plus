@@ -19,6 +19,7 @@ import {
 import type { NotificationStats, Rung } from '../src/notifications.js';
 import {
   PROSE_KEEP_LADDER,
+  applyProse,
   callActions,
   elideInputs,
   ladderRescue,
@@ -620,15 +621,60 @@ export async function compactSession(
     (config.stripHandles ?? HOOK_DEFAULTS.stripHandles)
       ? { ...out, messages: resumeSafeMessages(out.messages) }
       : out;
-  if ((!config.proseTrim && !trimNotifications && !trimInjected) || reductionRatio(result) >= config.minReductionRatio) {
-    return finish(tool);
+  if (reductionRatio(result) >= config.minReductionRatio) {
+    if (!(config.replyTrim ?? HOOK_DEFAULTS.replyTrim) || !config.proseTrim || !archive) return finish(tool);
+    const reply = await trimReplies(messages, result, asker, config, archive);
+    if (reply.result) await archive.flush();
+    return finish({ ...tool, ...reply });
   }
+  if (!config.proseTrim && !trimNotifications && !trimInjected) return finish(tool);
   const rescue =
     (trimNotifications || trimInjected) && archive
       ? await rescueWithTrim(messages, result, asker, config, archive)
       : await rescueWithProse(messages, result, asker, config, archive);
   if (archive) await archive.flush();
   return finish({ ...tool, ...rescue });
+}
+
+/**
+ * Reply trim, for a compaction that already reached the minimum: scores the prose of tool
+ * compaction's result once and drops only the clauses below the mildest cut-off, archiving each
+ * changed message's original. Returns only `prose` when nothing changed or the stage failed, so
+ * the caller keeps tool compaction's result.
+ */
+async function trimReplies(
+  messages: readonly SessionMessage[],
+  result: CompactResult,
+  asker: JevAsker,
+  config: HookConfig,
+  archive: ArchiveWriter,
+): Promise<Partial<SessionCompaction> & { prose: ProseOutcome }> {
+  const options = resolveOptions(config);
+  let scores;
+  try {
+    scores = await scoreProse(
+      result.messages,
+      callActions(messages, result.decisions, options.preserveRecentMessages),
+      asker,
+      { ...options, archive: archive.cite },
+    );
+  } catch (error) {
+    return { prose: { stats: failedProseStats(error) } };
+  }
+  if (scores.stats.failed !== undefined) return { prose: { stats: scores.stats } };
+  const cutoff = PROSE_KEEP_LADDER[0] as number;
+  const applied = applyProse(scores, cutoff, (id) => archive.pathOf(id));
+  if (applied.archived.length === 0 && applied.stats.inputsElided === 0) return { prose: { stats: applied.stats } };
+  for (const item of applied.archived) {
+    if (archive.cite(item.id, item.text) !== item.path) throw new Error(`archive path for ${item.id} is not ${item.path}`);
+  }
+  const charsAfter = applied.messages.reduce((sum, m) => sum + messageChars(m), 0);
+  const trimmed = { ...result, messages: applied.messages, stats: { ...result.stats, charsAfter } };
+  return {
+    result: trimmed,
+    messages: toSessionMessages(messages, applied.messages),
+    prose: { cutoff, stats: applied.stats },
+  };
 }
 
 /**
@@ -657,8 +703,11 @@ async function rescueWithProse(
     return { prose: { stats: failedProseStats(error) } };
   }
   if (scores.stats.failed !== undefined) return { prose: { stats: scores.stats } };
-  const rescue = ladderRescue(scores, result, config.minReductionRatio);
+  const rescue = ladderRescue(scores, result, config.minReductionRatio, archive ? (id) => archive.pathOf(id) : undefined);
   if (rescue) {
+    for (const item of rescue.archived) {
+      if (archive?.cite(item.id, item.text) !== item.path) throw new Error(`archive path for ${item.id} is not ${item.path}`);
+    }
     return {
       result: rescue.result,
       messages: toSessionMessages(messages, rescue.result.messages),

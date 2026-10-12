@@ -1,6 +1,7 @@
 import { messageChars, reductionRatio, splitsSurrogatePair } from './compact.js';
 import { noulAnswer } from './request.js';
 import { ERROR_LINE, SCAN, salvageBlock } from './salvage.js';
+import { sha256Hex } from './sha256.js';
 import { collectToolCalls, estimateTokens, goalFromMessages, isPinned, truncate } from './state.js';
 import type { ArchiveResult, CallDecision, CompactResult, JevAsker, JevQuestions, Message, ToolUse } from './types.js';
 
@@ -291,6 +292,24 @@ export type ProseTrimOptions = {
   windowTokens?: number;
   /** Saves a cut code body whole; the returned path is cited in the marker. Undefined (or a result of undefined) leaves the marker as it is. */
   archive?: ArchiveResult;
+};
+
+/**
+ * Archives the original of a message whose prose a rung cuts and returns the path its marker will
+ * name; undefined leaves that message's prose whole. The id is derived from the original, so a
+ * later call with the same original returns the same path.
+ */
+export type ProseCite = (id: string, text: string) => string | undefined;
+
+/** A prose cut must save more than its marker plus this margin, or the message stays whole. */
+const MARKER_MARGIN = 120;
+
+export type ProseApplied = {
+  messages: Message[];
+  decisions: ProseDecision[];
+  stats: ProseStats;
+  /** The originals this rung cites (only with a `cite`); hand them to the real archive writer once the rung is chosen. */
+  archived: { id: string; text: string; path: string }[];
 };
 
 /** One scored unit's outcome. `message` is the index in the input messages. */
@@ -649,7 +668,8 @@ export async function scoreProse(
 export function applyProse(
   scores: ProseScores,
   keepAt: number,
-): { messages: Message[]; decisions: ProseDecision[]; stats: ProseStats } {
+  cite?: ProseCite,
+): ProseApplied {
   const { messages, plans, noul } = scores;
   const stats: ProseStats = {
     ...scores.stats,
@@ -659,7 +679,8 @@ export function applyProse(
     proseCharsSaved: 0,
     inputCharsSaved: 0,
   };
-  if (stats.failed !== undefined) return { messages: [...messages], decisions: [], stats };
+  const archived: ProseApplied['archived'] = [];
+  if (stats.failed !== undefined) return { messages: [...messages], decisions: [], stats, archived };
   const decisions: ProseDecision[] = [];
   const dropped = new Set<ProseUnit>();
   for (const [i, plan] of plans) {
@@ -682,8 +703,34 @@ export function applyProse(
       out.push(m);
       return;
     }
-    const text = plan.text.length > 0 ? reassemble(m.text, plan.text, (u) => !dropped.has(u)) : m.text;
-    stats.proseCharsSaved += m.text.length - text.length;
+    let text = plan.text.length > 0 ? reassemble(m.text, plan.text, (u) => !dropped.has(u)) : m.text;
+    const values = new Map<number, string>();
+    for (const [k, prose] of plan.prose) {
+      if (plan.elided.has(k)) continue;
+      const value = reassemble(prose.value, prose.units, (u) => !dropped.has(u));
+      if (value !== prose.value) values.set(k, value);
+    }
+    let saved = m.text.length - text.length;
+    for (const [k, value] of values) saved += (plan.prose.get(k) as { value: string }).value.length - value.length;
+    if (cite && saved > 0) {
+      // A prose cut goes ahead only with the original archived and cited, and only when it saves
+      // more than the marker costs; otherwise this message's prose stays whole.
+      const original = proseOriginal(m, plan, values);
+      const id = `reply-${sha256Hex(original).slice(0, 12)}`;
+      const path = cite(id, original);
+      const marker = path ? `${MARKER_LINE}trimmed ${withCommas(saved)} chars of this reply; full text: ${path} (Read it if needed)]` : '';
+      if (path && saved > marker.length + 1 + MARKER_MARGIN) {
+        const cost = text.length > 0 ? marker.length + 1 : marker.length;
+        text = text.length > 0 ? `${text}\n${marker}` : marker;
+        archived.push({ id, text: original, path });
+        saved -= cost;
+      } else {
+        text = m.text;
+        values.clear();
+        saved = 0;
+      }
+    }
+    stats.proseCharsSaved += saved;
     let changed = text !== m.text;
     const toolUses = m.toolUses.map((tool, k) => {
       const elision = plan.elided.get(k);
@@ -694,9 +741,8 @@ export function applyProse(
         stats.inputsElided += elision.fields;
         stats.inputCharsSaved += elision.saved;
       } else if (prose) {
-        const value = reassemble(prose.value, prose.units, (u) => !dropped.has(u));
-        if (value === prose.value) return tool;
-        stats.proseCharsSaved += prose.value.length - value.length;
+        const value = values.get(k);
+        if (value === undefined) return tool;
         input = { ...tool.input, [prose.field]: value };
       }
       if (!input) return tool;
@@ -715,7 +761,17 @@ export function applyProse(
     if (m.toolResults) rebuilt.toolResults = m.toolResults;
     out.push(rebuilt);
   });
-  return { messages: out, decisions, stats };
+  return { messages: out, decisions, stats, archived };
+}
+
+/** The text a prose cut archives: the message's text and each prose input it cut, as they were. */
+function proseOriginal(m: Message, plan: Plan, values: ReadonlyMap<number, string>): string {
+  const parts = [m.text];
+  for (const k of values.keys()) {
+    const prose = plan.prose.get(k) as { field: string; value: string };
+    parts.push(`[${(m.toolUses[k] as ToolUse).tool} input "${prose.field}"]\n${prose.value}`);
+  }
+  return parts.filter((part) => part.length > 0).join('\n\n');
 }
 
 /**
@@ -768,12 +824,13 @@ export function ladderRescue(
   scores: ProseScores,
   result: CompactResult,
   minRatio: number,
-): { cutoff: number; result: CompactResult; stats: ProseStats } | undefined {
+  cite?: ProseCite,
+): { cutoff: number; result: CompactResult; stats: ProseStats; archived: ProseApplied['archived'] } | undefined {
   for (const cutoff of PROSE_KEEP_LADDER) {
-    const trimmed = applyProse(scores, cutoff);
+    const trimmed = applyProse(scores, cutoff, cite);
     const charsAfter = trimmed.messages.reduce((sum, message) => sum + messageChars(message), 0);
     const candidate = { ...result, messages: trimmed.messages, stats: { ...result.stats, charsAfter } };
-    if (reductionRatio(candidate) >= minRatio) return { cutoff, result: candidate, stats: trimmed.stats };
+    if (reductionRatio(candidate) >= minRatio) return { cutoff, result: candidate, stats: trimmed.stats, archived: trimmed.archived };
   }
   return undefined;
 }
