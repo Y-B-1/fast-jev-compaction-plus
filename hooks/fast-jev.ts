@@ -16,6 +16,7 @@ import {
   parseJevResponse,
   retryDelayMs,
 } from '../src/request.js';
+import { type ExchangeStats, exchangeLadder, scoreExchanges } from '../src/exchanges.js';
 import type { NotificationStats, Rung } from '../src/notifications.js';
 import {
   PROSE_KEEP_LADDER,
@@ -516,7 +517,12 @@ export type SessionCompaction = {
   notifications?: NotificationOutcome;
   /** Set only when `injectTrim` is on, an archive writer is given and tool compaction fell short. */
   injected?: InjectOutcome;
+  /** Set only when `exchangeDrop` is on, an archive writer is given and every earlier stage fell short. */
+  exchanges?: ExchangeOutcome;
 };
+
+/** What the exchange drop did: the cut-off it settled on, or none when no cut-off reached the minimum or the stage failed. */
+export type ExchangeOutcome = { cutoff?: number; stats: ExchangeStats };
 
 const ARCHIVE_DIR = '.claude/fast-jev-compaction';
 
@@ -633,7 +639,37 @@ export async function compactSession(
       ? await rescueWithTrim(messages, result, asker, config, archive)
       : await rescueWithProse(messages, result, asker, config, archive);
   if (archive) await archive.flush();
-  return finish({ ...tool, ...rescue });
+  if (rescue.result || !(config.exchangeDrop ?? HOOK_DEFAULTS.exchangeDrop) || !archive) return finish({ ...tool, ...rescue });
+  const exchanges = await dropExchanges(messages, result, asker, config, archive);
+  const tried = exchanges.exchanges.stats.eligible > 0 || exchanges.exchanges.stats.failed !== undefined;
+  return finish({ ...tool, ...rescue, ...(tried ? exchanges : {}) });
+}
+
+/**
+ * The last stage before the built-in summary: drops old finished exchanges Jev no longer needs,
+ * each archived whole first. Applied on tool compaction's result; returns only `exchanges` when no
+ * cut-off reaches the minimum or the stage fails, so the caller keeps its earlier result.
+ */
+async function dropExchanges(
+  messages: readonly SessionMessage[],
+  result: CompactResult,
+  asker: JevAsker,
+  config: HookConfig,
+  archive: ArchiveWriter,
+): Promise<Partial<SessionCompaction> & { exchanges: ExchangeOutcome }> {
+  const scores = await scoreExchanges(result.messages, asker, resolveOptions(config));
+  if (scores.stats.failed !== undefined || scores.exchanges.length === 0) return { exchanges: { stats: scores.stats } };
+  const ladder = exchangeLadder(scores, result, config.minReductionRatio, (id) => archive.pathOf(id));
+  if (!ladder) return { exchanges: { stats: scores.stats } };
+  for (const item of ladder.applied.archived) {
+    if (archive.cite(item.id, item.text) !== item.path) throw new Error(`archive path for ${item.id} is not ${item.path}`);
+  }
+  await archive.flush();
+  return {
+    result: ladder.result,
+    messages: toSessionMessages(messages, ladder.result.messages),
+    exchanges: { cutoff: ladder.cutoff, stats: ladder.applied.stats },
+  };
 }
 
 /**
@@ -764,6 +800,7 @@ export function summarize(
   prose?: ProseOutcome,
   notifications?: NotificationOutcome,
   injected?: InjectOutcome,
+  exchanges?: ExchangeOutcome,
 ): string {
   const { stats } = result;
   const parts = [
@@ -792,6 +829,10 @@ export function summarize(
     injected?.rung === undefined
       ? ''
       : `; injected-content fold at ${injected.rung}: ${injected.stats.folded} folded, ${injected.stats.charsSaved} chars`
+  }${
+    exchanges?.cutoff === undefined
+      ? ''
+      : `; exchange drop at ${exchanges.cutoff}: ${exchanges.stats.dropped} archived, ${exchanges.stats.charsSaved} chars`
   }`;
 }
 
@@ -1064,7 +1105,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         inertNoticeLogged = true;
         log($, 'notification trim skipped: archiveResults is off');
       }
-      const { result, messages, prose, notifications, injected } = await compactSession(
+      const { result, messages, prose, notifications, injected, exchanges } = await compactSession(
         event.messages,
         config,
         async (url, init) => {
@@ -1077,7 +1118,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) log($, line);
       if (reductionRatio(result) < config.minReductionRatio) {
-        const tried = `${prose ? ', prose trim tried' : ''}${notifications ? ', notification trim tried' : ''}${injected ? ', injected-content fold tried' : ''}${
+        const tried = `${prose ? ', prose trim tried' : ''}${notifications ? ', notification trim tried' : ''}${injected ? ', injected-content fold tried' : ''}${exchanges ? ', exchange drop tried' : ''}${
           target > configured.minReductionRatio ? `, history needs ${percent(target)} to free ${percent(configured.minReductionRatio)} of context` : ''
         }`;
         if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
@@ -1110,7 +1151,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       log($, `kept history ~${messageTokens(messages)} tokens of ~${historyTokens}`);
       notify(
         $,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose, notifications, injected)})`,
+        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose, notifications, injected, exchanges)})`,
       );
       return { messages };
     } catch (error) {

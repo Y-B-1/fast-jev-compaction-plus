@@ -20,7 +20,7 @@ const FOLD_MARGIN = 120;
 const USER_ALL_CUTOFF = PROSE_KEEP_LADDER[PROSE_KEEP_LADDER.length - 1] as number;
 
 /** A row the user typed (or the host typed for them): a user row with text, no tool results and no machine prefix. */
-function isPromptRow(message: Message): boolean {
+export function isPromptRow(message: Message): boolean {
   return (
     message.role === 'user' &&
     message.text.trim().length > 0 &&
