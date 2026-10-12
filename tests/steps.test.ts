@@ -69,6 +69,11 @@ describe('findSteps', () => {
     expect(findSteps(mixed, 2).some((s) => s.from === 6)).toBe(false);
     expect(isHostOnly(REMINDER)).toBe(true);
     expect(isHostOnly(`${REMINDER} typed`)).toBe(false);
+    const between = session();
+    between.splice(9, 0, user(REMINDER)); // a host row inside the open run of call b
+    expect(findSteps(between, 2).some((s) => s.from === 9)).toBe(false);
+    const parallel: Message[] = [user('start'), user('go'), { ...call('a'), toolUses: [...call('a').toolUses, ...call('b').toolUses] }, result('a', BIG), user(REMINDER), result('b', BIG), reply('done'), user('next'), reply('ok')];
+    expect(findSteps(parallel, 1).some((s) => s.from <= 4 && s.to > 4)).toBe(false);
     const unpaired = session();
     unpaired.splice(9, 1);
     expect(findSteps(unpaired, 2).some((s) => s.from === 8)).toBe(false);

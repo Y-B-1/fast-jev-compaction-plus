@@ -105,6 +105,11 @@ export function findSteps(messages: readonly Message[], preserveRecentMessages: 
       j++;
     }
     if (ok && open.size === 0) push(i, j);
+    // A run cut short with calls still open: no row before their last result may
+    // become a step, or its marker would land between a call and its result.
+    for (let k = j; open.size > 0 && k < total; k++) {
+      for (const res of (messages[k] as Message).toolResults ?? []) if (open.delete(res.tool_use_id)) j = k + 1;
+    }
     i = Math.max(j, i + 1);
   }
   return out;
