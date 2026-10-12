@@ -61,9 +61,22 @@ The plugin declares these `userConfig` values in
 | `maxKeptResultChars` | `4000` |
 | `inputTrim` | `true` |
 | `hybridSummary` | `true` |
+| `injectTrim` | `true` |
+| `replyTrim` | `true` |
+| `exchangeDrop` | `true` |
 | `jevPruneBashOutput` | `false` |
 | `jevPruneMinChars` | `4000` |
 | `model` | `jev-latest` |
+
+Nothing these stages cut is lost: each original is written to the archive
+folder first and the marker left in its place names the file, so the model can
+Read it back. Without `archiveResults` the three stages below do nothing.
+On every compaction `replyTrim` drops low-scoring filler clauses from old
+assistant replies. When trimming falls short, `injectTrim` folds old skill
+bodies, element selections, pastes and long user rows beside the
+notification fold, keeping any text typed around them. When that still falls
+short, `exchangeDrop` replaces the work of old finished exchanges with one row
+naming its archive, keeping the prompt.
 
 When trimming frees less than the minimum and `builtinFallback` allows the
 built-in summary, the hook first tries a hybrid (`hybridSummary`, on by
@@ -86,7 +99,7 @@ through `TYPESAFE_API_KEY`. The environment variable is the recommended
 development setup.
 
 Every option except `apiKey`, `archiveResults`, `minReductionRatio`,
-`jevPruneBashOutput`, `jevPruneMinChars`, `inputTrim`, `hybridSummary` and `model` is passed straight to the
+`jevPruneBashOutput`, `jevPruneMinChars`, `inputTrim`, `hybridSummary`, `injectTrim`, `replyTrim`, `exchangeDrop` and `model` is passed straight to the
 library; see the root README for what they do. The `session.compact` hook runs the Jev requests concurrently. If Jev fails,
 the response is malformed, the key is unavailable, the history cannot be
 fitted into the state budget, or the estimated reduction is below
