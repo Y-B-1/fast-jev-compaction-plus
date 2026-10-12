@@ -16,6 +16,7 @@ import {
   callActions,
   scoreProse,
 } from './prose.js';
+import { type InjectApplied, type InjectStats, applyInjected, scoreInjected } from './inject.js';
 import { sha256Hex } from './sha256.js';
 import type { CompactResult, JevAsker, Message, ResolvedCompactOptions } from './types.js';
 
@@ -37,11 +38,12 @@ export type TrimApplied = {
   messages: Message[];
   prose?: ReturnType<typeof applyProse>;
   notified?: NotificationApplied;
+  injected?: InjectApplied;
 };
 
 export type TrimRescue = {
   /** The stages' scoring outcome, kept even when no rung is chosen. */
-  out: { prose?: { stats: ProseStats }; notifications?: { stats: NotificationStats } };
+  out: { prose?: { stats: ProseStats }; notifications?: { stats: NotificationStats }; injected?: { stats: InjectStats } };
   /** The first rung whose result reaches `minRatio`; undefined when none does or both stages failed. */
   rescue?: { rung: Rung; result: CompactResult; applied: TrimApplied };
   /** The notification scores, for a caller that wants to reapply them offline. */
@@ -66,6 +68,10 @@ export async function trimRescue(input: {
   asker: JevAsker;
   options: ResolvedCompactOptions;
   proseTrim: boolean;
+  /** Score and fold `<task-notification>` reports; default true. */
+  notificationTrim?: boolean;
+  /** Score and fold injected blocks in user rows (`src/inject.ts`); default false. */
+  injectTrim?: boolean;
   minRatio: number;
   archive: { cite: (id: string, text: string) => string | undefined };
   /** The path `archive.cite` will return for an archive id. */
@@ -90,25 +96,38 @@ export async function trimRescue(input: {
       proseScores = undefined;
     }
   }
-  const scores = await scoreNotifications(result.messages, asker, options);
-  out.notifications = { stats: scores.stats };
-  const notificationsUsable = scores.stats.failed === undefined && scores.entries.length > 0;
-  if (!proseScores && !notificationsUsable) return { out, scores };
+  const notifying = input.notificationTrim ?? true;
+  // Both stages catch their own failures, so they can ask Jev side by side.
+  const [scores, injectScores] = await Promise.all([
+    notifying ? scoreNotifications(result.messages, asker, options) : undefined,
+    input.injectTrim ? scoreInjected(result.messages, asker, options) : undefined,
+  ]);
+  if (scores) out.notifications = { stats: scores.stats };
+  const notificationsUsable = scores !== undefined && scores.stats.failed === undefined && scores.entries.length > 0;
+  if (injectScores && (injectScores.stats.eligible > 0 || injectScores.stats.failed !== undefined)) out.injected = { stats: injectScores.stats };
+  const injectUsable = injectScores !== undefined && injectScores.stats.failed === undefined && injectScores.blocks.length > 0;
+  if (!proseScores && !notificationsUsable && !injectUsable) return { out, ...(scores ? { scores } : {}) };
 
   const lastProse = PROSE_KEEP_LADDER[PROSE_KEEP_LADDER.length - 1] as number;
   const apply = (rung: Rung): TrimApplied => {
     const prose = proseScores ? applyProse(proseScores, rung === 'all' ? lastProse : rung) : undefined;
-    const notified = notificationsUsable ? applyNotifications(scores, rung, (id, text) => pathOf(notificationArchiveId(id, text))) : undefined;
-    const base = prose?.messages ?? result.messages;
-    return { messages: notified ? mergeNotifications(base, notified.replaced) : base, prose, notified };
+    const notified = notificationsUsable && scores ? applyNotifications(scores, rung, (id, text) => pathOf(notificationArchiveId(id, text))) : undefined;
+    const injected = injectUsable && injectScores ? applyInjected(injectScores, rung, (id) => pathOf(id)) : undefined;
+    let merged = prose?.messages ?? result.messages;
+    if (notified) merged = mergeNotifications(merged, notified.replaced);
+    if (injected) merged = mergeNotifications(merged, injected.replaced);
+    return { messages: merged, prose, notified, injected };
   };
   const rescue = ladderRescueWith(apply, result, input.minRatio);
   if (proseScores) out.prose = { stats: proseScores.stats };
-  if (!rescue) return { out, scores };
+  if (!rescue) return { out, ...(scores ? { scores } : {}) };
   for (const item of rescue.applied.notified?.archived ?? []) {
     if (archive.cite(notificationArchiveId(item.id, item.text), item.text) !== item.path) {
       throw new Error(`archive path for ${item.id} is not ${item.path}`);
     }
   }
-  return { out, rescue, scores };
+  for (const item of rescue.applied.injected?.archived ?? []) {
+    if (archive.cite(item.id, item.text) !== item.path) throw new Error(`archive path for ${item.id} is not ${item.path}`);
+  }
+  return { out, rescue, ...(scores ? { scores } : {}) };
 }

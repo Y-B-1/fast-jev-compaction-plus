@@ -137,6 +137,90 @@ function unchanged(
   };
 }
 
+/** What `askNoul` returns: Jev's noul by question key (absent when an answer was missing or invalid). */
+export type NoulAnswers = {
+  noul: Map<string, number | undefined>;
+  requests: number;
+  failedRequests: number;
+  stateTokens: number;
+  /** Set when every request failed. */
+  failed?: string;
+};
+
+/**
+ * Asks Jev the noul `questions` about `messages`, in batches that fit the request budget, with the
+ * whole conversation as state (tool compaction's state builder). Throws when the budget leaves no
+ * room for the state and a question. A request that fails leaves its questions unanswered; when
+ * every request fails, `failed` is set.
+ */
+export async function askNoul(
+  messages: readonly Message[],
+  questions: readonly (readonly [string, JevQuestions[string]])[],
+  asker: JevAsker,
+  options: Pick<NotificationOptions, 'preserveRecentMessages' | 'maxStateTokens' | 'maxRequestTokens' | 'maxConcurrentRequests' | 'goal'>,
+): Promise<NoulAnswers> {
+  const tokensOf = (q: JevQuestions[string]): number => estimateTokens(JSON.stringify(q));
+  const largest = questions.reduce((m, [, q]) => Math.max(m, tokensOf(q)), 0);
+  const stateBudget = options.maxRequestTokens - OVERHEAD_TOKENS - largest;
+  if (stateBudget < 1) throw new Error('request budget leaves no room for state and questions');
+  const fitted = fitState(messages, collectToolCalls(messages, options.preserveRecentMessages), {
+    maxStateTokens: Math.min(options.maxStateTokens, stateBudget),
+    preserveRecentMessages: options.preserveRecentMessages,
+    goal: options.goal,
+  });
+  const budget = options.maxRequestTokens - fitted.tokens - OVERHEAD_TOKENS;
+  const batches: (readonly [string, JevQuestions[string]])[][] = [];
+  let current: (readonly [string, JevQuestions[string]])[] = [];
+  let used = 0;
+  for (const item of questions) {
+    const tokens = tokensOf(item[1]);
+    if (fitted.tokens + tokens + OVERHEAD_TOKENS > STATE_PLUS_QUESTION_TOKENS || tokens > budget) {
+      throw new Error(`state of ~${fitted.tokens} tokens leaves no room for a question of ~${tokens}`);
+    }
+    if (current.length > 0 && used + tokens > budget) {
+      batches.push(current);
+      current = [];
+      used = 0;
+    }
+    current.push(item);
+    used += tokens;
+  }
+  if (current.length > 0) batches.push(current);
+
+  const noul = new Map<string, number | undefined>();
+  let failed = 0;
+  let lastFailure: unknown;
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < batches.length) {
+      const batch = batches[cursor++] as (typeof batches)[number];
+      try {
+        const { answers } = await asker.ask(fitted.state, Object.fromEntries(batch));
+        for (const [key] of batch) {
+          try {
+            noul.set(key, noulAnswer(answers, key));
+          } catch {
+            // A missing or invalid answer keeps the text.
+          }
+        }
+      } catch (error) {
+        failed++;
+        lastFailure = error;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(options.maxConcurrentRequests, batches.length) }, worker));
+  return {
+    noul,
+    requests: batches.length,
+    failedRequests: failed,
+    stateTokens: fitted.tokens,
+    ...(failed > 0 && failed === batches.length
+      ? { failed: lastFailure instanceof Error ? lastFailure.message : String(lastFailure) }
+      : {}),
+  };
+}
+
 /**
  * Asks Jev, once per eligible notification, whether its report must stay verbatim. Eligible: an
  * unpinned user message that starts `<task-notification>`, carries a `<task-id>` and a `<result>`, has
@@ -175,65 +259,13 @@ export async function scoreNotifications(
     if (entries.length === 0) return unchanged(messages, stats);
 
     const questions = entries.map((e) => [e.key, question(e, (messages[e.index] as Message).text, options.resultPreviewChars)] as const);
-    const tokensOf = (q: JevQuestions[string]): number => estimateTokens(JSON.stringify(q));
-    const largest = questions.reduce((m, [, q]) => Math.max(m, tokensOf(q)), 0);
-    const stateBudget = options.maxRequestTokens - OVERHEAD_TOKENS - largest;
-    if (stateBudget < 1) throw new Error('request budget leaves no room for state and questions');
-    const fitted = fitState(messages, collectToolCalls(messages, options.preserveRecentMessages), {
-      maxStateTokens: Math.min(options.maxStateTokens, stateBudget),
-      preserveRecentMessages: options.preserveRecentMessages,
-      goal: options.goal,
-    });
-    stats.stateTokens = fitted.tokens;
-
-    const budget = options.maxRequestTokens - fitted.tokens - OVERHEAD_TOKENS;
-    const batches: (readonly [string, JevQuestions[string]])[][] = [];
-    let current: (readonly [string, JevQuestions[string]])[] = [];
-    let used = 0;
-    for (const item of questions) {
-      const tokens = tokensOf(item[1]);
-      if (fitted.tokens + tokens + OVERHEAD_TOKENS > STATE_PLUS_QUESTION_TOKENS || tokens > budget) {
-        throw new Error(`state of ~${fitted.tokens} tokens leaves no room for a question of ~${tokens}`);
-      }
-      if (current.length > 0 && used + tokens > budget) {
-        batches.push(current);
-        current = [];
-        used = 0;
-      }
-      current.push(item);
-      used += tokens;
-    }
-    if (current.length > 0) batches.push(current);
-
-    const noul = new Map<string, number | undefined>();
-    let failed = 0;
-    let lastFailure: unknown;
-    let cursor = 0;
-    const worker = async (): Promise<void> => {
-      while (cursor < batches.length) {
-        const batch = batches[cursor++] as (typeof batches)[number];
-        try {
-          const { answers } = await asker.ask(fitted.state, Object.fromEntries(batch));
-          for (const [key] of batch) {
-            try {
-              noul.set(key, noulAnswer(answers, key));
-            } catch {
-              // A missing or invalid answer keeps the report.
-            }
-          }
-        } catch (error) {
-          failed++;
-          lastFailure = error;
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(options.maxConcurrentRequests, batches.length) }, worker));
-    stats.requests = batches.length;
-    stats.failedRequests = failed;
-    stats.scored = [...noul.values()].filter((v) => v !== undefined).length;
-    if (failed > 0 && failed === batches.length) {
-      return unchanged(messages, stats, lastFailure instanceof Error ? lastFailure.message : String(lastFailure));
-    }
+    const asked = await askNoul(messages, questions, asker, options);
+    stats.stateTokens = asked.stateTokens;
+    stats.requests = asked.requests;
+    stats.failedRequests = asked.failedRequests;
+    stats.scored = [...asked.noul.values()].filter((v) => v !== undefined).length;
+    if (asked.failed !== undefined) return unchanged(messages, stats, asked.failed);
+    const noul = asked.noul;
     return { messages, entries, noul, headChars: options.truncateHeadChars, salvageChars: options.salvageChars, stats };
   } catch (error) {
     return unchanged(messages, stats, error instanceof Error ? error.message : String(error));
@@ -308,7 +340,7 @@ function foldSalvage(tail: string, maxChars: number): string {
   }
 }
 
-function fold(body: string, headChars: number, salvageChars: number, say: (cut: number) => string): string {
+export function fold(body: string, headChars: number, salvageChars: number, say: (cut: number) => string): string {
   const cut = Math.max(0, splitsSurrogatePair(body, headChars) ? headChars - 1 : headChars);
   const head = cut > 0 ? `${body.slice(0, cut)}\n` : '';
   const salvaged = foldSalvage(body.slice(cut), salvageChars);

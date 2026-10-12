@@ -307,6 +307,68 @@ export function isMachineText(text: string): boolean {
   return MACHINE_TEXT_PREFIXES.some((prefix) => head.startsWith(prefix));
 }
 
+const SKILL_HEAD = 'Base directory for this skill:';
+const SKILL_ARGS = '\nARGUMENTS:';
+const ELEMENT = ['<launch-selected-element>', '</launch-selected-element>'] as const;
+const PASTE_OPEN = /<pasted_content\b[^>]*>/g;
+const PASTE_CLOSE = '</pasted_content>';
+
+export type InjectKind = 'skill' | 'element' | 'paste' | 'long';
+
+/** A user row at least this long, with no known injected block, is folded as a whole (`long`). */
+export const LONG_USER_CHARS = 3000;
+
+export type InjectSpan = { kind: InjectKind; span: [number, number] };
+
+/** The injected spans of a user row's text, in order; `long` only when there is no other span. */
+export function injectedSpans(text: string): InjectSpan[] {
+  if (text.trimStart().startsWith(SKILL_HEAD)) {
+    const from = text.indexOf('\n', text.indexOf(SKILL_HEAD));
+    if (from === -1) return [];
+    const args = text.lastIndexOf(SKILL_ARGS);
+    const to = args > from ? args : text.length;
+    return to > from + 1 ? [{ kind: 'skill', span: [from + 1, to] }] : [];
+  }
+  const spans: InjectSpan[] = [];
+  let at = 0;
+  for (;;) {
+    const open = text.indexOf(ELEMENT[0], at);
+    if (open === -1) break;
+    const close = text.indexOf(ELEMENT[1], open);
+    if (close === -1) break;
+    spans.push({ kind: 'element', span: [open + ELEMENT[0].length, close] });
+    at = close + ELEMENT[1].length;
+  }
+  for (const match of text.matchAll(PASTE_OPEN)) {
+    const from = (match.index ?? 0) + match[0].length;
+    const close = text.indexOf(PASTE_CLOSE, from);
+    if (close !== -1) spans.push({ kind: 'paste', span: [from, close] });
+  }
+  spans.sort((a, b) => a.span[0] - b.span[0]);
+  if (spans.length === 0 && text.length >= LONG_USER_CHARS) spans.push({ kind: 'long', span: [0, text.length] });
+  return spans;
+}
+
+/**
+ * A prompt row's text as the goal should read it: a skill body gives only its `ARGUMENTS:` (what
+ * the user typed after the command), and element and paste blocks are left out. A `long` row is
+ * kept, since nothing marks which part of it was typed.
+ */
+export function goalText(text: string): string {
+  if (text.trimStart().startsWith(SKILL_HEAD)) {
+    const args = text.lastIndexOf(SKILL_ARGS);
+    return args === -1 ? '' : text.slice(args + SKILL_ARGS.length).trim();
+  }
+  const spans = injectedSpans(text).filter((s) => s.kind !== 'long');
+  let out = '';
+  let at = 0;
+  for (const { span } of spans) {
+    out += text.slice(at, span[0]);
+    at = span[1];
+  }
+  return (out + text.slice(at)).trim();
+}
+
 /** The last three prompts the user typed, as the default `goal`. */
 export function goalFromMessages(messages: readonly Message[]): string {
   return messages
@@ -315,10 +377,11 @@ export function goalFromMessages(messages: readonly Message[]): string {
         message.role === 'user' &&
         message.text.trim().length > 0 &&
         (message.toolResults ?? []).length === 0 &&
-        !isMachineText(message.text),
+        !isMachineText(message.text) &&
+        goalText(message.text).length > 0,
     )
     .slice(-3)
-    .map((message) => truncate(message.text, 500))
+    .map((message) => truncate(goalText(message.text), 500))
     .join('\n');
 }
 

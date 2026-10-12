@@ -76,6 +76,24 @@
       "description": "A tool result outside the newest messages that Jev keeps whole is still cut to its first this many characters, with the full text archived and cited; 0 disables.",
       "default": 4000
     },
+    "injectTrim": {
+      "type": "boolean",
+      "title": "Fold old skill bodies, element selections and pastes when trimming falls short",
+      "description": "On by default: when trimming cuts less than the minimum, fold old skill bodies, browser element selections, pasted content and long user messages that Jev scores as stale to a short head and a marker; each original is archived and cited. Text you typed around them and your last three prompts are never changed. Needs archiveResults.",
+      "default": true
+    },
+    "replyTrim": {
+      "type": "boolean",
+      "title": "Trim old assistant replies on every compaction",
+      "description": "On by default: also trim old assistant replies when tool compaction already reaches the minimum, dropping only the clauses Jev is most sure are filler. Every trimmed reply is archived and cited. Needs proseTrim and archiveResults.",
+      "default": true
+    },
+    "exchangeDrop": {
+      "type": "boolean",
+      "title": "Archive the work of finished exchanges as the last trim step",
+      "description": "On by default: when every other trim falls short, archive the tool calls and replies of old exchanges Jev scores as no longer needed and leave a one-line note; your prompt in each exchange stays word for word. Runs before any built-in summary. Needs archiveResults.",
+      "default": true
+    },
     "hybridSummary": {
       "type": "boolean",
       "title": "Summarize only the older history when trimming falls short",

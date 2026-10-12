@@ -27,6 +27,7 @@ import {
 } from '../src/prose.js';
 import { redactCompactionState, redactText } from '../src/redact.js';
 import { estimateTokens, goalFromMessages } from '../src/state.js';
+import type { InjectStats } from '../src/inject.js';
 import { failedProseStats, trimRescue } from '../src/trim.js';
 import type {
   CompactOptions,
@@ -68,6 +69,12 @@ const HOOK_DEFAULTS = {
    * Runs only where `builtinFallback` allows the built-in summary.
    */
   hybridSummary: true,
+  /** On by default: when trimming falls short, fold old skill bodies, browser element selections, pastes and long user rows to a head and a marker, archiving each original; typed text around them and the last three prompts stay. Needs `archiveResults`; see `src/inject.ts`. */
+  injectTrim: true,
+  /** On by default: also trim old assistant replies when tool compaction already reaches the minimum, at the mildest prose cut-off. Every prose cut archives the original reply. Needs `proseTrim` and `archiveResults`. */
+  replyTrim: true,
+  /** On by default: as the last trim rung before any built-in summary, archive the work of old exchanges Jev scores as no longer needed, keeping each prompt verbatim; see `src/exchanges.ts`. Needs `archiveResults`. */
+  exchangeDrop: true,
 };
 
 
@@ -105,6 +112,12 @@ export type HookConfig = CompactOptions & {
   inputTrim: boolean;
   /** See `HOOK_DEFAULTS.hybridSummary`. */
   hybridSummary: boolean;
+  /** See `HOOK_DEFAULTS.injectTrim`. */
+  injectTrim: boolean;
+  /** See `HOOK_DEFAULTS.replyTrim`. */
+  replyTrim: boolean;
+  /** See `HOOK_DEFAULTS.exchangeDrop`. */
+  exchangeDrop: boolean;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -190,6 +203,12 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       typeof options['inputTrim'] === 'boolean' ? options['inputTrim'] : HOOK_DEFAULTS.inputTrim,
     hybridSummary:
       typeof options['hybridSummary'] === 'boolean' ? options['hybridSummary'] : HOOK_DEFAULTS.hybridSummary,
+    injectTrim:
+      typeof options['injectTrim'] === 'boolean' ? options['injectTrim'] : HOOK_DEFAULTS.injectTrim,
+    replyTrim:
+      typeof options['replyTrim'] === 'boolean' ? options['replyTrim'] : HOOK_DEFAULTS.replyTrim,
+    exchangeDrop:
+      typeof options['exchangeDrop'] === 'boolean' ? options['exchangeDrop'] : HOOK_DEFAULTS.exchangeDrop,
     ...(typeof options['dedupeRepeats'] === 'boolean'
       ? { dedupeRepeats: options['dedupeRepeats'] }
       : {}),
@@ -484,6 +503,9 @@ export type ProseOutcome = { cutoff?: number; stats: ProseStats };
 /** What the notification-trim rescue did: the rung it settled on, or none when no rung reached the minimum or the stage failed. */
 export type NotificationOutcome = { rung?: Rung; stats: NotificationStats };
 
+/** What the injected-content rescue did: the rung it settled on, or none when no rung reached the minimum or the stage failed. */
+export type InjectOutcome = { rung?: Rung; stats: InjectStats };
+
 export type SessionCompaction = {
   result: CompactResult;
   messages: SessionMessage[];
@@ -491,6 +513,8 @@ export type SessionCompaction = {
   prose?: ProseOutcome;
   /** Set only when `notificationTrim` is on, an archive writer is given and tool compaction fell short. */
   notifications?: NotificationOutcome;
+  /** Set only when `injectTrim` is on, an archive writer is given and tool compaction fell short. */
+  injected?: InjectOutcome;
 };
 
 const ARCHIVE_DIR = '.claude/fast-jev-compaction';
@@ -591,15 +615,16 @@ export async function compactSession(
   const tool = { result, messages: toSessionMessages(messages, result.messages) };
   const trimNotifications =
     (config.notificationTrim ?? HOOK_DEFAULTS.notificationTrim) && archive !== undefined;
+  const trimInjected = (config.injectTrim ?? HOOK_DEFAULTS.injectTrim) && archive !== undefined;
   const finish = (out: SessionCompaction): SessionCompaction =>
     (config.stripHandles ?? HOOK_DEFAULTS.stripHandles)
       ? { ...out, messages: resumeSafeMessages(out.messages) }
       : out;
-  if ((!config.proseTrim && !trimNotifications) || reductionRatio(result) >= config.minReductionRatio) {
+  if ((!config.proseTrim && !trimNotifications && !trimInjected) || reductionRatio(result) >= config.minReductionRatio) {
     return finish(tool);
   }
   const rescue =
-    trimNotifications && archive
+    (trimNotifications || trimInjected) && archive
       ? await rescueWithTrim(messages, result, asker, config, archive)
       : await rescueWithProse(messages, result, asker, config, archive);
   if (archive) await archive.flush();
@@ -663,18 +688,21 @@ async function rescueWithTrim(
     asker,
     options: resolveOptions(config),
     proseTrim: config.proseTrim,
+    notificationTrim: config.notificationTrim ?? HOOK_DEFAULTS.notificationTrim,
+    injectTrim: config.injectTrim ?? HOOK_DEFAULTS.injectTrim,
     minRatio: config.minReductionRatio,
     archive,
     pathOf: archive.pathOf,
   });
   if (!rescue) return out;
-  const { prose, notified } = rescue.applied;
+  const { prose, notified, injected } = rescue.applied;
   const lastProse = PROSE_KEEP_LADDER[PROSE_KEEP_LADDER.length - 1] as number;
   return {
     result: rescue.result,
     messages: toSessionMessages(messages, rescue.result.messages),
     ...(prose ? { prose: { cutoff: rescue.rung === 'all' ? lastProse : rescue.rung, stats: prose.stats } } : out.prose ? { prose: out.prose } : {}),
-    ...(notified ? { notifications: { rung: rescue.rung, stats: notified.stats } } : { notifications: out.notifications }),
+    ...(notified ? { notifications: { rung: rescue.rung, stats: notified.stats } } : out.notifications ? { notifications: out.notifications } : {}),
+    ...(injected ? { injected: { rung: rescue.rung, stats: injected.stats } } : out.injected ? { injected: out.injected } : {}),
   };
 }
 
@@ -686,6 +714,7 @@ export function summarize(
   result: CompactResult,
   prose?: ProseOutcome,
   notifications?: NotificationOutcome,
+  injected?: InjectOutcome,
 ): string {
   const { stats } = result;
   const parts = [
@@ -710,6 +739,10 @@ export function summarize(
     notifications?.rung === undefined
       ? ''
       : `; notification trim at ${notifications.rung}: ${notifications.stats.folded} folded, ${notifications.stats.stripped} stripped, ${notifications.stats.charsSaved} chars`
+  }${
+    injected?.rung === undefined
+      ? ''
+      : `; injected-content fold at ${injected.rung}: ${injected.stats.folded} folded, ${injected.stats.charsSaved} chars`
   }`;
 }
 
@@ -982,7 +1015,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         inertNoticeLogged = true;
         log($, 'notification trim skipped: archiveResults is off');
       }
-      const { result, messages, prose, notifications } = await compactSession(
+      const { result, messages, prose, notifications, injected } = await compactSession(
         event.messages,
         config,
         async (url, init) => {
@@ -995,7 +1028,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) log($, line);
       if (reductionRatio(result) < config.minReductionRatio) {
-        const tried = `${prose ? ', prose trim tried' : ''}${notifications ? ', notification trim tried' : ''}${
+        const tried = `${prose ? ', prose trim tried' : ''}${notifications ? ', notification trim tried' : ''}${injected ? ', injected-content fold tried' : ''}${
           target > configured.minReductionRatio ? `, history needs ${percent(target)} to free ${percent(configured.minReductionRatio)} of context` : ''
         }`;
         if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
@@ -1028,7 +1061,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       log($, `kept history ~${messageTokens(messages)} tokens of ~${historyTokens}`);
       notify(
         $,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose, notifications)})`,
+        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose, notifications, injected)})`,
       );
       return { messages };
     } catch (error) {

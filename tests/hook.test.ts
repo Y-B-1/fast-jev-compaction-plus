@@ -90,6 +90,9 @@ describe('hook config', () => {
       stripHandles: true,
       inputTrim: true,
       hybridSummary: true,
+      injectTrim: true,
+      replyTrim: true,
+      exchangeDrop: true,
     });
     expect(
       resolveHookConfigLib({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g' }),
@@ -108,6 +111,14 @@ describe('hook config', () => {
       stripHandles: true,
       inputTrim: true,
       hybridSummary: true,
+      injectTrim: true,
+      replyTrim: true,
+      exchangeDrop: true,
+    });
+    expect(resolveHookConfig({ injectTrim: false, replyTrim: false, exchangeDrop: 'no' })).toMatchObject({
+      injectTrim: false,
+      replyTrim: false,
+      exchangeDrop: true,
     });
   });
 
