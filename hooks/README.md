@@ -60,9 +60,20 @@ The plugin declares these `userConfig` values in
 | `salvageChars` | `150` |
 | `maxKeptResultChars` | `4000` |
 | `inputTrim` | `true` |
+| `hybridSummary` | `true` |
 | `jevPruneBashOutput` | `false` |
 | `jevPruneMinChars` | `4000` |
 | `model` | `jev-latest` |
+
+When trimming frees less than the minimum and `builtinFallback` allows the
+built-in summary, the hook first tries a hybrid (`hybridSummary`, on by
+default): it splits the trimmed history at the earliest user turn whose tail
+is at most 30% of the original history (less when the minimum is high), hands
+only the part before it to the built-in summarizer (`next({ ...e, messages })`),
+and returns that summary followed by the recent turns as trimmed. The split is
+always at a user message with text, so no tool call is separated from its
+result. When no user turn qualifies, the whole history goes to the built-in
+summary as before.
 
 Each compaction logs what the model reads before it, from Claude Code's own
 Messages API view (`$.session.messages({ as: 'api' })`): estimated tokens of
@@ -75,7 +86,7 @@ through `TYPESAFE_API_KEY`. The environment variable is the recommended
 development setup.
 
 Every option except `apiKey`, `archiveResults`, `minReductionRatio`,
-`jevPruneBashOutput`, `jevPruneMinChars`, `inputTrim` and `model` is passed straight to the
+`jevPruneBashOutput`, `jevPruneMinChars`, `inputTrim`, `hybridSummary` and `model` is passed straight to the
 library; see the root README for what they do. The `session.compact` hook runs the Jev requests concurrently. If Jev fails,
 the response is malformed, the key is unavailable, the history cannot be
 fitted into the state budget, or the estimated reduction is below

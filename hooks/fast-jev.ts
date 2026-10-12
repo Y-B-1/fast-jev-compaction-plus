@@ -61,6 +61,13 @@ const HOOK_DEFAULTS = {
   stripHandles: true,
   /** On by default: cut the code bodies of old tool inputs (Write/Edit contents, Bash heredocs) on every compaction, by rule; see `elideInputs`. */
   inputTrim: true,
+  /**
+   * On by default: when trimming alone frees too little, have the built-in
+   * summarizer summarize only the older part of the history and keep the
+   * recent turns trimmed, instead of summarizing everything; see `hybridSplit`.
+   * Runs only where `builtinFallback` allows the built-in summary.
+   */
+  hybridSummary: true,
 };
 
 
@@ -96,6 +103,8 @@ export type HookConfig = CompactOptions & {
   stripHandles: boolean;
   /** See `HOOK_DEFAULTS.inputTrim`. */
   inputTrim: boolean;
+  /** See `HOOK_DEFAULTS.hybridSummary`. */
+  hybridSummary: boolean;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -179,6 +188,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
         : HOOK_DEFAULTS.stripHandles,
     inputTrim:
       typeof options['inputTrim'] === 'boolean' ? options['inputTrim'] : HOOK_DEFAULTS.inputTrim,
+    hybridSummary:
+      typeof options['hybridSummary'] === 'boolean' ? options['hybridSummary'] : HOOK_DEFAULTS.hybridSummary,
     ...(typeof options['dedupeRepeats'] === 'boolean'
       ? { dedupeRepeats: options['dedupeRepeats'] }
       : {}),
@@ -809,6 +820,30 @@ export function messageTarget(contextTokens: number | undefined, historyTokens: 
 }
 
 /** An interrupted dispatch is vetoed quietly: no summary, nothing replaced. */
+/** Share of the original history the kept recent turns may take in a hybrid rescue. */
+export const HYBRID_RECENT_SHARE = 0.3;
+/** Share of the original history reserved for the summary of the older part. */
+const HYBRID_SUMMARY_ALLOWANCE = 0.1;
+
+/**
+ * Where to split `messages` for a hybrid rescue: the earliest user turn (a
+ * user message with text and no tool results, so no tool call is separated
+ * from its result) whose tail, from there to the end, is at most `share` of
+ * `historyTokens`. 0 when no turn after the first qualifies.
+ */
+export function hybridSplit(messages: readonly Message[], historyTokens: number, share: number): number {
+  const limit = share * historyTokens;
+  let tail = 0;
+  let split = 0;
+  for (let i = messages.length - 1; i > 0; i -= 1) {
+    tail += messageTokens([messages[i]!]);
+    if (tail > limit) break;
+    const m = messages[i]!;
+    if (m.role === 'user' && m.text.trim() !== '' && (m.toolResults?.length ?? 0) === 0) split = i;
+  }
+  return split;
+}
+
 export type ContextBreakdown = {
   userText: number;
   assistantText: number;
@@ -969,6 +1004,20 @@ export const register: Register = (on: On, options: PluginOptions) => {
             `skipped (below ${percent(configured.minReductionRatio)} minimum${tried}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result)})`,
           );
           return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
+        }
+        const share = Math.min(HYBRID_RECENT_SHARE, 1 - target - HYBRID_SUMMARY_ALLOWANCE);
+        const split = config.hybridSummary && share > 0 ? hybridSplit(messages, historyTokens, share) : 0;
+        if (split > 0) {
+          const summarized = await next({ ...event, messages: messages.slice(0, split) });
+          if (next.signal.aborted) return interrupted($);
+          if (summarized.skip !== undefined) return summarized;
+          const recent = messages.slice(split);
+          log($, `hybrid: summarized ${split} older messages, kept ${recent.length} recent (~${messageTokens(recent)} tokens)`);
+          notify(
+            $,
+            `summarized ${split} older messages, kept ${recent.length} recent (trim alone below ${percent(configured.minReductionRatio)} minimum${tried}: ${summarize(result)})`,
+          );
+          return { messages: [...summarized.messages, ...recent] };
         }
         notify(
           $,

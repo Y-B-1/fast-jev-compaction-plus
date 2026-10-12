@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { compactSession, contextBreakdown, formatBreakdown, resolveHookConfig } from '../hooks/fast-jev.ts';
+import {
+  compactSession,
+  contextBreakdown,
+  formatBreakdown,
+  hybridSplit,
+  messageTokens,
+  register,
+  resolveHookConfig,
+} from '../hooks/fast-jev.ts';
 import { COMPACTED_MARKER } from '../src/dedupe.js';
 import { elideBody } from '../src/prose.js';
 import { estimateTokens } from '../src/state.js';
@@ -180,5 +188,104 @@ describe('context breakdown', () => {
     });
     expect(b.images).toBe(1);
     expect(formatBreakdown(b)).toMatch(/^user text ~\d+, assistant text ~\d+, thinking ~\d+, tool inputs ~\d+, tool results ~\d+, images 1$/);
+  });
+});
+
+describe('hybrid rescue: built-in summary of the older part only', () => {
+  const MID = 'kept output line\n'.repeat(200); // 3,400 chars: under the kept-result cap
+  const turn = (n: number): SessionMessage[] => [
+    message('user', `Step ${n}: keep going on the cache work.`),
+    call(`r${n}`, 'Read', { file_path: `f${n}` }, MID),
+    result(`r${n}`, MID),
+    message('assistant', `Done with step ${n}.`),
+  ];
+  const transcript = (): SessionMessage[] => [1, 2, 3, 4, 5, 6, 7, 8].flatMap(turn);
+  const SUMMARY = message('user', 'Summary of the earlier work.', { handle: 'summary' });
+  const setup = (options: Record<string, unknown> = {}, trigger = 'auto') => {
+    const hooks: Record<string, (...args: any[]) => Promise<any>> = {};
+    (register as any)(
+      (event: string, a: unknown, b?: any) => {
+        hooks[event] = typeof b === 'function' ? b : (a as any);
+      },
+      { apiKey: 'k', preserveRecentMessages: 2, archiveResults: false, ...options },
+    );
+    const toasts: string[] = [];
+    const calls: SessionMessage[][] = [];
+    const $ = {
+      // A sleep that only ends on abort: the request timeout never fires first.
+      clock: {
+        sleep: (_ms: number, o?: { signal?: AbortSignal }) =>
+          new Promise<void>((_r, reject) => o?.signal?.addEventListener('abort', () => reject(o.signal?.reason), { once: true })),
+      },
+      http: { fetch: async (url: string, init?: { body?: string }) => jevFetch(() => 0.99)(url, init) },
+      ui: { log: () => {}, toast: (t: string) => toasts.push(t) },
+    };
+    const next = Object.assign(
+      async (e: { messages: SessionMessage[] }) => {
+        calls.push(e.messages);
+        return { messages: [SUMMARY] };
+      },
+      { signal: new AbortController().signal, budget: { ms: 10_000, remainingMs: 10_000 } },
+    );
+    return { run: () => hooks['session.compact']!($, { trigger, messages: transcript() }, next), toasts, calls };
+  };
+
+  it('summarizes only the older turns and keeps the recent ones after the summary', async () => {
+    const on = setup();
+    const out = await on.run();
+    expect(on.calls).toHaveLength(1);
+    const older = on.calls[0]!;
+    expect(older.length).toBeGreaterThan(0);
+    expect(older.length).toBeLessThan(transcript().length);
+    expect(out.messages[0]).toBe(SUMMARY);
+    const recent = out.messages.slice(1) as SessionMessage[];
+    expect(recent[0]!.role).toBe('user');
+    expect(recent[0]!.text).toMatch(/^Step \d: /);
+    expect(recent.at(-1)!.text).toBe('Done with step 8.');
+    expect(on.toasts[0]).toMatch(/^summarized 24 older messages, kept 8 recent \(trim alone below 25% minimum, prose trim tried: \d+% reduction; /);
+  });
+
+  it('splits only at a user turn, so no tool call is separated from its result', async () => {
+    const on = setup();
+    await on.run();
+    const older = on.calls[0]!;
+    const ids = (ms: SessionMessage[], f: (m: SessionMessage) => string[]) => new Set(ms.flatMap(f));
+    const uses = ids(older, (m) => m.toolUses.map((t) => t.tool_use_id));
+    const results = ids(older, (m) => (m.toolResults ?? []).map((r) => r.tool_use_id));
+    expect([...uses].sort()).toEqual([...results].sort());
+  });
+
+  it('falls back to the full built-in summary when hybridSummary is off', async () => {
+    const on = setup({ hybridSummary: false });
+    await on.run();
+    expect(on.calls[0]).toHaveLength(transcript().length);
+    expect(on.toasts[0]).toMatch(/^fallback to built-in summary \(below 25% minimum/);
+  });
+
+  it('never summarizes when the built-in fallback is not allowed for the trigger', async () => {
+    const on = setup({ builtinFallback: 'never' });
+    const out = await on.run();
+    expect(on.calls).toHaveLength(0);
+    expect(out.skip).toMatch(/builtin fallback disabled/);
+  });
+});
+
+describe('hybridSplit', () => {
+  const turn = (n: number, size: number): SessionMessage[] => [
+    message('user', `turn ${n}`),
+    call(`c${n}`, 'Read', { file_path: 'x' }, 'y'.repeat(size)),
+    result(`c${n}`, 'y'.repeat(size)),
+  ];
+  it('returns the earliest user turn whose tail fits the share', () => {
+    const ms = [...turn(1, 4000), ...turn(2, 4000), ...turn(3, 1000), ...turn(4, 1000)];
+    expect(hybridSplit(ms, messageTokens(ms), 0.3)).toBe(6);
+  });
+  it('returns 0 when no user turn leaves a tail that fits', () => {
+    const ms = [...turn(1, 100), ...turn(2, 9000)];
+    expect(hybridSplit(ms, messageTokens(ms), 0.3)).toBe(0);
+  });
+  it('never returns 0 as a split of the first message', () => {
+    const ms = turn(1, 100);
+    expect(hybridSplit(ms, messageTokens(ms), 0.99)).toBe(0);
   });
 });

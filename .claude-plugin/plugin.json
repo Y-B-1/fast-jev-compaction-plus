@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
@@ -75,6 +75,12 @@
       "title": "Cap on tool results Jev keeps whole",
       "description": "A tool result outside the newest messages that Jev keeps whole is still cut to its first this many characters, with the full text archived and cited; 0 disables.",
       "default": 4000
+    },
+    "hybridSummary": {
+      "type": "boolean",
+      "title": "Summarize only the older history when trimming falls short",
+      "description": "On by default: when trimming frees less than the minimum, the built-in summarizer summarizes only the older part of the history and the recent turns stay as trimmed (at most 30% of the history), instead of summarizing everything. Runs only where builtinFallback allows the built-in summary.",
+      "default": true
     },
     "inputTrim": {
       "type": "boolean",

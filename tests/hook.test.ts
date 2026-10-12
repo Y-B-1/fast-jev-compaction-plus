@@ -89,6 +89,7 @@ describe('hook config', () => {
       jevPruneMinChars: 4_000,
       stripHandles: true,
       inputTrim: true,
+      hybridSummary: true,
     });
     expect(
       resolveHookConfigLib({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g' }),
@@ -106,6 +107,7 @@ describe('hook config', () => {
       jevPruneMinChars: 4_000,
       stripHandles: true,
       inputTrim: true,
+      hybridSummary: true,
     });
   });
 
@@ -1028,7 +1030,7 @@ describe('proseTrim rescue', () => {
 
     it('falls back, saying trim was tried, when no cut-off reaches the minimum', async () => {
       const event = { trigger: 'auto', messages: proseTranscript() };
-      const on = hook({ proseTrim: true }, fetchWith(0.9));
+      const on = hook({ proseTrim: true, hybridSummary: false }, fetchWith(0.9));
       expect(await on.run(event)).toBe(event);
       expect(on.toasts[0]).toMatch(/^fallback to built-in summary \(below 25% minimum, prose trim tried: /);
       const never = hook({ proseTrim: true, builtinFallback: 'never' }, fetchWith(0.9));
@@ -1038,10 +1040,10 @@ describe('proseTrim rescue', () => {
 
     it('falls back when the prose stage fails, and says nothing about trim with proseTrim off', async () => {
       const event = { trigger: 'auto', messages: proseTranscript() };
-      const failed = hook({ proseTrim: true }, fetchWith('fail'));
+      const failed = hook({ proseTrim: true, hybridSummary: false }, fetchWith('fail'));
       expect(await failed.run(event)).toBe(event);
       expect(failed.toasts[0]).toContain('prose trim tried');
-      const off = hook({ proseTrim: false, notificationTrim: false }, fetchWith(0.1));
+      const off = hook({ proseTrim: false, notificationTrim: false, hybridSummary: false }, fetchWith(0.1));
       expect(await off.run(event)).toBe(event);
       expect(off.toasts[0]).not.toContain('prose');
     });
