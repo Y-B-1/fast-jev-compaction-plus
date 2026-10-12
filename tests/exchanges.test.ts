@@ -70,6 +70,19 @@ describe('findExchanges', () => {
     const withArgs = session();
     withArgs.splice(4, 0, typed('<command-message>review</command-message>\n<command-name>/review</command-name>\n<command-args>focus on the parser</command-args>'));
     expect(findExchanges(withArgs, 2).map((e) => e.prompt)).toEqual([7]);
+    const angled = session();
+    angled.splice(4, 0, typed('<command-name>/review</command-name>\n<command-args><Button> props are wrong</command-args>'));
+    expect(findExchanges(angled, 2).map((e) => e.prompt)).toEqual([7]);
+    const emptyArgs = session();
+    emptyArgs.splice(4, 0, typed('<command-name>/clear</command-name>\n<command-args> </command-args>'));
+    expect(findExchanges(emptyArgs, 2).map((e) => e.prompt)).toEqual([2, 7]);
+    const queued = '<system-reminder>\nThe user sent a new message while you were working:\nstop touching the cache\n</system-reminder>';
+    const inRow = session();
+    inRow.splice(4, 0, typed(queued));
+    expect(findExchanges(inRow, 2).map((e) => e.prompt)).toEqual([7]);
+    const inResult = session();
+    inResult[4] = { ...inResult[4]!, toolResults: [{ tool_use_id: 't1', text: `${BIG}\n${queued}`, isError: false }] };
+    expect(findExchanges(inResult, 2).map((e) => e.prompt)).toEqual([6]);
   });
 
   it('renders every row of the exchange into the archive text', () => {

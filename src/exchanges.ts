@@ -53,11 +53,14 @@ export type ExchangeApplied = {
 /**
  * The exchanges that may be dropped: the prompt is not one of the goal's prompts, every row is
  * outside the pinned recent window, there are at least two work rows, no work row holds typed text
- * (a `!` command or slash-command arguments), and every tool call in the
+ * (`TYPED_WORK`), and every tool call in the
  * work rows has its result there too (and the other way round).
  */
-/** A work row carrying text the user typed: a `!` shell command or a slash command's arguments. */
-const TYPED_WORK = /<bash-input>|<command-args>\s*[^<\s]/;
+/**
+ * Text the user typed inside a work row: a `!` shell command, a slash command's non-empty
+ * arguments, or a message sent while a turn was running (delivered as a system reminder).
+ */
+const TYPED_WORK = /<bash-input>|<command-args>(?!\s*<\/command-args>)|The user sent a new message while you were working:/;
 
 export function findExchanges(messages: readonly Message[], preserveRecentMessages: number): Exchange[] {
   const goal = goalIndices(messages);
@@ -76,7 +79,7 @@ export function findExchanges(messages: readonly Message[], preserveRecentMessag
     const tools = new Map<string, number>();
     for (let i = from; i < to; i++) {
       const m = messages[i] as Message;
-      if (m.role === 'user' && TYPED_WORK.test(m.text)) return;
+      if (m.role === 'user' && [m.text, ...(m.toolResults ?? []).map((r) => r.text)].some((t) => TYPED_WORK.test(t))) return;
       for (const use of m.toolUses) {
         uses.add(use.tool_use_id);
         tools.set(use.tool, (tools.get(use.tool) ?? 0) + 1);
