@@ -3,7 +3,7 @@ import { compactSession, contextBreakdown, formatBreakdown, resolveHookConfig } 
 import { COMPACTED_MARKER } from '../src/dedupe.js';
 import { elideBody } from '../src/prose.js';
 import { estimateTokens } from '../src/state.js';
-import { compact, resolveOptions, type JevAsker, type Message } from '../src/index.js';
+import { compact, messageChars, resolveOptions, type JevAsker, type Message } from '../src/index.js';
 
 type SessionMessage = Message & { handle?: string };
 
@@ -134,6 +134,17 @@ describe('inputTrim', () => {
     const on = await compactSession(session(), config(), jevFetch(() => 0.01));
     const off = await compactSession(session(), config({ inputTrim: false }), jevFetch(() => 0.01));
     expect(on.result.stats.charsAfter).toBeLessThan(off.result.stats.charsAfter - 3000);
+  });
+
+  it('measures charsAfter on the trimmed messages, quotes and newlines included', async () => {
+    const quoted = 'const s = "a\tb";\n'.repeat(300);
+    const messages = session().map((m) =>
+      m.toolUses.some((t) => t.tool_use_id === 'w1')
+        ? call('w1', 'Write', { file_path: 'src/app.ts', content: quoted }, 'ok')
+        : m,
+    );
+    const out = await compactSession(messages, config(), jevFetch(() => 0.01));
+    expect(out.result.stats.charsAfter).toBe(out.result.messages.reduce((sum, m) => sum + messageChars(m), 0));
   });
 });
 

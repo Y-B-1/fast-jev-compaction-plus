@@ -7,7 +7,7 @@ import type {
   ToolUseSummary,
 } from 'claude-code';
 
-import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
+import { compact, messageChars, reductionRatio, resolveOptions } from '../src/compact.js';
 import { trimOutput } from '../src/output.js';
 import {
   buildJevRequest,
@@ -572,7 +572,7 @@ export async function compactSession(
       result = {
         ...result,
         messages: cut.messages,
-        stats: { ...result.stats, charsAfter: result.stats.charsAfter - cut.saved, inputsElided: cut.fields },
+        stats: { ...result.stats, charsAfter: cut.messages.reduce((sum, m) => sum + messageChars(m), 0), inputsElided: cut.fields },
       };
     }
   }
