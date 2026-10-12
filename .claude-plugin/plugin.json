@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
@@ -84,14 +84,20 @@
     },
     "replyTrim": {
       "type": "boolean",
-      "title": "Trim old assistant replies on every compaction",
-      "description": "On by default: also trim old assistant replies when tool compaction already reaches the minimum, dropping only the clauses Jev is most sure are filler. Every trimmed reply is archived and cited. Needs proseTrim and archiveResults.",
+      "title": "Archive stale old steps on every compaction",
+      "description": "On by default: on every compaction, archive whole old steps (replies, finished tool runs) before your last prompt that Jev is most sure are no longer needed. Each becomes one row naming its archive file. Replies are never cut mid-sentence. Needs archiveResults.",
       "default": true
     },
     "exchangeDrop": {
       "type": "boolean",
       "title": "Archive the work of finished exchanges as the last trim step",
       "description": "On by default: when every other trim falls short, archive the tool calls and replies of old exchanges Jev scores as no longer needed and leave a one-line note; your prompt in each exchange stays word for word. Runs before any built-in summary. Needs archiveResults.",
+      "default": true
+    },
+    "stepTrim": {
+      "type": "boolean",
+      "title": "Archive old steps by Jev score as the last trim stage",
+      "description": "On by default: when every other trim falls short, archive old steps Jev scores lowest, then the lowest-scored steps of the current task, until the minimum is met. Your prompt text is never changed. The built-in summary then runs only when Jev fails. Needs archiveResults.",
       "default": true
     },
     "hybridSummary": {

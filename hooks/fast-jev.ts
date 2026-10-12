@@ -16,11 +16,11 @@ import {
   parseJevResponse,
   retryDelayMs,
 } from '../src/request.js';
-import { type ExchangeStats, exchangeLadder, scoreExchanges } from '../src/exchanges.js';
+import { type ExchangeStats, applyExchanges, exchangeLadder, scoreExchanges } from '../src/exchanges.js';
+import { type StepOutcome, type StepStats, mildSteps, scoreSteps, stepLadder } from '../src/steps.js';
 import type { NotificationStats, Rung } from '../src/notifications.js';
 import {
   PROSE_KEEP_LADDER,
-  applyProse,
   callActions,
   elideInputs,
   ladderRescue,
@@ -73,10 +73,12 @@ const HOOK_DEFAULTS = {
   hybridSummary: true,
   /** On by default: when trimming falls short, fold old skill bodies, browser element selections, pastes and long user rows to a head and a marker, archiving each original; typed text around them and the last three prompts stay. Needs `archiveResults`; see `src/inject.ts`. */
   injectTrim: true,
-  /** On by default: also trim old assistant replies when tool compaction already reaches the minimum, at the mildest prose cut-off. Every prose cut archives the original reply. Needs `proseTrim` and `archiveResults`. */
+  /** On by default: when tool compaction already reaches the minimum, also archive old replies and work steps before the last prompt that Jev scores below the mildest cut-off; and archive each prose cut's original reply. Needs `archiveResults`; see `src/steps.ts`. */
   replyTrim: true,
   /** On by default: as the last trim rung before any built-in summary, archive the work of old exchanges Jev scores as no longer needed, keeping each prompt verbatim; see `src/exchanges.ts`. Needs `archiveResults`. */
   exchangeDrop: true,
+  /** On by default: the last stage before any built-in summary. Archives single steps of work (a tool call with its result, a reply, a host reminder) Jev scores lowest, first before the last prompt, then the current task's oldest, until the minimum is met. Prompts, row 0 and the recent rows stay. Needs `archiveResults`; see `src/steps.ts`. */
+  stepTrim: true,
 };
 
 
@@ -120,6 +122,8 @@ export type HookConfig = CompactOptions & {
   replyTrim: boolean;
   /** See `HOOK_DEFAULTS.exchangeDrop`. */
   exchangeDrop: boolean;
+  /** Absent unless the user set it; read as `HOOK_DEFAULTS.stepTrim` (true) then. */
+  stepTrim?: boolean;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -211,6 +215,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       typeof options['replyTrim'] === 'boolean' ? options['replyTrim'] : HOOK_DEFAULTS.replyTrim,
     exchangeDrop:
       typeof options['exchangeDrop'] === 'boolean' ? options['exchangeDrop'] : HOOK_DEFAULTS.exchangeDrop,
+    ...(typeof options['stepTrim'] === 'boolean' ? { stepTrim: options['stepTrim'] } : {}),
     ...(typeof options['dedupeRepeats'] === 'boolean'
       ? { dedupeRepeats: options['dedupeRepeats'] }
       : {}),
@@ -519,7 +524,12 @@ export type SessionCompaction = {
   injected?: InjectOutcome;
   /** Set only when `exchangeDrop` is on, an archive writer is given and every earlier stage fell short. */
   exchanges?: ExchangeOutcome;
+  /** Set when step trim ran: as the last stage, or as reply cleanup on a compaction that already met the minimum. */
+  steps?: StepsOutcome;
 };
+
+/** What step trim did: the pass and cut-off it settled on, or neither when it fell short or failed. */
+export type StepsOutcome = { pass?: StepOutcome['pass']; cutoff?: number; stats: StepStats };
 
 /** What the exchange drop did: the cut-off it settled on, or none when no cut-off reached the minimum or the stage failed. */
 export type ExchangeOutcome = { cutoff?: number; stats: ExchangeStats };
@@ -627,31 +637,76 @@ export async function compactSession(
     (config.stripHandles ?? HOOK_DEFAULTS.stripHandles)
       ? { ...out, messages: resumeSafeMessages(out.messages) }
       : out;
-  if (reductionRatio(result) >= config.minReductionRatio) {
-    if (!(config.replyTrim ?? HOOK_DEFAULTS.replyTrim) || !config.proseTrim || !archive) return finish(tool);
-    const reply = await trimReplies(messages, result, asker, config, archive);
-    if (reply.result) await archive.flush();
-    return finish({ ...tool, ...reply });
-  }
   const dropping = (config.exchangeDrop ?? HOOK_DEFAULTS.exchangeDrop) && archive !== undefined;
+  const stepping = (config.stepTrim ?? HOOK_DEFAULTS.stepTrim) && archive !== undefined;
+  if (reductionRatio(result) >= config.minReductionRatio) {
+    if (!(config.replyTrim ?? HOOK_DEFAULTS.replyTrim) || !archive) return finish(tool);
+    return finish({ ...tool, ...(await trimSteps(messages, result, asker, config, archive, 'mild')) });
+  }
   const trimming = config.proseTrim || trimNotifications || trimInjected;
-  if (!trimming && !dropping) return finish(tool);
-  const rescue: Partial<SessionCompaction> = !trimming
+  if (!trimming && !dropping && !stepping) return finish(tool);
+  const { best, ...rescue }: Partial<SessionCompaction> & { best?: CompactResult } = !trimming
     ? {}
     : (trimNotifications || trimInjected) && archive
       ? await rescueWithTrim(messages, result, asker, config, archive)
       : await rescueWithProse(messages, result, asker, config, archive);
   if (archive) await archive.flush();
-  if (rescue.result || !dropping || !archive) return finish({ ...tool, ...rescue });
-  const exchanges = await dropExchanges(messages, result, asker, config, archive);
-  const tried = exchanges.exchanges.stats.eligible > 0 || exchanges.exchanges.stats.failed !== undefined;
-  return finish({ ...tool, ...rescue, ...(tried ? exchanges : {}) });
+  if (rescue.result || !archive || (!dropping && !stepping)) return finish({ ...tool, ...rescue });
+  // Each later stage builds on the best result so far; what an earlier stage archived stays archived.
+  let base = best ?? result;
+  let out: SessionCompaction = { ...tool, ...rescue };
+  if (dropping) {
+    const dropped = await dropExchanges(messages, base, asker, config, archive);
+    const tried = dropped.exchanges.stats.eligible > 0 || dropped.exchanges.stats.failed !== undefined;
+    if (tried) out = { ...out, exchanges: dropped.exchanges };
+    if (dropped.result) {
+      base = dropped.result;
+      if (reductionRatio(base) >= config.minReductionRatio) return finish({ ...out, result: base, messages: toSessionMessages(messages, base.messages) });
+    }
+  }
+  if (stepping) {
+    const stepped = await trimSteps(messages, base, asker, config, archive, 'ladder');
+    if (stepped.result) return finish({ ...out, ...stepped });
+    out = { ...out, steps: stepped.steps };
+  }
+  return finish(base === result && !best ? out : { ...out, result: base, messages: toSessionMessages(messages, base.messages) });
 }
 
 /**
- * The last stage before the built-in summary: drops old finished exchanges Jev no longer needs,
- * each archived whole first. Applied on tool compaction's result; returns only `exchanges` when no
- * cut-off reaches the minimum or the stage fails, so the caller keeps its earlier result.
+ * Step trim on `result`. `ladder`: the last stage, archiving steps until the minimum is met (see
+ * `stepLadder`). `mild`: reply cleanup on a compaction that already met it (see `mildSteps`).
+ * Returns only `steps` when nothing is archived or the stage failed.
+ */
+async function trimSteps(
+  messages: readonly SessionMessage[],
+  result: CompactResult,
+  asker: JevAsker,
+  config: HookConfig,
+  archive: ArchiveWriter,
+  mode: 'ladder' | 'mild',
+): Promise<Partial<SessionCompaction> & { steps: StepsOutcome }> {
+  const scores = await scoreSteps(result.messages, asker, resolveOptions(config), mode === 'mild' ? (s) => !s.current : undefined);
+  if (scores.stats.failed !== undefined || scores.steps.length === 0) return { steps: { stats: scores.stats } };
+  const picked =
+    mode === 'mild'
+      ? mildSteps(scores, result, (id) => archive.pathOf(id))
+      : stepLadder(scores, result, config.minReductionRatio, (id) => archive.pathOf(id));
+  if (!picked) return { steps: { stats: scores.stats } };
+  for (const item of picked.applied.archived) {
+    if (archive.cite(item.id, item.text) !== item.path) throw new Error(`archive path for ${item.id} is not ${item.path}`);
+  }
+  await archive.flush();
+  return {
+    result: picked.result,
+    messages: toSessionMessages(messages, picked.result.messages),
+    steps: { pass: picked.pass, ...(picked.cutoff !== undefined ? { cutoff: picked.cutoff } : {}), stats: picked.applied.stats },
+  };
+}
+
+/**
+ * Drops old finished exchanges Jev no longer needs, each archived whole first, on the best result
+ * so far. When no cut-off reaches the minimum it still returns the loosest cut-off's result, for
+ * step trim to build on; returns only `exchanges` when nothing drops or the stage fails.
  */
 async function dropExchanges(
   messages: readonly SessionMessage[],
@@ -662,8 +717,15 @@ async function dropExchanges(
 ): Promise<Partial<SessionCompaction> & { exchanges: ExchangeOutcome }> {
   const scores = await scoreExchanges(result.messages, asker, resolveOptions(config));
   if (scores.stats.failed !== undefined || scores.exchanges.length === 0) return { exchanges: { stats: scores.stats } };
-  const ladder = exchangeLadder(scores, result, config.minReductionRatio, (id) => archive.pathOf(id));
-  if (!ladder) return { exchanges: { stats: scores.stats } };
+  let ladder = exchangeLadder(scores, result, config.minReductionRatio, (id) => archive.pathOf(id));
+  if (!ladder) {
+    // Nothing reaches the minimum: keep the loosest cut-off's drops for step trim to build on.
+    const cutoff = PROSE_KEEP_LADDER[PROSE_KEEP_LADDER.length - 1] as number;
+    const applied = applyExchanges(scores, cutoff, (id) => archive.pathOf(id));
+    if (applied.stats.dropped === 0) return { exchanges: { stats: scores.stats } };
+    const charsAfter = applied.messages.reduce((sum, m) => sum + messageChars(m), 0);
+    ladder = { cutoff, result: { ...result, messages: applied.messages, stats: { ...result.stats, charsAfter } }, applied };
+  }
   for (const item of ladder.applied.archived) {
     if (archive.cite(item.id, item.text) !== item.path) throw new Error(`archive path for ${item.id} is not ${item.path}`);
   }
@@ -672,47 +734,6 @@ async function dropExchanges(
     result: ladder.result,
     messages: toSessionMessages(messages, ladder.result.messages),
     exchanges: { cutoff: ladder.cutoff, stats: ladder.applied.stats },
-  };
-}
-
-/**
- * Reply trim, for a compaction that already reached the minimum: scores the prose of tool
- * compaction's result once and drops only the clauses below the mildest cut-off, archiving each
- * changed message's original. Returns only `prose` when nothing changed or the stage failed, so
- * the caller keeps tool compaction's result.
- */
-async function trimReplies(
-  messages: readonly SessionMessage[],
-  result: CompactResult,
-  asker: JevAsker,
-  config: HookConfig,
-  archive: ArchiveWriter,
-): Promise<Partial<SessionCompaction> & { prose: ProseOutcome }> {
-  const options = resolveOptions(config);
-  let scores;
-  try {
-    scores = await scoreProse(
-      result.messages,
-      callActions(messages, result.decisions, options.preserveRecentMessages),
-      asker,
-      { ...options, archive: archive.cite },
-    );
-  } catch (error) {
-    return { prose: { stats: failedProseStats(error) } };
-  }
-  if (scores.stats.failed !== undefined) return { prose: { stats: scores.stats } };
-  const cutoff = PROSE_KEEP_LADDER[0] as number;
-  const applied = applyProse(scores, cutoff, (id) => archive.pathOf(id));
-  if (applied.archived.length === 0 && applied.stats.inputsElided === 0) return { prose: { stats: applied.stats } };
-  for (const item of applied.archived) {
-    if (archive.cite(item.id, item.text) !== item.path) throw new Error(`archive path for ${item.id} is not ${item.path}`);
-  }
-  const charsAfter = applied.messages.reduce((sum, m) => sum + messageChars(m), 0);
-  const trimmed = { ...result, messages: applied.messages, stats: { ...result.stats, charsAfter } };
-  return {
-    result: trimmed,
-    messages: toSessionMessages(messages, applied.messages),
-    prose: { cutoff, stats: applied.stats },
   };
 }
 
@@ -769,8 +790,8 @@ async function rescueWithTrim(
   asker: JevAsker,
   config: HookConfig,
   archive: ArchiveWriter,
-): Promise<Partial<SessionCompaction>> {
-  const { out, rescue } = await trimRescue({
+): Promise<Partial<SessionCompaction> & { best?: CompactResult }> {
+  const { out, rescue, best } = await trimRescue({
     messages,
     result,
     asker,
@@ -783,15 +804,15 @@ async function rescueWithTrim(
     archive,
     pathOf: archive.pathOf,
   });
-  if (!rescue) return out;
-  const { prose, notified, injected } = rescue.applied;
+  const chosen = rescue ?? best;
+  if (!chosen) return out;
+  const { prose, notified, injected } = chosen.applied;
   const lastProse = PROSE_KEEP_LADDER[PROSE_KEEP_LADDER.length - 1] as number;
   return {
-    result: rescue.result,
-    messages: toSessionMessages(messages, rescue.result.messages),
-    ...(prose ? { prose: { cutoff: rescue.rung === 'all' ? lastProse : rescue.rung, stats: prose.stats } } : out.prose ? { prose: out.prose } : {}),
-    ...(notified ? { notifications: { rung: rescue.rung, stats: notified.stats } } : out.notifications ? { notifications: out.notifications } : {}),
-    ...(injected ? { injected: { rung: rescue.rung, stats: injected.stats } } : out.injected ? { injected: out.injected } : {}),
+    ...(rescue ? { result: rescue.result, messages: toSessionMessages(messages, rescue.result.messages) } : { best: chosen.result }),
+    ...(prose ? { prose: { cutoff: chosen.rung === 'all' ? lastProse : chosen.rung, stats: prose.stats } } : out.prose ? { prose: out.prose } : {}),
+    ...(notified ? { notifications: { rung: chosen.rung, stats: notified.stats } } : out.notifications ? { notifications: out.notifications } : {}),
+    ...(injected ? { injected: { rung: chosen.rung, stats: injected.stats } } : out.injected ? { injected: out.injected } : {}),
   };
 }
 
@@ -805,6 +826,7 @@ export function summarize(
   notifications?: NotificationOutcome,
   injected?: InjectOutcome,
   exchanges?: ExchangeOutcome,
+  steps?: StepsOutcome,
 ): string {
   const { stats } = result;
   const parts = [
@@ -820,7 +842,7 @@ export function summarize(
   return `${percent(reductionRatio(result))} reduction; ${
     parts.join(', ') || 'no tool calls'
   }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)${
-    prose?.cutoff === undefined
+    prose?.cutoff === undefined || prose.stats.proseCharsSaved + prose.stats.inputCharsSaved <= 0
       ? ''
       : `; prose trim at ${prose.cutoff}: ${prose.stats.dropped} dropped, ${prose.stats.inputsElided} inputs elided, ${
           prose.stats.proseCharsSaved + prose.stats.inputCharsSaved
@@ -837,6 +859,10 @@ export function summarize(
     exchanges?.cutoff === undefined
       ? ''
       : `; exchange drop at ${exchanges.cutoff}: ${exchanges.stats.dropped} archived, ${exchanges.stats.charsSaved} chars`
+  }${
+    steps?.pass === undefined
+      ? ''
+      : `; step trim (${steps.pass === 'fill' ? 'lowest-scored first' : `at ${steps.cutoff}`}): ${steps.stats.archived} archived, ${steps.stats.charsSaved} chars`
   }`;
 }
 
@@ -1064,11 +1090,10 @@ export const register: Register = (on: On, options: PluginOptions) => {
   let inertNoticeLogged = false;
 
   on('session.compact', async ($, event, next) => {
-    // A subagent's or a fork's own transcript is not the main conversation
-    // this plugin is tuned for; let the engine handle it as it normally
-    // would. `precompute` computes nothing yet and installs no result, so
-    // there is nothing useful for Jev to do here either.
-    if (event.agentId) return next(event);
+    // A subagent's or a fork's own transcript is compacted like the main one;
+    // only the context reading, which is the main conversation's, is left out.
+    // `precompute` computes nothing yet and installs no result, so there is
+    // nothing useful for Jev to do here.
     if (event.trigger === 'precompute') {
       return { skip: 'fast-jev-compaction does not handle speculative compactions' };
     }
@@ -1077,7 +1102,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       // The last response's input tokens: the size the engine compacts at.
       let contextTokens: number | undefined;
       try {
-        contextTokens = (await $.session.usage()).context.tokens;
+        contextTokens = event.agentId ? undefined : (await $.session.usage()).context.tokens;
       } catch {
         contextTokens = undefined;
       }
@@ -1086,7 +1111,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (contextTokens !== undefined) {
         log($, `context ${contextTokens} tokens, history ~${historyTokens} tokens, history cut needed ${percent(target)}`);
       }
-      try {
+      if (!event.agentId) try {
         log($, `history as the model sees it: ${formatBreakdown(contextBreakdown(await $.session.messages({ as: 'api' })))}`);
       } catch {
         // Diagnostics only: an engine without the API form still compacts.
@@ -1109,7 +1134,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         inertNoticeLogged = true;
         log($, 'notification trim skipped: archiveResults is off');
       }
-      const { result, messages, prose, notifications, injected, exchanges } = await compactSession(
+      const { result, messages, prose, notifications, injected, exchanges, steps } = await compactSession(
         event.messages,
         config,
         async (url, init) => {
@@ -1122,7 +1147,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) log($, line);
       if (reductionRatio(result) < config.minReductionRatio) {
-        const tried = `${prose ? ', prose trim tried' : ''}${notifications ? ', notification trim tried' : ''}${injected ? ', injected-content fold tried' : ''}${exchanges ? ', exchange drop tried' : ''}${
+        const tried = `${prose ? ', prose trim tried' : ''}${notifications ? ', notification trim tried' : ''}${injected ? ', injected-content fold tried' : ''}${exchanges ? ', exchange drop tried' : ''}${steps ? ', step trim tried' : ''}${
           target > configured.minReductionRatio ? `, history needs ${percent(target)} to free ${percent(configured.minReductionRatio)} of context` : ''
         }`;
         if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
@@ -1152,12 +1177,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
         );
         return next(event);
       }
-      log($, `kept history ~${messageTokens(messages)} tokens of ~${historyTokens}`);
+      const tokensAfter = messageTokens(messages);
+      log($, `kept history ~${tokensAfter} tokens of ~${historyTokens}`);
       notify(
         $,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose, notifications, injected, exchanges)})`,
+        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose, notifications, injected, exchanges, steps)})`,
       );
-      return { messages };
+      return { messages, tokensBefore: historyTokens, tokensAfter };
     } catch (error) {
       if (next.signal.aborted) return interrupted($);
       if (!mayUseBuiltin(event.trigger, configured.builtinFallback)) {

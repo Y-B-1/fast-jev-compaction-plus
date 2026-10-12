@@ -2,7 +2,7 @@ import { messageChars, reductionRatio, splitsSurrogatePair } from './compact.js'
 import { PROSE_KEEP_LADDER } from './prose.js';
 import { noulAnswer } from './request.js';
 import { ERROR_LINE, capped, redact, salvageErrorLines, salvageIdentifiers } from './salvage.js';
-import { collectToolCalls, estimateTokens, fitState, isPinned, resultPreview } from './state.js';
+import { MARKER, collectToolCalls, estimateTokens, fitState, isPinned, resultPreview } from './state.js';
 import type {
   CompactResult,
   JevAsker,
@@ -80,7 +80,6 @@ export type NotificationApplied = {
   stats: NotificationStats;
 };
 
-const MARKER = '[fast-jev-compaction ';
 const OPEN = '<task-notification>';
 const ENVELOPE = /(<usage>[\s\S]*?<\/usage>|<diagnostics>[\s\S]*?<\/diagnostics>)(\r?\n)?/g;
 const ARCHIVE_ID_DIR = '.claude/fast-jev-compaction';
@@ -413,11 +412,11 @@ export function applyNotifications(
       else stats.stripped++;
     }
   }
-  return { messages: mergeNotifications(scores.messages, replaced), replaced, archived, stats };
+  return { messages: mergeReplaced(scores.messages, replaced), replaced, archived, stats };
 }
 
 /** `messages` with each message in `replaced` swapped for its copy; matching is by object identity, so another stage may have dropped messages before. */
-export function mergeNotifications(
+export function mergeReplaced(
   messages: readonly Message[],
   replaced: ReadonlyMap<Message, Message>,
 ): Message[] {

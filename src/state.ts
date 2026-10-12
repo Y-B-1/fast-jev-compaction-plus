@@ -301,10 +301,30 @@ const MACHINE_TEXT_PREFIXES = [
   'This session is being continued from a previous conversation',
 ] as const;
 
+/** The prefix of every marker this plugin leaves in the history. */
+export const MARKER = '[fast-jev-compaction ';
+
+/** A row the user typed (or the host typed for them): a user row with text, no tool results and no machine prefix. */
+export function isPromptRow(message: Message): boolean {
+  return (
+    message.role === 'user' &&
+    message.text.trim().length > 0 &&
+    (message.toolResults ?? []).length === 0 &&
+    !isMachineText(message.text)
+  );
+}
+
 /** Whether a user-role text was written by the host, not typed by the user. */
 export function isMachineText(text: string): boolean {
   const head = text.trimStart();
   return MACHINE_TEXT_PREFIXES.some((prefix) => head.startsWith(prefix));
+}
+
+const HOST_BLOCK = /<(system-reminder|task-notification|local-command-[a-z]+|bash-stdout|bash-stderr)>[\s\S]*?<\/\1>/g;
+
+/** Whether a user-role text is nothing but whole host blocks (reminders, reports, command output): no room for a typed word. */
+export function isHostOnly(text: string): boolean {
+  return text.trim().length > 0 && text.replace(HOST_BLOCK, '').trim().length === 0;
 }
 
 const SKILL_HEAD = 'Base directory for this skill:';
@@ -374,14 +394,7 @@ export function goalText(text: string): string {
 /** The last three prompts the user typed, as the default `goal`. */
 export function goalFromMessages(messages: readonly Message[]): string {
   return messages
-    .filter(
-      (message) =>
-        message.role === 'user' &&
-        message.text.trim().length > 0 &&
-        (message.toolResults ?? []).length === 0 &&
-        !isMachineText(message.text) &&
-        goalText(message.text).length > 0,
-    )
+    .filter((message) => isPromptRow(message) && goalText(message.text).length > 0)
     .slice(-3)
     .map((message) => truncate(goalText(message.text), 500))
     .join('\n');

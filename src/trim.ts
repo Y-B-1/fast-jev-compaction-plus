@@ -5,7 +5,7 @@ import {
   type Rung,
   applyNotifications,
   ladderRescueWith,
-  mergeNotifications,
+  mergeReplaced,
   scoreNotifications,
 } from './notifications.js';
 import {
@@ -17,6 +17,7 @@ import {
   scoreProse,
 } from './prose.js';
 import { type InjectApplied, type InjectStats, applyInjected, scoreInjected } from './inject.js';
+import { messageChars } from './compact.js';
 import { sha256Hex } from './sha256.js';
 import type { CompactResult, JevAsker, Message, ResolvedCompactOptions } from './types.js';
 
@@ -46,6 +47,8 @@ export type TrimRescue = {
   out: { prose?: { stats: ProseStats }; notifications?: { stats: NotificationStats }; injected?: { stats: InjectStats } };
   /** The first rung whose result reaches `minRatio`; undefined when none does or every stage failed. */
   rescue?: { rung: Rung; result: CompactResult; applied: TrimApplied };
+  /** When no rung reaches `minRatio`: the `all` rung's result, archives already cited, for a later stage to build on; undefined when it frees nothing. */
+  best?: { rung: Rung; result: CompactResult; applied: TrimApplied };
   /** The notification scores, for a caller that wants to reapply them offline. */
   scores?: NotificationScores;
 };
@@ -116,23 +119,30 @@ export async function trimRescue(input: {
     const notified = notificationsUsable && scores ? applyNotifications(scores, rung, (id, text) => pathOf(notificationArchiveId(id, text))) : undefined;
     const injected = injectUsable && injectScores ? applyInjected(injectScores, rung, (id) => pathOf(id)) : undefined;
     let merged = prose?.messages ?? result.messages;
-    if (notified) merged = mergeNotifications(merged, notified.replaced);
-    if (injected) merged = mergeNotifications(merged, injected.replaced);
+    if (notified) merged = mergeReplaced(merged, notified.replaced);
+    if (injected) merged = mergeReplaced(merged, injected.replaced);
     return { messages: merged, prose, notified, injected };
+  };
+  const commit = (applied: TrimApplied): void => {
+    for (const item of applied.notified?.archived ?? []) {
+      if (archive.cite(notificationArchiveId(item.id, item.text), item.text) !== item.path) {
+        throw new Error(`archive path for ${item.id} is not ${item.path}`);
+      }
+    }
+    for (const item of [...(applied.prose?.archived ?? []), ...(applied.injected?.archived ?? [])]) {
+      if (archive.cite(item.id, item.text) !== item.path) throw new Error(`archive path for ${item.id} is not ${item.path}`);
+    }
   };
   const rescue = ladderRescueWith(apply, result, input.minRatio);
   if (proseScores) out.prose = { stats: proseScores.stats };
-  if (!rescue) return { out, ...(scores ? { scores } : {}) };
-  for (const item of rescue.applied.notified?.archived ?? []) {
-    if (archive.cite(notificationArchiveId(item.id, item.text), item.text) !== item.path) {
-      throw new Error(`archive path for ${item.id} is not ${item.path}`);
-    }
+  if (!rescue) {
+    const applied = apply('all');
+    const charsAfter = applied.messages.reduce((sum, m) => sum + messageChars(m), 0);
+    if (charsAfter >= result.stats.charsAfter) return { out, ...(scores ? { scores } : {}) };
+    commit(applied);
+    const best = { rung: 'all' as const, result: { ...result, messages: applied.messages, stats: { ...result.stats, charsAfter } }, applied };
+    return { out, best, ...(scores ? { scores } : {}) };
   }
-  for (const item of rescue.applied.prose?.archived ?? []) {
-    if (archive.cite(item.id, item.text) !== item.path) throw new Error(`archive path for ${item.id} is not ${item.path}`);
-  }
-  for (const item of rescue.applied.injected?.archived ?? []) {
-    if (archive.cite(item.id, item.text) !== item.path) throw new Error(`archive path for ${item.id} is not ${item.path}`);
-  }
+  commit(rescue.applied);
   return { out, rescue, ...(scores ? { scores } : {}) };
 }

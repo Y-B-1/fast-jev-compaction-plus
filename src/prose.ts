@@ -2,7 +2,7 @@ import { messageChars, reductionRatio, splitsSurrogatePair } from './compact.js'
 import { noulAnswer } from './request.js';
 import { ERROR_LINE, SCAN, salvageBlock } from './salvage.js';
 import { sha256Hex } from './sha256.js';
-import { collectToolCalls, estimateTokens, goalFromMessages, isPinned, truncate } from './state.js';
+import { MARKER, collectToolCalls, estimateTokens, goalFromMessages, isPinned, truncate } from './state.js';
 import type { ArchiveResult, CallDecision, CompactResult, JevAsker, JevQuestions, Message, ToolUse } from './types.js';
 
 /**
@@ -23,7 +23,6 @@ const QUOTED = /"[^"\n]{4,}"|“[^”\n]{4,}”|(?<![\w])'[^'\n]{4,}'(?![\w])/;
 const BOUND =
   /\b(?:not|no|never|none|nothing|neither|nor|without|cannot|if|unless|only|except|until|before|after|when|otherwise|instead|but|however|although|though|yet|because|since|so that|must|needs?|required|always|avoid)\b|n't\b|n’t\b/i;
 const BOUND_START = new RegExp(`^(?:${BOUND.source})`, 'i');
-const MARKER_LINE = '[fast-jev-compaction ';
 
 /** Whether `s` holds any protected span (P3, P5-P9; line-level spans are handled by the caller). */
 function isProtected(s: string): boolean {
@@ -44,7 +43,7 @@ function isProtectedLine(line: string): boolean {
     /^(?: {4,}|\t)/.test(line) ||
     /^ {0,3}[|#]/.test(line) ||
     /^[ \t]*[$%] /.test(line) ||
-    line.startsWith(MARKER_LINE) ||
+    line.startsWith(MARKER) ||
     ERROR_LINE.test(line) ||
     !/[A-Za-z]/.test(line)
   );
@@ -718,7 +717,7 @@ export function applyProse(
       const original = proseOriginal(m, plan, values);
       const id = `reply-${sha256Hex(original).slice(0, 12)}`;
       const path = cite(id, original);
-      const marker = path ? `${MARKER_LINE}trimmed ${withCommas(saved)} chars of this reply; full text: ${path} (Read it if needed)]` : '';
+      const marker = path ? `${MARKER}trimmed ${withCommas(saved)} chars of this reply; full text: ${path} (Read it if needed)]` : '';
       if (path && saved > marker.length + 1 + MARKER_MARGIN) {
         const cost = text.length > 0 ? marker.length + 1 : marker.length;
         text = text.length > 0 ? `${text}\n${marker}` : marker;

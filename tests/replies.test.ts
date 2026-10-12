@@ -16,7 +16,7 @@ const result = (id: string, text: string): SessionMessage =>
 const BIG = 'export const value = 1;\n'.repeat(2000); // 48,000 chars, dropped by tool compaction
 const FLUFF = 'Let me take a careful look at how this module is laid out before changing anything.';
 const KEPT = 'The cache key lives in src/cache/key.ts and must not change.';
-const REPLY = `${Array(12).fill(FLUFF).join(' ')} ${KEPT}`;
+const REPLY = `${Array(20).fill(FLUFF).join(' ')} ${KEPT}`;
 
 function transcript(): SessionMessage[] {
   return [
@@ -31,14 +31,14 @@ function transcript(): SessionMessage[] {
   ];
 }
 
-const isProse = (key: string) => /^c\d+$/.test(key);
-function fetchWith(prose: number | 'fail', requests: string[][] = []) {
+const isStep = (key: string) => /^s\d+$/.test(key);
+function fetchWith(step: number | 'fail', requests: string[][] = []) {
   return async (_url: string, init?: { body?: string }) => {
     const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
     const keys = Object.keys(questions);
     requests.push(keys);
-    if (prose === 'fail' && keys.some(isProse)) return { status: 500, ok: false, text: 'down' };
-    const answers = Object.fromEntries(keys.map((k) => [k, { type: 'noul', noul: isProse(k) ? prose : 0.01 }]));
+    if (step === 'fail' && keys.some(isStep)) return { status: 500, ok: false, text: 'down' };
+    const answers = Object.fromEntries(keys.map((k) => [k, { type: 'noul', noul: isStep(k) ? step : 0.01 }]));
     return { status: 200, ok: true, text: JSON.stringify({ answers }) };
   };
 }
@@ -55,49 +55,48 @@ const config = (extra: Record<string, unknown> = {}) => ({
   proseTrim: true,
   ...extra,
 });
-const replyOf = (messages: readonly SessionMessage[]) => messages.find((m) => m.role === 'assistant' && m.text.includes('src/cache/key.ts'));
+const replyOf = (messages: readonly SessionMessage[]) => messages.find((m) => m.role === 'assistant' && m.text.includes(KEPT));
+const stepRequests = (requests: string[][]) => requests.filter((keys) => keys.some(isStep));
 
-describe('replyTrim: old replies trimmed on every compaction', () => {
-  it('trims an old reply after tool compaction already met the minimum, keeping protected clauses and archiving the original', async () => {
+describe('replyTrim: old replies folded whole on every compaction', () => {
+  it('folds an old reply Jev scores done into one archive pointer after tool compaction met the minimum', async () => {
     const a = archive();
     const requests: string[][] = [];
     const out = await compactSession(transcript(), config() as never, fetchWith(0.01, requests), a);
-    const reply = replyOf(out.messages)!;
-    expect(reply.text).toContain(KEPT);
-    expect(reply.text).not.toContain(FLUFF);
-    expect(reply.text).toMatch(/\[fast-jev-compaction trimmed [\d,]+ chars of this reply; full text: arch\/reply-[0-9a-f]{12}\.txt/);
-    expect([...a.files.values()]).toContain(REPLY);
-    expect(reply.text).not.toContain(REPLY);
-    expect(out.prose?.cutoff).toBe(0.05);
-    expect(requests.filter((keys) => keys.some(isProse))).toHaveLength(1);
-    // The recent rows are never scored or changed.
+    expect(replyOf(out.messages)).toBeUndefined();
+    const marker = out.messages.find((m) => m.text.includes('archived 1 row of earlier work'))!;
+    expect(marker.text).toMatch(/full text: arch\/step-[0-9a-f]{12}\.txt \(Read it if needed\)\]\nNote: Let me take/);
+    expect([...a.files.values()].some((t) => t.includes(REPLY))).toBe(true);
+    expect(out.steps).toMatchObject({ pass: 'trim', cutoff: 0.05, stats: { archived: 1 } });
+    expect(stepRequests(requests)).toHaveLength(1);
+    // The prompts and the recent rows are never scored or changed.
     expect(out.messages.slice(-4).map((m) => m.text)).toEqual(['first recent prompt', 'ok', 'second recent prompt', 'ok']);
+    expect(out.messages[0]!.text).toBe('Fix the stale cache.');
   });
 
-  it('keeps a clause Jev scores at or above the cut-off', async () => {
+  it('keeps a reply Jev scores at or above the cut-off', async () => {
     const out = await compactSession(transcript(), config() as never, fetchWith(0.05), archive());
     expect(replyOf(out.messages)!.text).toContain(REPLY);
-    expect(out.prose?.stats.dropped).toBe(0);
+    expect(out.steps?.pass).toBeUndefined();
   });
 
-  it('changes nothing when replyTrim is off, without an archive, or when proseTrim is off', async () => {
+  it('changes nothing and asks nothing when replyTrim is off or there is no archive', async () => {
     for (const [extra, withArchive] of [
       [{ replyTrim: false }, true],
       [{ archiveResults: false }, false],
-      [{ proseTrim: false }, true],
     ] as const) {
       const requests: string[][] = [];
       const out = await compactSession(transcript(), config(extra) as never, fetchWith(0.01, requests), withArchive ? archive() : undefined);
       expect(replyOf(out.messages)!.text).toContain(REPLY);
-      expect(requests.filter((keys) => keys.some(isProse))).toHaveLength(0);
+      expect(stepRequests(requests)).toHaveLength(0);
     }
   });
 
-  it('keeps tool compaction’s result when the reply request fails', async () => {
+  it('keeps tool compaction’s result when the step request fails', async () => {
     const a = archive();
     const out = await compactSession(transcript(), config() as never, fetchWith('fail'), a);
     expect(replyOf(out.messages)!.text).toContain(REPLY);
-    expect(out.prose?.stats.failed).toBeDefined();
-    expect([...a.files.keys()].some((id) => id.startsWith('reply-'))).toBe(false);
+    expect(out.steps?.stats.failed).toBeDefined();
+    expect([...a.files.keys()].some((id) => id.includes('step-'))).toBe(false);
   });
 });

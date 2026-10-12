@@ -5,7 +5,7 @@ import {
   NOTIFICATION_RUNGS,
   applyNotifications,
   ladderRescueWith,
-  mergeNotifications,
+  mergeReplaced,
   scoreNotifications,
 } from '../src/notifications.js';
 import type { CompactResult, JevAsker, JevQuestions, Message } from '../src/types.js';
@@ -315,7 +315,7 @@ describe('ladder (plan item 6)', () => {
     const scores = await scoreNotifications(messages, fakeAsker(() => 0.01), options);
     const out = applyNotifications(scores, 'all', cite);
     const shifted = messages.filter((m) => m.text !== 'Dispatching a worker.');
-    const merged = mergeNotifications(shifted, out.replaced);
+    const merged = mergeReplaced(shifted, out.replaced);
     expect(merged).toHaveLength(shifted.length);
     expect(merged.filter((m) => m.text.includes('folded'))).toHaveLength(1);
     expect(merged.filter((m) => m !== messages[0] && !m.text.includes('folded') && m.text.startsWith('<task'))).toHaveLength(0);

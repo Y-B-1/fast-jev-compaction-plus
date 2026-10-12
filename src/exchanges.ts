@@ -3,7 +3,7 @@ import { goalIndices, isPromptRow } from './inject.js';
 import { type NotificationOptions, askNoul } from './notifications.js';
 import { PROSE_KEEP_LADDER } from './prose.js';
 import { sha256Hex } from './sha256.js';
-import { isPinned, resultPreview } from './state.js';
+import { MARKER, isPinned, resultPreview } from './state.js';
 import type { CompactResult, JevAsker, JevQuestions, Message, NoulQuestion } from './types.js';
 
 /**
@@ -14,7 +14,6 @@ import type { CompactResult, JevAsker, JevQuestions, Message, NoulQuestion } fro
  * prompt row stays verbatim. Tool calls and their results always leave together.
  */
 
-const MARKER = '[fast-jev-compaction ';
 const REPLY_HEAD_CHARS = 400;
 
 export type Exchange = {
@@ -60,7 +59,7 @@ export type ExchangeApplied = {
  * Text the user typed inside a work row: a `!` shell command, a slash command's non-empty
  * arguments, or a message sent while a turn was running (delivered as a system reminder).
  */
-const TYPED_WORK = /<bash-input>|<command-args>(?!\s*<\/command-args>)|The user sent a new message while you were working:/;
+export const TYPED_WORK = /<bash-input>|<command-args>(?!\s*<\/command-args>)|The user sent a new message while you were working:/;
 
 export function findExchanges(messages: readonly Message[], preserveRecentMessages: number): Exchange[] {
   const goal = goalIndices(messages);

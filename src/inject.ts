@@ -1,10 +1,10 @@
 import { type NotificationOptions, type Rung, askNoul, fold } from './notifications.js';
 import { PROSE_KEEP_LADDER } from './prose.js';
 import { sha256Hex } from './sha256.js';
-import { type InjectKind, goalText, injectedSpans, isMachineText, isPinned, resultPreview } from './state.js';
+import { type InjectKind, MARKER, goalText, injectedSpans, isPinned, isPromptRow, resultPreview } from './state.js';
 import type { JevAsker, JevQuestions, Message, NoulQuestion } from './types.js';
 
-export { type InjectKind, LONG_USER_CHARS, goalText, injectedSpans } from './state.js';
+export { type InjectKind, LONG_USER_CHARS, goalText, injectedSpans, isPromptRow } from './state.js';
 
 /**
  * Injected-content trim: folds the large blocks the host puts into user rows — skill bodies,
@@ -14,20 +14,9 @@ export { type InjectKind, LONG_USER_CHARS, goalText, injectedSpans } from './sta
  * notification trim: `scoreInjected` asks Jev once, offline `applyInjected` applies a rung.
  */
 
-const MARKER = '[fast-jev-compaction ';
 const FOLD_MARGIN = 120;
 /** At the `all` rung a `long` or `paste` block — likely typed or chosen by the user — still needs Jev's go-ahead at the last prose cut-off. */
 const USER_ALL_CUTOFF = PROSE_KEEP_LADDER[PROSE_KEEP_LADDER.length - 1] as number;
-
-/** A row the user typed (or the host typed for them): a user row with text, no tool results and no machine prefix. */
-export function isPromptRow(message: Message): boolean {
-  return (
-    message.role === 'user' &&
-    message.text.trim().length > 0 &&
-    (message.toolResults ?? []).length === 0 &&
-    !isMachineText(message.text)
-  );
-}
 
 /** Indices of the last three prompt rows, the ones the goal is read from. */
 export function goalIndices(messages: readonly Message[]): Set<number> {
@@ -166,10 +155,15 @@ export function applyInjected(
   const archived: InjectApplied['archived'] = [];
   if (stats.failed !== undefined || !cite) return { messages: [...scores.messages], replaced, archived, stats };
   const byRow = new Map<number, Block[]>();
-  for (const block of scores.blocks) {
+  const folds = (block: Block): boolean => {
     const n = scores.noul.get(block.key);
     const userish = block.kind === 'long' || block.kind === 'paste';
-    if (n === undefined ? rung !== 'all' || userish : n >= (rung !== 'all' ? rung : userish ? USER_ALL_CUTOFF : Infinity)) continue;
+    if (rung !== 'all') return n !== undefined && n < rung;
+    if (!userish) return true;
+    return n !== undefined && n < USER_ALL_CUTOFF;
+  };
+  for (const block of scores.blocks) {
+    if (!folds(block)) continue;
     byRow.set(block.index, [...(byRow.get(block.index) ?? []), block]);
   }
   for (const [index, blocks] of byRow) {

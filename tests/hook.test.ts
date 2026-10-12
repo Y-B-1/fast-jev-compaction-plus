@@ -562,15 +562,25 @@ describe('register', () => {
     expect(e.toasts).toEqual([]);
   });
 
-  it('leaves a subagent transcript to the engine', async () => {
+  it('compacts a subagent transcript with Jev too, without reading the main context size', async () => {
     const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 0 });
-    const e = engine(async () => ({ status: 200, ok: true, text: '{"answers":{}}' }));
+    const e = engine(async (_url: string, init?: { body?: string }) => {
+      const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
+      const answers = Object.fromEntries(Object.keys(questions).map((k) => [k, { noul: 0.9 }]));
+      return { status: 200, ok: true, text: JSON.stringify({ answers }) };
+    });
+    const usage = e.$.session.usage;
+    let usageRead = false;
+    e.$.session.usage = async () => ((usageRead = true), usage());
     const out = await hooks['session.compact']!(
       e.$,
       { trigger: 'plugin', agentId: 'sub-1', messages: transcript() },
       next(),
     );
-    expect(out).toEqual({ trigger: 'plugin', agentId: 'sub-1', messages: transcript() });
+    expect(Array.isArray(out.messages)).toBe(true);
+    expect(out).not.toHaveProperty('trigger');
+    expect(out.tokensAfter).toBeLessThanOrEqual(out.tokensBefore);
+    expect(usageRead).toBe(false);
   });
 
   it('skips a speculative precompute instead of running Jev on it', async () => {
@@ -963,7 +973,7 @@ describe('proseTrim rescue', () => {
 
       it('compacts as before when the context is no larger than the history', async () => {
         const out = await hook({ proseTrim: true }, fetchWith(0.1), history()).run({ trigger: 'auto', messages: proseTranscript() });
-        expect(Object.keys(out)).toEqual(['messages']);
+        expect(Object.keys(out)).toEqual(['messages', 'tokensBefore', 'tokensAfter']);
       });
 
       it('falls back without asking Jev when no history cut can free the minimum', async () => {
@@ -987,7 +997,7 @@ describe('proseTrim rescue', () => {
       const event = { trigger: 'auto', messages: proseTranscript() };
       const on = hook({ proseTrim: true });
       const out = await on.run(event);
-      expect(Object.keys(out)).toEqual(['messages']);
+      expect(Object.keys(out)).toEqual(['messages', 'tokensBefore', 'tokensAfter']);
       expect(out.messages.length).toBe(4);
       expect(on.toasts.join('\n')).toContain('prose trim at 0.15');
       expect(on.toasts.join('\n')).toContain('no summary');
@@ -1246,24 +1256,24 @@ describe('notificationTrim rescue', () => {
     expect(summarize(out.result, out.prose, out.notifications)).toContain('; notification trim at all: 3 folded');
   });
 
-  it('keeps the tool-compaction result when no rung reaches the minimum', async () => {
-    const plain = await compactSession(transcriptWithReports(), cfg({ proseTrim: false, notificationTrim: false }), fetchWith(0.9));
+  it('keeps its best partial result for later stages when no rung reaches the minimum', async () => {
+    const plain = await compactSession(transcriptWithReports(), cfg({ proseTrim: false, notificationTrim: false, stepTrim: false }), fetchWith(0.9));
     const out = await compactSession(
       transcriptWithReports(),
-      cfg({ notificationTrim: true, archiveResults: true, minReductionRatio: 0.99 }),
+      cfg({ notificationTrim: true, archiveResults: true, minReductionRatio: 0.99, stepTrim: false }),
       fetchWith(0.9),
       memoryArchive().writer,
     );
-    expect(out.notifications).toMatchObject({ stats: { requests: 1 } });
-    expect(out.notifications?.rung).toBeUndefined();
-    expect(strip(out)).toEqual(strip(plain));
+    expect(out.notifications).toMatchObject({ rung: 'all', stats: { requests: 1, folded: 3 } });
+    expect(reductionRatioOf(out)).toBeLessThan(0.99);
+    expect(out.result.stats.charsAfter).toBeLessThan(plain.result.stats.charsAfter);
   });
 
   it('keeps the tool-compaction result when the notification request fails', async () => {
     const plain = await compactSession(transcriptWithReports(), cfg({ proseTrim: false, notificationTrim: false }), fetchWith(0.9));
     const out = await compactSession(
       transcriptWithReports(),
-      cfg({ notificationTrim: true, archiveResults: true }),
+      cfg({ notificationTrim: true, archiveResults: true, stepTrim: false }),
       fetchWith('fail'),
       memoryArchive().writer,
     );
@@ -1290,15 +1300,16 @@ describe('notificationTrim rescue', () => {
     expect(files.get(cited.find((p) => /notif-w2-[0-9a-f]{8}\.txt$/.test(p ?? '')) ?? '')).toBe(original);
   });
 
-  it('writes no notification archive when no rung reaches the minimum', async () => {
+  it('writes exactly the notification archives its partial result cites when no rung reaches the minimum', async () => {
     const { files, writer } = memoryArchive();
-    await compactSession(
+    const out = await compactSession(
       transcriptWithReports(),
-      cfg({ notificationTrim: true, archiveResults: true, minReductionRatio: 0.99 }),
+      cfg({ notificationTrim: true, archiveResults: true, minReductionRatio: 0.99, stepTrim: false }),
       fetchWith(0.1),
       writer,
     );
-    expect([...files.keys()].filter((p) => p.includes('notif-'))).toEqual([]);
+    const cited = [...textOf(out).matchAll(/full notification: (\S+) \(Read or grep it if needed\)/g)].map((m) => m[1]);
+    expect([...files.keys()].filter((p) => p.includes('notif-')).sort()).toEqual([...cited].sort());
   });
 
   it('redacts a key-like string in a report, its summary and its preview before the request leaves', async () => {
@@ -1376,7 +1387,7 @@ describe('notificationTrim rescue', () => {
       const event = { trigger: 'auto', messages: transcriptWithReports() };
       const on = hook({ notificationTrim: true });
       const out = await on.run(event);
-      expect(Object.keys(out)).toEqual(['messages']);
+      expect(Object.keys(out)).toEqual(['messages', 'tokensBefore', 'tokensAfter']);
       expect(out.messages).toHaveLength(event.messages.length);
       expect(on.toasts[0]).toMatch(
         /^kept \d+\/\d+ messages, no summary \(\d+% reduction; .*; notification trim at 0\.15: 3 folded, 0 stripped, \d+ chars\)$/,
@@ -1387,13 +1398,13 @@ describe('notificationTrim rescue', () => {
       const event = { trigger: 'auto', messages: transcriptWithReports() };
       const on = hook({ notificationTrim: true, proseTrim: false, minReductionRatio: 0.99 }, fetchWith(0.9));
       expect(await on.run(event)).toBe(event);
-      expect(on.toasts[0]).toMatch(/^fallback to built-in summary \(below 99% minimum, notification trim tried: /);
+      expect(on.toasts[0]).toMatch(/^fallback to built-in summary \(below 99% minimum, notification trim tried, step trim tried: /);
       const never = hook({ notificationTrim: true, proseTrim: false, minReductionRatio: 0.99, builtinFallback: 'never' }, fetchWith(0.9));
       expect(await never.run(event)).toEqual({ skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' });
-      expect(never.toasts[0]).toContain('minimum, notification trim tried, builtin fallback disabled');
+      expect(never.toasts[0]).toContain('minimum, notification trim tried, step trim tried, builtin fallback disabled');
       const both = hook({ notificationTrim: true, proseTrim: true, minReductionRatio: 0.99 }, fetchWith(0.9));
       expect(await both.run(event)).toBe(event);
-      expect(both.toasts[0]).toContain('minimum, prose trim tried, notification trim tried: ');
+      expect(both.toasts[0]).toContain('minimum, prose trim tried, notification trim tried, step trim tried: ');
     });
 
     it('says nothing about notification trim when the option is off', async () => {
