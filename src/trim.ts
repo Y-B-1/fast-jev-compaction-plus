@@ -44,7 +44,7 @@ export type TrimApplied = {
 export type TrimRescue = {
   /** The stages' scoring outcome, kept even when no rung is chosen. */
   out: { prose?: { stats: ProseStats }; notifications?: { stats: NotificationStats }; injected?: { stats: InjectStats } };
-  /** The first rung whose result reaches `minRatio`; undefined when none does or both stages failed. */
+  /** The first rung whose result reaches `minRatio`; undefined when none does or every stage failed. */
   rescue?: { rung: Rung; result: CompactResult; applied: TrimApplied };
   /** The notification scores, for a caller that wants to reapply them offline. */
   scores?: NotificationScores;
@@ -70,8 +70,10 @@ export async function trimRescue(input: {
   proseTrim: boolean;
   /** Score and fold `<task-notification>` reports; default true. */
   notificationTrim?: boolean;
-  /** Score and fold injected blocks in user rows (`src/inject.ts`); default false. */
+  /** Score and fold injected blocks in user rows (`src/inject.ts`); off unless set (the hook passes its default). */
   injectTrim?: boolean;
+  /** Archive and mark each prose cut (`replyTrim`); without it prose cuts as in 0.10.0. */
+  replyTrim?: boolean;
   minRatio: number;
   archive: { cite: (id: string, text: string) => string | undefined };
   /** The path `archive.cite` will return for an archive id. */
@@ -110,7 +112,7 @@ export async function trimRescue(input: {
 
   const lastProse = PROSE_KEEP_LADDER[PROSE_KEEP_LADDER.length - 1] as number;
   const apply = (rung: Rung): TrimApplied => {
-    const prose = proseScores ? applyProse(proseScores, rung === 'all' ? lastProse : rung, (id) => pathOf(id)) : undefined;
+    const prose = proseScores ? applyProse(proseScores, rung === 'all' ? lastProse : rung, input.replyTrim ? (id) => pathOf(id) : undefined) : undefined;
     const notified = notificationsUsable && scores ? applyNotifications(scores, rung, (id, text) => pathOf(notificationArchiveId(id, text))) : undefined;
     const injected = injectUsable && injectScores ? applyInjected(injectScores, rung, (id) => pathOf(id)) : undefined;
     let merged = prose?.messages ?? result.messages;

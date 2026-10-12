@@ -374,6 +374,14 @@ describe('archiveWriter', () => {
     expect(stub.files.get(path!)).toBe('ok\n[REDACTED]\ndone');
   });
 
+  it('archives text with the configured API key redacted even when it matches no secret pattern', async () => {
+    const stub = fsStub();
+    const writer = archiveWriter(stub, undefined, 'plainkeyvalue123');
+    const path = writer.cite('toolu_5', 'pasted plainkeyvalue123 here');
+    await writer.flush();
+    expect(stub.files.get(path!)).not.toContain('plainkeyvalue123');
+  });
+
   it('archives git output and paths verbatim', async () => {
     const stub = fsStub();
     const writer = archiveWriter(stub);
@@ -1322,11 +1330,12 @@ describe('notificationTrim rescue', () => {
     );
     const both = await compactSession(
       transcriptWithReports(extra),
-      cfg({ proseTrim: true, notificationTrim: true, archiveResults: true }),
+      cfg({ proseTrim: true, notificationTrim: true, archiveResults: true, injectTrim: false, replyTrim: false }),
       fetchWith(0.1, [], 0.1),
       memoryArchive().writer,
     );
-    expect(proseOnly.prose?.stats.dropped).toBeGreaterThan(0);
+    expect(proseOnly.prose?.cutoff).toBe(0.15);
+    expect(proseOnly.messages.some((m) => m.text.includes('of this reply; full text'))).toBe(false);
     expect(both.prose?.cutoff).toBe(0.15);
     expect(both.notifications?.rung).toBe(0.15);
     expect(both.messages).toHaveLength(proseOnly.messages.length);

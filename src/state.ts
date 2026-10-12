@@ -345,8 +345,10 @@ export function injectedSpans(text: string): InjectSpan[] {
     if (close !== -1) spans.push({ kind: 'paste', span: [from, close] });
   }
   spans.sort((a, b) => a.span[0] - b.span[0]);
-  if (spans.length === 0 && text.length >= LONG_USER_CHARS) spans.push({ kind: 'long', span: [0, text.length] });
-  return spans;
+  // A block nested in another (element tags inside a paste) folds with its outer block.
+  const outer = spans.filter((s, i) => !spans.slice(0, i).some((p) => s.span[0] < p.span[1]));
+  if (outer.length === 0 && text.length >= LONG_USER_CHARS) outer.push({ kind: 'long', span: [0, text.length] });
+  return outer;
 }
 
 /**

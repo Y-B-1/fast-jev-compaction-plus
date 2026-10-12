@@ -52,9 +52,13 @@ export type ExchangeApplied = {
 
 /**
  * The exchanges that may be dropped: the prompt is not one of the goal's prompts, every row is
- * outside the pinned recent window, there are at least two work rows, and every tool call in the
+ * outside the pinned recent window, there are at least two work rows, no work row holds typed text
+ * (a `!` command or slash-command arguments), and every tool call in the
  * work rows has its result there too (and the other way round).
  */
+/** A work row carrying text the user typed: a `!` shell command or a slash command's arguments. */
+const TYPED_WORK = /<bash-input>|<command-args>\s*[^<\s]/;
+
 export function findExchanges(messages: readonly Message[], preserveRecentMessages: number): Exchange[] {
   const goal = goalIndices(messages);
   const prompts: number[] = [];
@@ -72,6 +76,7 @@ export function findExchanges(messages: readonly Message[], preserveRecentMessag
     const tools = new Map<string, number>();
     for (let i = from; i < to; i++) {
       const m = messages[i] as Message;
+      if (m.role === 'user' && TYPED_WORK.test(m.text)) return;
       for (const use of m.toolUses) {
         uses.add(use.tool_use_id);
         tools.set(use.tool, (tools.get(use.tool) ?? 0) + 1);

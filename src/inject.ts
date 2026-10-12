@@ -153,7 +153,7 @@ const WHERE = (path: string): string => `full text: ${path} (Read or grep it if 
 /**
  * Applies `scores` at a rung: a block whose noul is below the rung is folded. At `all`, every
  * `skill` and `element` block folds, while `long` and `paste` blocks still need a noul below the
- * last prose cut-off. A missing answer keeps the block. Before a row changes, `cite` is given its
+ * last prose cut-off. Below `all`, a missing answer keeps the block. Before a row changes, `cite` is given its
  * whole original and must return the path the markers will name; without a path the row stays.
  */
 export function applyInjected(

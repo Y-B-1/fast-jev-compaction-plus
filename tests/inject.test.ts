@@ -195,3 +195,21 @@ describe('injected-content fold through compactSession', () => {
     expect(out.messages).toEqual(messages());
   });
 });
+
+describe('overlapping injected spans', () => {
+  it('folds only the outer block of a paste that holds element tags and keeps the typed text after it', () => {
+    const inner = `<launch-selected-element>${'e'.repeat(2000)}</launch-selected-element>`;
+    const text = `TYPED-BEFORE <pasted_content id="p1">${'a'.repeat(2000)}${inner}${'b'.repeat(2000)}</pasted_content> TYPED-AFTER keep this exact sentence.`;
+    const spans = injectedSpans(text);
+    expect(spans).toHaveLength(1);
+    expect(spans[0]!.kind).toBe('paste');
+    const messages = [user('start'), user(text), user('a'), user('b'), user('c'), user('d')];
+    const blocks = findBlocks(messages, 2, 200);
+    const noul = new Map(blocks.map((b) => [b.key, 0.01]));
+    const out = applyInjected({ messages, blocks, noul, headChars: 200, salvageChars: 0, stats: { eligible: blocks.length, scored: blocks.length, requests: 1, failedRequests: 0, stateTokens: 0 } } as any, 0.05, (id) => `arch/${id}.txt`);
+    const row = out.messages[1]!.text;
+    expect(row.startsWith('TYPED-BEFORE <pasted_content id="p1">')).toBe(true);
+    expect(row.endsWith('</pasted_content> TYPED-AFTER keep this exact sentence.')).toBe(true);
+    expect(row.length).toBeLessThan(text.length);
+  });
+});

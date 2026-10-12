@@ -568,7 +568,7 @@ export function archiveWriter($: {
     exists: (path: string) => Promise<boolean>;
     write: (path: string, text: string) => Promise<void>;
   };
-}, dir: string = ARCHIVE_DIR): ArchiveWriter {
+}, dir: string = ARCHIVE_DIR, apiKey?: string): ArchiveWriter {
   const pending = new Map<string, string>();
   const pathOf = (id: string) => `${dir}/${id}.txt`;
   return {
@@ -576,7 +576,7 @@ export function archiveWriter($: {
     cite(toolUseId, text) {
       if (!text) return undefined;
       const path = pathOf(toolUseId);
-      pending.set(path, redactText(text, undefined));
+      pending.set(path, redactText(text, apiKey));
       return path;
     },
     async flush() {
@@ -633,13 +633,16 @@ export async function compactSession(
     if (reply.result) await archive.flush();
     return finish({ ...tool, ...reply });
   }
-  if (!config.proseTrim && !trimNotifications && !trimInjected) return finish(tool);
-  const rescue =
-    (trimNotifications || trimInjected) && archive
+  const dropping = (config.exchangeDrop ?? HOOK_DEFAULTS.exchangeDrop) && archive !== undefined;
+  const trimming = config.proseTrim || trimNotifications || trimInjected;
+  if (!trimming && !dropping) return finish(tool);
+  const rescue: Partial<SessionCompaction> = !trimming
+    ? {}
+    : (trimNotifications || trimInjected) && archive
       ? await rescueWithTrim(messages, result, asker, config, archive)
       : await rescueWithProse(messages, result, asker, config, archive);
   if (archive) await archive.flush();
-  if (rescue.result || !(config.exchangeDrop ?? HOOK_DEFAULTS.exchangeDrop) || !archive) return finish({ ...tool, ...rescue });
+  if (rescue.result || !dropping || !archive) return finish({ ...tool, ...rescue });
   const exchanges = await dropExchanges(messages, result, asker, config, archive);
   const tried = exchanges.exchanges.stats.eligible > 0 || exchanges.exchanges.stats.failed !== undefined;
   return finish({ ...tool, ...rescue, ...(tried ? exchanges : {}) });
@@ -739,7 +742,7 @@ async function rescueWithProse(
     return { prose: { stats: failedProseStats(error) } };
   }
   if (scores.stats.failed !== undefined) return { prose: { stats: scores.stats } };
-  const rescue = ladderRescue(scores, result, config.minReductionRatio, archive ? (id) => archive.pathOf(id) : undefined);
+  const rescue = ladderRescue(scores, result, config.minReductionRatio, archive && (config.replyTrim ?? HOOK_DEFAULTS.replyTrim) ? (id) => archive.pathOf(id) : undefined);
   if (rescue) {
     for (const item of rescue.archived) {
       if (archive?.cite(item.id, item.text) !== item.path) throw new Error(`archive path for ${item.id} is not ${item.path}`);
@@ -775,6 +778,7 @@ async function rescueWithTrim(
     proseTrim: config.proseTrim,
     notificationTrim: config.notificationTrim ?? HOOK_DEFAULTS.notificationTrim,
     injectTrim: config.injectTrim ?? HOOK_DEFAULTS.injectTrim,
+    replyTrim: config.replyTrim ?? HOOK_DEFAULTS.replyTrim,
     minRatio: config.minReductionRatio,
     archive,
     pathOf: archive.pathOf,
@@ -1112,7 +1116,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
           const response = await $.http.fetch(url, init);
           return { status: response.status, ok: response.ok, text: response.text, headers: response.headers };
         },
-        config.archiveResults ? archiveWriter($, await archiveDir($)) : undefined,
+        config.archiveResults ? archiveWriter($, await archiveDir($), config.apiKey) : undefined,
         { signal: next.signal, sleep: clockSleep($), remainingMs: () => next.budget.remainingMs },
       );
       if (next.signal.aborted) return interrupted($);

@@ -62,6 +62,16 @@ describe('findExchanges', () => {
     expect(findExchanges([...messages.slice(0, 4), ...messages.slice(5)], 2).map((e) => e.prompt)).toEqual([5]);
   });
 
+  it('never offers an exchange whose work rows hold text the user typed', () => {
+    const typed = (text: string): Message => ({ role: 'user', text, toolUses: [] });
+    const withBang = session();
+    withBang.splice(4, 0, typed('<bash-input>git status</bash-input>'));
+    expect(findExchanges(withBang, 2).map((e) => e.prompt)).toEqual([7]);
+    const withArgs = session();
+    withArgs.splice(4, 0, typed('<command-message>review</command-message>\n<command-name>/review</command-name>\n<command-args>focus on the parser</command-args>'));
+    expect(findExchanges(withArgs, 2).map((e) => e.prompt)).toEqual([7]);
+  });
+
   it('renders every row of the exchange into the archive text', () => {
     const messages = session();
     const [, cache] = findExchanges(messages, 2);
@@ -136,6 +146,11 @@ describe('exchange drop through compactSession', () => {
     expect(out.messages.some((m) => m.text.startsWith('[fast-jev-compaction archived this exchange'))).toBe(true);
     expect(out.messages.map((m) => m.text)).toContain('check the old cache layer');
     expect([...a.files.values()].filter((t) => t.startsWith('request (entry'))).toHaveLength(2);
+  });
+
+  it('runs when exchangeDrop is the only stage on', async () => {
+    const out = await compactSession(sessionRows(), cfg({ proseTrim: false, notificationTrim: false, injectTrim: false, replyTrim: false }) as any, fetchWith(0.01), memory());
+    expect(out.exchanges?.stats.dropped).toBe(2);
   });
 
   it('changes nothing when exchangeDrop is off, without an archive, or when every exchange is still needed', async () => {
