@@ -1,5 +1,7 @@
 # fast-jev-compaction
 
+A fork of [tamaratran/fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction) with context-relative minimums, a result cap, input trim and a hybrid rescue (built-in summary of the older history only). See the version history in `git log`.
+
 Claude Code and Codex plugin for Jev-guided selective compaction. Claude Code
 replaces the compaction summary with Jev decisions:
 every tool call and result is scored in one fast request, stale ones are
@@ -201,7 +203,7 @@ Then add this repository as a plugin marketplace and install the plugin,
 either from the shell or as slash commands inside a session:
 
 ```sh
-claude plugin marketplace add tamaratran/fast-jev-compaction
+claude plugin marketplace add Y-B-1/fast-jev-compaction-plus
 claude plugin install fast-jev-compaction@fast-jev-compaction
 ```
 
