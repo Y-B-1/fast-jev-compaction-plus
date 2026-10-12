@@ -34,10 +34,11 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   maxStateTokens: 25_000,
   maxRequestTokens: 60_000,
   maxConcurrentRequests: 4,
-  truncateHeadChars: 300,
+  truncateHeadChars: 150,
   resultPreviewChars: 300,
-  salvageChars: 300,
+  salvageChars: 150,
   minResultChars: 500,
+  maxKeptResultChars: 4000,
   dedupeRepeats: true,
   minKeepSignalCalls: 3,
 };
@@ -100,6 +101,10 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
     minResultChars: Math.max(
       0,
       Math.floor(finite(options.minResultChars, DEFAULT_OPTIONS.minResultChars)),
+    ),
+    maxKeptResultChars: Math.max(
+      0,
+      Math.floor(finite(options.maxKeptResultChars, DEFAULT_OPTIONS.maxKeptResultChars)),
     ),
     dedupeRepeats: options.dedupeRepeats ?? DEFAULT_OPTIONS.dedupeRepeats,
     minKeepSignalCalls: Math.max(
@@ -287,12 +292,8 @@ function truncatedResultText(
   // Messages API rejects on every subsequent turn.
   const cut = splitsSurrogatePair(text, headChars) ? headChars - 1 : headChars;
   const head = cut > 0 ? `${text.slice(0, cut)}\n` : '';
-  const where = archivedPath
-    ? `; full output: ${archivedPath} (Read or grep it if needed)`
-    : '; re-run the tool if needed';
-  const note = `[fast-jev-compaction truncated ${text.length - cut} chars of this tool result${
-    isError ? ' (error)' : ''
-  }${where}]`;
+  const where = archivedPath ? `; full output: ${archivedPath}` : '; re-run the tool if needed';
+  const note = `[fast-jev-compaction truncated ${text.length - cut} chars${isError ? ' (error)' : ''}${where}]`;
   // Identifiers and error lines recovered from the dropped tail: the head is
   // preamble for a listing or a build log, and the useful parts live further
   // down where they would otherwise be lost until the tool is re-run.
@@ -310,7 +311,7 @@ function droppedCallNote(tool: ToolUse, archivedPath: string | undefined): strin
   }
   if (input.length > 160) input = `${input.slice(0, 159)}…`;
   return `[fast-jev-compaction removed the ${tool.tool} call ${input}${
-    archivedPath ? `; full output: ${archivedPath} (Read or grep it if needed)` : ''
+    archivedPath ? `; full output: ${archivedPath}` : ''
   }]`;
 }
 
@@ -339,13 +340,27 @@ export function applyDecisions(
   headChars: number,
   archive?: ArchiveResult,
   salvageChars = 0,
+  capChars = 0,
 ): Message[] {
   const byId = new Map(calls.map((call) => [call.id, call]));
-  const actions = new Map<string, CallDecision['action']>();
+  // `cap`: a result Jev kept whole that is longer than `capChars`, cut to its
+  // first `capChars` like a dropped result.
+  const actions = new Map<string, CallDecision['action'] | 'cap'>();
   for (const decision of decisions) {
     const call = byId.get(decision.id);
-    if (call && decision.action !== 'keep') actions.set(call.tool_use_id, decision.action);
+    if (!call) continue;
+    if (decision.action !== 'keep') actions.set(call.tool_use_id, decision.action);
+    else if (decision.reason === 'kept' && capChars > 0 && call.resultChars > capChars + 120) {
+      actions.set(call.tool_use_id, 'cap');
+    }
   }
+  const cutResult = (id: string, text: string, isError: boolean): string => {
+    const action = actions.get(id);
+    if (action !== 'drop_result' && action !== 'cap') return text;
+    return action === 'cap'
+      ? truncatedResultText(text, isError, capChars, archive?.(id, text), 0)
+      : truncatedResultText(text, isError, headChars, archive?.(id, text), salvageChars);
+  };
   const kept: Message[] = [];
   for (const message of messages) {
     const touched =
@@ -369,14 +384,7 @@ export function applyDecisions(
     const toolUses = message.toolUses
       .filter((tool) => actions.get(tool.tool_use_id) !== 'drop_call')
       .map((tool) => {
-        if (actions.get(tool.tool_use_id) !== 'drop_result') return tool;
-        const text = truncatedResultText(
-          tool.text ?? '',
-          tool.isError ?? false,
-          headChars,
-          archive?.(tool.tool_use_id, tool.text ?? ''),
-          salvageChars,
-        );
+        const text = cutResult(tool.tool_use_id, tool.text ?? '', tool.isError ?? false);
         if ((tool.text ?? '') === text) return tool;
         const copy: ToolUse = {
           tool_use_id: tool.tool_use_id,
@@ -390,14 +398,7 @@ export function applyDecisions(
     const toolResults = (message.toolResults ?? [])
       .filter((result) => actions.get(result.tool_use_id) !== 'drop_call')
       .map((result) => {
-        if (actions.get(result.tool_use_id) !== 'drop_result') return result;
-        const text = truncatedResultText(
-          result.text,
-          result.isError ?? false,
-          headChars,
-          archive?.(result.tool_use_id, result.text),
-          salvageChars,
-        );
+        const text = cutResult(result.tool_use_id, result.text, result.isError ?? false);
         return text === result.text
           ? result
           : {
@@ -563,6 +564,12 @@ export async function compact(
     resolved.truncateHeadChars,
     options.archive,
     resolved.salvageChars,
+    resolved.maxKeptResultChars,
+  );
+  const capped = new Set(
+    calls
+      .filter((call) => resolved.maxKeptResultChars > 0 && call.resultChars > resolved.maxKeptResultChars + 120)
+      .map((call) => call.id),
   );
   return {
     messages: kept,
@@ -580,6 +587,8 @@ export async function compact(
       small: count(decisions, 'small'),
       compacted: count(decisions, 'compacted'),
       duplicates: count(decisions, 'duplicate'),
+      resultsCapped: decisions.filter((d) => d.reason === 'kept' && capped.has(d.id)).length,
+      inputsElided: 0,
       blocksDeduped: deduped.removed,
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,

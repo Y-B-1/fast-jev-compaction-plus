@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
@@ -56,7 +56,7 @@
       "type": "number",
       "title": "Truncated tool result head",
       "description": "Characters of a tool result kept when Jev decides its full output is no longer needed; 0 keeps only the note.",
-      "default": 300
+      "default": 150
     },
     "resultPreviewChars": {
       "type": "number",
@@ -68,7 +68,19 @@
       "type": "number",
       "title": "Salvaged identifiers and errors",
       "description": "Characters of identifiers and error lines recovered from the dropped part of a tool result and kept alongside its truncation note; 0 disables.",
-      "default": 300
+      "default": 150
+    },
+    "maxKeptResultChars": {
+      "type": "number",
+      "title": "Cap on tool results Jev keeps whole",
+      "description": "A tool result outside the newest messages that Jev keeps whole is still cut to its first this many characters, with the full text archived and cited; 0 disables.",
+      "default": 4000
+    },
+    "inputTrim": {
+      "type": "boolean",
+      "title": "Cut old code bodies in tool inputs",
+      "description": "On by default: on every compaction, cut the code bodies of old tool inputs (Write and Edit contents, notebook sources, workflow scripts, Bash heredocs) to a short head and a note, archiving the full text when archiveResults is on. The newest messages are never touched.",
+      "default": true
     },
     "proseTrim": {
       "type": "boolean",

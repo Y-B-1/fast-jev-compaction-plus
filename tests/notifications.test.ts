@@ -115,14 +115,14 @@ describe('strip (plan item 1)', () => {
 });
 
 describe('fold (plan item 2)', () => {
-  test('a noul below the rung folds the body to a 300-character head, a marker and a salvage block', async () => {
+  test('a noul below the rung folds the body to a truncateHeadChars head, a marker and a salvage block', async () => {
     const original = notification();
     const { out } = await applied([original], 0.15, 0.1);
     const text = out.messages[2]!.text;
-    const marker = `[fast-jev-compaction folded ${BODY.length - 300} chars of this task result and removed its usage and diagnostics; full notification: ${archiveAt('notif-a1b2c3')} (Read or grep it if needed)]`;
+    const marker = `[fast-jev-compaction folded ${BODY.length - options.truncateHeadChars} chars of this task result and removed its usage and diagnostics; full notification: ${archiveAt('notif-a1b2c3')} (Read or grep it if needed)]`;
     const lines = text.split('\n');
     expect(lines).toContain(marker);
-    expect(text).toContain(`<result>${BODY.slice(0, 300)}\n${marker}\n`);
+    expect(text).toContain(`<result>${BODY.slice(0, options.truncateHeadChars)}\n${marker}\n`);
     expect(text).toContain('errors: error: build failed in src/cache/store.ts at 4f3a9c2 with exit code 2.');
     expect(text).toContain('refs: src/cache/store.ts 4f3a9c2');
     expect(text).toContain('\n</result>');

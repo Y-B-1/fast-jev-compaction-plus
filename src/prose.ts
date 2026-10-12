@@ -252,6 +252,8 @@ function withCommas(n: number): string {
   return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
+export const ELIDED_MARKER = '[fast-jev-compaction elided ';
+
 /**
  * A code body cut to its first `headChars`, a note naming what was elided (`label` is
  * "Tool.field for path"), and a salvage block for the tail. The original when that is not shorter.
@@ -263,11 +265,13 @@ export function elideBody(
   salvageChars: number,
   archivedPath?: string,
 ): string {
-  if (text.length <= headChars + 120) return text;
+  // A body an earlier pass already cut stays as it is: cutting it again would
+  // archive the stub over the full text saved the first time.
+  if (text.length <= headChars + 120 || text.includes(ELIDED_MARKER)) return text;
   const cut = Math.max(0, splitsSurrogatePair(text, headChars) ? headChars - 1 : headChars);
   const head = cut > 0 ? `${text.slice(0, cut)}\n` : '';
-  const note = `[fast-jev-compaction elided ${withCommas(text.length - cut)} chars of ${label}${
-    archivedPath ? `; full output: ${archivedPath} (Read or grep it if needed)` : '; Read the file if needed'
+  const note = `${ELIDED_MARKER}${withCommas(text.length - cut)} chars of ${label}${
+    archivedPath ? `; full output: ${archivedPath}` : '; Read the file if needed'
   }]`;
   const salvaged = salvageBlock(text.slice(cut), salvageChars);
   const out = salvaged ? `${head}${note}\n${salvaged}` : `${head}${note}`;
@@ -712,6 +716,48 @@ export function applyProse(
     out.push(rebuilt);
   });
   return { messages: out, decisions, stats };
+}
+
+/**
+ * Cuts the code bodies of old tool inputs (Write/Edit contents, notebook sources, workflow
+ * scripts, Bash heredocs) by rule, with no Jev request: the same cut `applyProse` makes, run on
+ * every compaction. Covers the calls `scoreProse` would plan; prose inputs, pinned messages and
+ * dropped calls stay as they are. Untouched messages come back as the same objects.
+ */
+export function elideInputs(
+  messages: readonly Message[],
+  actions: ReadonlyMap<string, CallDecision>,
+  options: Pick<ProseTrimOptions, 'preserveRecentMessages' | 'truncateHeadChars' | 'salvageChars' | 'archive'>,
+): { messages: Message[]; fields: number; saved: number } {
+  const total = messages.length;
+  const pinned = (i: number): boolean => isPinned(i, total, options.preserveRecentMessages);
+  const resultAt = new Map<string, number>();
+  messages.forEach((m, i) => m.toolResults?.forEach((r) => resultAt.set(r.tool_use_id, i)));
+  let fields = 0;
+  let saved = 0;
+  const out = messages.map((m, i) => {
+    if (m.role !== 'assistant' || pinned(i)) return m;
+    let changed = false;
+    const toolUses = m.toolUses.map((tool) => {
+      const action = actions.get(tool.tool_use_id);
+      if (!action || action.reason === 'pinned' || (action.action !== 'keep' && action.action !== 'drop_result')) return tool;
+      const at = resultAt.get(tool.tool_use_id);
+      if (at !== undefined && pinned(at)) return tool;
+      const field = PROSE_INPUTS[tool.tool];
+      if (field !== undefined && typeof tool.input[field] === 'string') return tool;
+      const elision = elideInput(tool, options.truncateHeadChars, options.salvageChars, options.archive);
+      if (!elision) return tool;
+      changed = true;
+      fields += elision.fields;
+      saved += elision.saved;
+      const copy: ToolUse = { tool_use_id: tool.tool_use_id, tool: tool.tool, input: elision.input };
+      if (tool.text !== undefined) copy.text = tool.text;
+      if (tool.isError !== undefined) copy.isError = tool.isError;
+      return copy;
+    });
+    return changed ? { ...m, toolUses } : m;
+  });
+  return { messages: out, fields, saved };
 }
 
 /**

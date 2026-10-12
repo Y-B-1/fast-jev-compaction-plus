@@ -500,7 +500,7 @@ describe('scoreProse + applyProse (Jev trim stage)', () => {
       expect(calls[0]![0]).toContain('w1');
       expect(calls[0]![1]).toBe(body);
       const cut = out.messages[1]!.toolUses[0]!.input['content'] as string;
-      expect(cut).toContain('; full output: arch/out.txt#1 (Read or grep it if needed)]');
+      expect(cut).toContain('; full output: arch/out.txt#1]');
       expect(cut).not.toContain('Read the file if needed');
     });
 
@@ -511,7 +511,7 @@ describe('scoreProse + applyProse (Jev trim stage)', () => {
       const out = await trimProse(messages, actionsOf(messages), asker(() => 0.9), { ...OPTS, archive });
       expect(calls.map(([, text]) => text)).toEqual([body]);
       const cut = out.messages[1]!.toolUses[0]!.input['command'] as string;
-      expect(cut).toContain('full output: arch/out.txt#1 (Read or grep it if needed)');
+      expect(cut).toContain('full output: arch/out.txt#1]');
       expect(cut.endsWith('\nEOF\necho done')).toBe(true);
     });
 

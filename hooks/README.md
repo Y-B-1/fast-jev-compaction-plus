@@ -55,19 +55,27 @@ The plugin declares these `userConfig` values in
 | `minReductionRatio` | `0.25` |
 | `maxStateTokens` | `25000` |
 | `maxRequestTokens` | `60000` |
-| `truncateHeadChars` | `300` |
+| `truncateHeadChars` | `150` |
 | `resultPreviewChars` | `300` |
-| `salvageChars` | `300` |
+| `salvageChars` | `150` |
+| `maxKeptResultChars` | `4000` |
+| `inputTrim` | `true` |
 | `jevPruneBashOutput` | `false` |
 | `jevPruneMinChars` | `4000` |
 | `model` | `jev-latest` |
+
+Each compaction logs what the model reads before it, from Claude Code's own
+Messages API view (`$.session.messages({ as: 'api' })`): estimated tokens of
+user text, assistant text, thinking, tool inputs and tool results, and the
+number of images. After a compaction that replaces the history it logs the
+kept history's size against the original.
 
 The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
 through `TYPESAFE_API_KEY`. The environment variable is the recommended
 development setup.
 
 Every option except `apiKey`, `archiveResults`, `minReductionRatio`,
-`jevPruneBashOutput`, `jevPruneMinChars` and `model` is passed straight to the
+`jevPruneBashOutput`, `jevPruneMinChars`, `inputTrim` and `model` is passed straight to the
 library; see the root README for what they do. The `session.compact` hook runs the Jev requests concurrently. If Jev fails,
 the response is malformed, the key is unavailable, the history cannot be
 fitted into the state budget, or the estimated reduction is below

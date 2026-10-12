@@ -142,7 +142,7 @@ export interface CompactOptions {
   /** Maximum concurrent Jev requests. Default 4. A batch that still fails after
    * the asker's own retries is salvaged: its calls are simply left unanswered. */
   maxConcurrentRequests?: number;
-  /** Characters of a dropped tool result to retain. Default 300. */
+  /** Characters of a dropped tool result to retain. Default 150. */
   truncateHeadChars?: number;
   /**
    * Characters from each end of a tool result quoted in its keep question, so
@@ -154,12 +154,18 @@ export interface CompactOptions {
    * Characters of identifiers and error lines salvaged from the dropped part
    * of a tool result and kept alongside its truncation note, since the head
    * alone is often preamble for a listing or a build log. 0 disables. Default
-   * 300.
+   * 150.
    */
   salvageChars?: number;
   /**
+   * A result Jev keeps whole (outside the newest messages) that is longer than
+   * this is still cut to its first `maxKeptResultChars`, with the full text
+   * archived. 0 disables. Default 4000.
+   */
+  maxKeptResultChars?: number;
+  /**
    * A tool result shorter than this is always kept and never asked about: it
-   * costs little to keep, and dropping it saves next to nothing (a 300-char head plus the marker is about 420). Default 500; a live run on 8 cases showed 1500 cost 1-3 points of reduction, 500 none.
+   * costs little to keep, and dropping it saves next to nothing (a 150-char head plus the marker and salvage is about 400). Default 500; a live run on 8 cases showed 1500 cost 1-3 points of reduction, 500 none.
    */
   minResultChars?: number;
   /**
@@ -191,6 +197,7 @@ export interface ResolvedCompactOptions {
   resultPreviewChars: number;
   salvageChars: number;
   minResultChars: number;
+  maxKeptResultChars: number;
   dedupeRepeats: boolean;
   minKeepSignalCalls: number;
 }
@@ -215,6 +222,10 @@ export interface CompactResult {
     compacted: number;
     /** Earlier copies of a repeated call whose results were truncated without asking. */
     duplicates: number;
+    /** Results Jev kept whole that were cut to `maxKeptResultChars`. */
+    resultsCapped: number;
+    /** Old code bodies in tool inputs cut by the hook's input trim. */
+    inputsElided: number;
     /** Earlier copies of repeated injected blocks replaced by a marker. */
     blocksDeduped: number;
     stateTokens: number;

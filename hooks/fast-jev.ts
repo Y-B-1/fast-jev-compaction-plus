@@ -20,6 +20,7 @@ import type { NotificationStats, Rung } from '../src/notifications.js';
 import {
   PROSE_KEEP_LADDER,
   callActions,
+  elideInputs,
   ladderRescue,
   scoreProse,
   type ProseStats,
@@ -58,6 +59,8 @@ const HOOK_DEFAULTS = {
   jevPruneMinChars: 4_000,
   /** On by default: hand messages back in the shape that survives `--resume`; see `resumeSafeMessages`. */
   stripHandles: true,
+  /** On by default: cut the code bodies of old tool inputs (Write/Edit contents, Bash heredocs) on every compaction, by rule; see `elideInputs`. */
+  inputTrim: true,
 };
 
 
@@ -91,6 +94,8 @@ export type HookConfig = CompactOptions & {
   jevPruneMinChars: number;
   /** See `resumeSafeMessages`. */
   stripHandles: boolean;
+  /** See `HOOK_DEFAULTS.inputTrim`. */
+  inputTrim: boolean;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -136,6 +141,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     'resultPreviewChars',
     'salvageChars',
     'minResultChars',
+    'maxKeptResultChars',
     'minKeepSignalCalls',
   ] as const) {
     const value = options[key];
@@ -171,6 +177,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       typeof options['stripHandles'] === 'boolean'
         ? options['stripHandles']
         : HOOK_DEFAULTS.stripHandles,
+    inputTrim:
+      typeof options['inputTrim'] === 'boolean' ? options['inputTrim'] : HOOK_DEFAULTS.inputTrim,
     ...(typeof options['dedupeRepeats'] === 'boolean'
       ? { dedupeRepeats: options['dedupeRepeats'] }
       : {}),
@@ -549,10 +557,25 @@ export async function compactSession(
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
   const asker = jevAsker(fetchFn, config.apiKey, config.model, askerOptions);
-  const result = await compact(messages, asker, {
+  let result = await compact(messages, asker, {
     ...config,
     ...(archive ? { archive: archive.cite } : {}),
   });
+  if (config.inputTrim) {
+    const options = resolveOptions(config);
+    const cut = elideInputs(
+      result.messages,
+      callActions(messages, result.decisions, options.preserveRecentMessages),
+      { ...options, ...(archive ? { archive: archive.cite } : {}) },
+    );
+    if (cut.fields > 0) {
+      result = {
+        ...result,
+        messages: cut.messages,
+        stats: { ...result.stats, charsAfter: result.stats.charsAfter - cut.saved, inputsElided: cut.fields },
+      };
+    }
+  }
   if (archive) await archive.flush();
   const tool = { result, messages: toSessionMessages(messages, result.messages) };
   const trimNotifications =
@@ -786,6 +809,72 @@ export function messageTarget(contextTokens: number | undefined, historyTokens: 
 }
 
 /** An interrupted dispatch is vetoed quietly: no summary, nothing replaced. */
+export type ContextBreakdown = {
+  userText: number;
+  assistantText: number;
+  thinking: number;
+  toolInputs: number;
+  toolResults: number;
+  images: number;
+};
+
+/**
+ * Estimated tokens per kind of content in the Messages API form of the conversation, the form
+ * the model reads (`$.session.messages({ as: 'api' })`); images are counted, not sized.
+ */
+export function contextBreakdown(
+  messages: readonly { role: string; content: readonly unknown[] }[],
+): ContextBreakdown {
+  const out: ContextBreakdown = { userText: 0, assistantText: 0, thinking: 0, toolInputs: 0, toolResults: 0, images: 0 };
+  const json = (value: unknown): string => {
+    try {
+      return JSON.stringify(value) ?? '';
+    } catch {
+      return '';
+    }
+  };
+  for (const message of messages) {
+    for (const raw of message.content) {
+      const block = (raw ?? {}) as Record<string, unknown>;
+      switch (block['type']) {
+        case 'text': {
+          const tokens = estimateTokens(String(block['text'] ?? ''));
+          if (message.role === 'assistant') out.assistantText += tokens;
+          else out.userText += tokens;
+          break;
+        }
+        case 'thinking':
+          out.thinking += estimateTokens(String(block['thinking'] ?? ''));
+          break;
+        case 'tool_use':
+          out.toolInputs += estimateTokens(json(block['input']));
+          break;
+        case 'tool_result': {
+          const content = block['content'];
+          if (typeof content === 'string') out.toolResults += estimateTokens(content);
+          else if (Array.isArray(content)) {
+            for (const part of content as Record<string, unknown>[]) {
+              if (part?.['type'] === 'image') out.images++;
+              else out.toolResults += estimateTokens(typeof part?.['text'] === 'string' ? part['text'] : json(part));
+            }
+          }
+          break;
+        }
+        case 'image':
+          out.images++;
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  return out;
+}
+
+export function formatBreakdown(b: ContextBreakdown): string {
+  return `user text ~${b.userText}, assistant text ~${b.assistantText}, thinking ~${b.thinking}, tool inputs ~${b.toolInputs}, tool results ~${b.toolResults}, images ${b.images}`;
+}
+
 function interrupted($: { ui: { log: (text: string) => void } }): { skip: string } {
   log($, 'compaction interrupted; nothing changed');
   return { skip: 'fast-jev-compaction: interrupted' };
@@ -835,6 +924,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (contextTokens !== undefined) {
         log($, `context ${contextTokens} tokens, history ~${historyTokens} tokens, history cut needed ${percent(target)}`);
       }
+      try {
+        log($, `history as the model sees it: ${formatBreakdown(contextBreakdown(await $.session.messages({ as: 'api' })))}`);
+      } catch {
+        // Diagnostics only: an engine without the API form still compacts.
+      }
       if (target >= 1 && target > configured.minReductionRatio) {
         const reason = `history is too small a share of the context to free ${percent(configured.minReductionRatio)}`;
         if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
@@ -882,6 +976,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         );
         return next(event);
       }
+      log($, `kept history ~${messageTokens(messages)} tokens of ~${historyTokens}`);
       notify(
         $,
         `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose, notifications)})`,

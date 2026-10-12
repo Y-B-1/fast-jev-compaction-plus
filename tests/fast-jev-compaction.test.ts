@@ -88,9 +88,10 @@ describe('options', () => {
       preserveRecentMessages: 6,
       maxStateTokens: 25_000,
       maxRequestTokens: 60_000,
-      truncateHeadChars: 300,
+      truncateHeadChars: 150,
       resultPreviewChars: 300,
-      salvageChars: 300,
+      salvageChars: 150,
+      maxKeptResultChars: 4000,
     });
     expect(resolveOptions({
       keepThreshold: Number.NaN,
@@ -402,13 +403,13 @@ describe('decisions', () => {
 
     const kept = applyDecisions(messages, decisions, calls, 50);
     expect(kept[2]?.toolResults?.[0]?.text).toBe(
-      `${original.slice(0, 50)}\n[fast-jev-compaction truncated ${total - 50} chars of this tool result; re-run the tool if needed]`,
+      `${original.slice(0, 50)}\n[fast-jev-compaction truncated ${total - 50} chars; re-run the tool if needed]`,
     );
     expect(kept[1]?.toolUses[0]?.text).toBe(kept[2]?.toolResults?.[0]?.text);
 
     const noHead = applyDecisions(messages, decisions, calls, 0);
     expect(noHead[2]?.toolResults?.[0]?.text).toBe(
-      `[fast-jev-compaction truncated ${total} chars of this tool result; re-run the tool if needed]`,
+      `[fast-jev-compaction truncated ${total} chars; re-run the tool if needed]`,
     );
   });
 
@@ -433,7 +434,7 @@ describe('decisions', () => {
   it('never cuts the head of a dropped result inside a surrogate pair', () => {
     const emoji = '\u{1F600}';
     const note = (omitted: number): string =>
-      `[fast-jev-compaction truncated ${omitted} chars of this tool result; re-run the tool if needed]`;
+      `[fast-jev-compaction truncated ${omitted} chars; re-run the tool if needed]`;
     const truncated = (text: string): string | undefined => {
       const messages = transcript();
       messages[1]!.toolUses[0]!.text = text;

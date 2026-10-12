@@ -88,6 +88,7 @@ describe('hook config', () => {
       jevPruneBashOutput: false,
       jevPruneMinChars: 4_000,
       stripHandles: true,
+      inputTrim: true,
     });
     expect(
       resolveHookConfigLib({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g' }),
@@ -104,6 +105,7 @@ describe('hook config', () => {
       jevPruneBashOutput: false,
       jevPruneMinChars: 4_000,
       stripHandles: true,
+      inputTrim: true,
     });
   });
 
@@ -118,6 +120,12 @@ describe('hook config', () => {
     expect(resolveHookConfig({ builtinFallback: 'always' }).builtinFallback).toBe('always');
     expect(resolveHookConfig({ builtinFallback: 'never' }).builtinFallback).toBe('never');
     expect(resolveHookConfig({ builtinFallback: 'sometimes' }).builtinFallback).toBe('auto');
+  });
+
+  it('reads inputTrim and maxKeptResultChars from userConfig', () => {
+    expect(resolveHookConfig({ inputTrim: false }).inputTrim).toBe(false);
+    expect(resolveHookConfig({ inputTrim: 'no' }).inputTrim).toBe(true);
+    expect(resolveHookConfig({ maxKeptResultChars: 0 }).maxKeptResultChars).toBe(0);
   });
 });
 
@@ -1005,7 +1013,7 @@ describe('proseTrim rescue', () => {
       it('archives the cut body and cites it when archiveResults is on', async () => {
         const { out, files } = await run(true);
         const cut = written(out);
-        const path = /full output: (\S+) \(Read or grep it if needed\)/.exec(cut)?.[1];
+        const path = /full output: (\S+?)\]/.exec(cut)?.[1];
         expect(path).toBeDefined();
         expect(files.get(path!)).toBe(body);
         expect(files.get('.claude/fast-jev-compaction/.gitignore')).toBe('*\n');
