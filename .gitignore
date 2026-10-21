@@ -2,4 +2,3 @@ node_modules
 dist
 .env
 demo/JevDemo/build
-__pycache__/

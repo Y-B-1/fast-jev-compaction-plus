@@ -2,12 +2,27 @@
 
 A fork of [tamaratran/fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction) with context-relative minimums, a result cap, input trim and a hybrid rescue (built-in summary of the older history only). See the version history in `git log`.
 
-Claude Code and Codex plugin for Jev-guided selective compaction. Claude Code
-replaces the compaction summary with Jev decisions:
-every tool call and result is scored in one fast request, stale ones are
-dropped or truncated, everything kept stays verbatim. Also usable as an npm
-library. Codex uses a version-pinned native runtime bridge; see
-[Codex installation](docs/codex-install.md).
+Claude Code plugin for Jev-guided selective compaction. It replaces the
+compaction summary with Jev decisions: every tool call and result is scored in
+one fast request, stale ones are dropped or truncated, everything kept stays
+verbatim. Also usable as an npm library.
+
+### Where it runs
+
+It needs Claude Code's `session.compact` function hook, the one place a plugin
+can hand back its own history instead of a summary. So it runs wherever Claude
+Code itself runs: the `claude` CLI, the IDE extensions, and apps that drive
+Claude Code underneath, such as [Orca](https://github.com/stablyai/orca) (which
+starts `claude` in its terminals and uses the Claude Agent SDK) and
+[T3 Code](https://github.com/pingdotgg/t3code) (Claude Agent SDK, loading your
+user settings). In those apps, put the two variables below in the `env` block of
+`~/.claude/settings.json` rather than your shell, since the app starts Claude
+Code with its own environment.
+
+It does not run in Cursor or Codex. Cursor's `preCompact` hook only observes a
+compaction (its only output is a message to the user), and stock Codex's
+`PreCompact`/`PostCompact` hooks cannot return a history either; replacing it
+there takes a patched Codex runtime, which this repository dropped in 0.14.0.
 
 ## What and why
 

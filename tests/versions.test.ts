@@ -8,7 +8,6 @@ describe('release versions', () => {
     const version = json('package.json').version;
     const market = json('.claude-plugin/marketplace.json');
     expect(json('.claude-plugin/plugin.json').version).toBe(version);
-    expect(json('.codex-plugin/plugin.json').version).toBe(version);
     expect(market.version).toBe(version);
     expect(json('package-lock.json').version).toBe(version);
     expect(json('package-lock.json').packages[''].version).toBe(version);
