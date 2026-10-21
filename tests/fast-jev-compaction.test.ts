@@ -897,3 +897,11 @@ describe('result preview', () => {
     expect(Object.values(questionsFor(plain!))[1]!.instructions).not.toContain('preview');
   });
 });
+
+describe('request body', () => {
+  it('replaces lone surrogates from raw tool output and keeps real pairs', () => {
+    const request = buildJevRequest({ apiKey: 'k' }, { output: 'a\uD83D b \uDE00 c 😀' } as never, {});
+    expect(request.body).not.toMatch(/\\ud[89a-f][0-9a-f]{2}/i);
+    expect(JSON.parse(request.body).state.output).toBe('a� b � c 😀');
+  });
+});

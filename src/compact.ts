@@ -284,6 +284,11 @@ export function splitsSurrogatePair(text: string, index: number): boolean {
   return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
 }
 
+/** The first `chars` characters of `text`, one fewer when the cut would split a surrogate pair. */
+export function headOf(text: string, chars: number): string {
+  return text.slice(0, splitsSurrogatePair(text, chars) ? chars - 1 : chars);
+}
+
 function truncatedResultText(
   text: string,
   isError: boolean,
@@ -314,7 +319,7 @@ function droppedCallNote(tool: ToolUse, archivedPath: string | undefined): strin
   } catch {
     input = '{}';
   }
-  if (input.length > 160) input = `${input.slice(0, 159)}…`;
+  if (input.length > 160) input = `${headOf(input, 159)}…`;
   return `[fast-jev-compaction removed the ${tool.tool} call ${input}${
     archivedPath ? `; full output: ${archivedPath}` : ''
   }]`;

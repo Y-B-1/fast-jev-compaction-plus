@@ -1,4 +1,4 @@
-import { messageChars, reductionRatio } from './compact.js';
+import { headOf, messageChars, reductionRatio } from './compact.js';
 import { goalIndices, isPromptRow } from './inject.js';
 import { type NotificationOptions, askNoul } from './notifications.js';
 import { PROSE_KEEP_LADDER } from './prose.js';
@@ -194,7 +194,7 @@ export function applyExchanges(
       calls += (messages[i] as Message).toolUses.length;
     }
     const reply = lastReply(messages, e.work);
-    const head = reply.length > REPLY_HEAD_CHARS ? `${reply.slice(0, REPLY_HEAD_CHARS)}…` : reply;
+    const head = reply.length > REPLY_HEAD_CHARS ? `${headOf(reply, REPLY_HEAD_CHARS)}…` : reply;
     const marker = `${MARKER}archived this exchange: ${e.work[1] - e.work[0]} rows, ${calls} tool calls${
       calls > 0 ? ` (${toolList(e.tools)})` : ''
     }, ${chars} chars; full text: ${path} (Read it if needed)]`;

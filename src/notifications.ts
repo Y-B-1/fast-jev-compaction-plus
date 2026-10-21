@@ -38,7 +38,14 @@ export type NotificationOptions = Pick<
   | 'resultPreviewChars'
   | 'salvageChars'
   | 'goal'
->;
+> & {
+  /**
+   * The conversation holds images: a typed prompt the engine still holds whole
+   * (it carries a handle) may be one of them, and folding it would rebuild the
+   * row from its text alone and lose the image, so such prompts stay.
+   */
+  imagesInContext?: boolean;
+};
 
 export type NotificationStats = {
   /** Notifications the stage may rewrite. */

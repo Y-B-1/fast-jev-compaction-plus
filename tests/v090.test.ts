@@ -284,6 +284,29 @@ describe('hybridSplit', () => {
     const ms = [...turn(1, 100), ...turn(2, 9000)];
     expect(hybridSplit(ms, messageTokens(ms), 0.3)).toBe(0);
   });
+  it('never splits at a host notice inside an open parallel tool run', () => {
+    const big = 'x y z '.repeat(3000);
+    const ms: SessionMessage[] = [
+      message('user', 'start'),
+      message('assistant', `big work ${big}`),
+      message('user', 'go'),
+      { ...call('a', 'Read', {}, ''), toolUses: [
+        { tool_use_id: 'a', tool: 'Read', input: {} },
+        { tool_use_id: 'b', tool: 'Read', input: {} },
+      ] } as SessionMessage,
+      result('a', big),
+      message('user', '<system-reminder>file changed</system-reminder>'),
+      result('b', 'rb'),
+      message('assistant', 'done'),
+    ];
+    const split = hybridSplit(ms, messageTokens(ms), 0.3);
+    expect(split).not.toBe(5);
+    const tail = ms.slice(split);
+    const orphans = tail
+      .flatMap((m) => m.toolResults ?? [])
+      .filter((r) => !tail.some((m) => m.toolUses.some((u) => u.tool_use_id === r.tool_use_id)));
+    if (split > 0) expect(orphans).toEqual([]);
+  });
   it('never returns 0 as a split of the first message', () => {
     const ms = turn(1, 100);
     expect(hybridSplit(ms, messageTokens(ms), 0.99)).toBe(0);

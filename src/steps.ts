@@ -1,4 +1,4 @@
-import { messageChars } from './compact.js';
+import { headOf, messageChars } from './compact.js';
 import { TYPED_WORK } from './exchanges.js';
 import { type NotificationOptions, askNoul } from './notifications.js';
 import { PROSE_KEEP_LADDER } from './prose.js';
@@ -197,7 +197,7 @@ export function planSteps(scores: StepScores, pathOf: (id: string) => string): S
     }, ${step.chars} chars; full text: ${path} (Read it if needed)]`;
     const row: Message = {
       role: 'assistant',
-      text: note ? `${marker}\nNote: ${note.length > NOTE_CHARS ? `${note.slice(0, NOTE_CHARS)}…` : note}` : marker,
+      text: note ? `${marker}\nNote: ${note.length > NOTE_CHARS ? `${headOf(note, NOTE_CHARS)}…` : note}` : marker,
       toolUses: [],
     };
     const saved = step.chars - messageChars(row);

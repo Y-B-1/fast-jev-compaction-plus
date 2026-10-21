@@ -69,7 +69,7 @@ export async function trimRescue(input: {
   messages: readonly Message[];
   result: CompactResult;
   asker: JevAsker;
-  options: ResolvedCompactOptions;
+  options: ResolvedCompactOptions & { imagesInContext?: boolean };
   proseTrim: boolean;
   /** Score and fold `<task-notification>` reports; default true. */
   notificationTrim?: boolean;

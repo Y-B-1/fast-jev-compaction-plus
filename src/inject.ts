@@ -64,14 +64,21 @@ export type InjectApplied = {
 };
 
 /** Finds the blocks: unpinned prompt rows outside the goal, holding no marker of ours, with a span worth folding. */
-export function findBlocks(messages: readonly Message[], preserveRecentMessages: number, headChars: number): Block[] {
+export function findBlocks(
+  messages: readonly Message[],
+  preserveRecentMessages: number,
+  headChars: number,
+  imagesInContext = false,
+): Block[] {
   const goal = goalIndices(messages);
   const blocks: Block[] = [];
   messages.forEach((message, index) => {
     if (!isPromptRow(message) || goal.has(index) || isPinned(index, messages.length, preserveRecentMessages)) return;
     if (message.text.includes(MARKER)) return;
+    const engineHeld = (message as { handle?: string }).handle !== undefined;
     for (const { kind, span } of injectedSpans(message.text)) {
       if (span[1] - span[0] <= headChars + FOLD_MARGIN) continue;
+      if (imagesInContext && engineHeld && (kind === 'long' || kind === 'paste')) continue;
       blocks.push({ index, key: `i${blocks.length + 1}`, kind, span });
     }
   });
@@ -121,7 +128,7 @@ export async function scoreInjected(
   const stats = emptyStats();
   const base = { messages, headChars: options.truncateHeadChars, salvageChars: options.salvageChars };
   try {
-    const blocks = findBlocks(messages, options.preserveRecentMessages, options.truncateHeadChars);
+    const blocks = findBlocks(messages, options.preserveRecentMessages, options.truncateHeadChars, options.imagesInContext);
     stats.eligible = blocks.length;
     if (blocks.length === 0) return { ...base, blocks, noul: new Map(), stats };
     const questions = blocks.map((b) => [b.key, question(b, (messages[b.index] as Message).text, options.resultPreviewChars)] as const);

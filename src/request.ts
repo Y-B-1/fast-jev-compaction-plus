@@ -30,12 +30,26 @@ export function buildJevRequest(
       authorization: `Bearer ${params.apiKey}`,
       'content-type': 'application/json',
     },
-    body: JSON.stringify({
-      model: params.model ?? DEFAULT_MODEL,
-      state,
-      questions,
-    }),
+    body: JSON.stringify(
+      {
+        model: params.model ?? DEFAULT_MODEL,
+        state,
+        questions,
+      },
+      (_key, value) => (typeof value === 'string' ? wellFormed(value) : value),
+    ),
   };
+}
+
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/**
+ * Replaces lone surrogates with U+FFFD. The plugin's own cuts keep pairs whole,
+ * but raw tool output can carry a lone half, which JSON.stringify escapes as
+ * `\udXXX` and Jev rejects with a 400 for the whole request.
+ */
+export function wellFormed(text: string): string {
+  return text.replace(LONE_SURROGATE, '\uFFFD');
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

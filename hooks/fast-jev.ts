@@ -101,6 +101,8 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 
 export type HookConfig = CompactOptions & {
   apiKey?: string;
+  /** Set per compaction from the API form of the conversation; see `NotificationOptions.imagesInContext`. */
+  imagesInContext?: boolean;
   archiveResults: boolean;
   minReductionRatio: number;
   model: string;
@@ -795,7 +797,7 @@ async function rescueWithTrim(
     messages,
     result,
     asker,
-    options: resolveOptions(config),
+    options: { ...resolveOptions(config), imagesInContext: config.imagesInContext ?? true },
     proseTrim: config.proseTrim,
     notificationTrim: config.notificationTrim ?? HOOK_DEFAULTS.notificationTrim,
     injectTrim: config.injectTrim ?? HOOK_DEFAULTS.injectTrim,
@@ -983,11 +985,22 @@ const HYBRID_SUMMARY_ALLOWANCE = 0.1;
 
 /**
  * Where to split `messages` for a hybrid rescue: the earliest user turn (a
- * user message with text and no tool results, so no tool call is separated
- * from its result) whose tail, from there to the end, is at most `share` of
+ * user message with text and no tool results, outside any open tool run, so
+ * no tool call is separated from its result) whose tail, from there to the end, is at most `share` of
  * `historyTokens`. 0 when no turn after the first qualifies.
  */
 export function hybridSplit(messages: readonly Message[], historyTokens: number, share: number): number {
+  // A host notice can sit inside an open parallel run (call A and B, result A,
+  // notice, result B); splitting there would orphan result B, so only rows
+  // with no call still waiting for its result qualify.
+  const answered = new Set(messages.flatMap((m) => (m.toolResults ?? []).map((r) => r.tool_use_id)));
+  const open = new Set<string>();
+  const closed: boolean[] = [];
+  for (const m of messages) {
+    closed.push(open.size === 0);
+    for (const use of m.toolUses) if (answered.has(use.tool_use_id)) open.add(use.tool_use_id);
+    for (const result of m.toolResults ?? []) open.delete(result.tool_use_id);
+  }
   const limit = share * historyTokens;
   let tail = 0;
   let split = 0;
@@ -995,7 +1008,7 @@ export function hybridSplit(messages: readonly Message[], historyTokens: number,
     tail += messageTokens([messages[i]!]);
     if (tail > limit) break;
     const m = messages[i]!;
-    if (m.role === 'user' && m.text.trim() !== '' && (m.toolResults?.length ?? 0) === 0) split = i;
+    if (closed[i] && m.role === 'user' && m.text.trim() !== '' && (m.toolResults?.length ?? 0) === 0) split = i;
   }
   return split;
 }
@@ -1113,11 +1126,16 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (contextTokens !== undefined) {
         log($, `context ${contextTokens} tokens, history ~${historyTokens} tokens, history cut needed ${percent(target)}`);
       }
+      // Unknown (a subagent, or an engine without the API form) counts as having images.
+      let imagesInContext = true;
       if (!event.agentId) try {
-        log($, `history as the model sees it: ${formatBreakdown(contextBreakdown(await $.session.messages({ as: 'api' })))}`);
+        const breakdown = contextBreakdown(await $.session.messages({ as: 'api' }));
+        imagesInContext = breakdown.images > 0;
+        log($, `history as the model sees it: ${formatBreakdown(breakdown)}`);
       } catch {
         // Diagnostics only: an engine without the API form still compacts.
       }
+      config.imagesInContext = imagesInContext;
       if (target >= 1 && target > configured.minReductionRatio) {
         const reason = `history is too small a share of the context to free ${percent(configured.minReductionRatio)}`;
         if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
