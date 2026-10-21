@@ -1,7 +1,7 @@
 import { COMPACTED_MARKER, dedupeBlocks, supersededCalls } from './dedupe.js';
 import { MAX_QUESTIONS_PER_REQUEST, noulAnswer } from './request.js';
 import { salvageBlock } from './salvage.js';
-import { collectToolCalls, estimateTokens, fitState } from './state.js';
+import { collectToolCalls, estimateTokens, fitState, goalFromMessages, isPinned } from './state.js';
 import type {
   ArchiveResult,
   CallAnswer,
@@ -252,19 +252,19 @@ async function askBatch(
  */
 async function askBatches(
   asker: JevAsker,
-  state: CompactionState,
-  batches: readonly ToolCall[][],
+  jobs: readonly { state: CompactionState; batch: readonly ToolCall[] }[],
   concurrency: number,
 ): Promise<{ answered: Map<string, CallAnswer>[]; failed: number }> {
-  const answered: Map<string, CallAnswer>[] = new Array(batches.length);
+  const answered: Map<string, CallAnswer>[] = new Array(jobs.length);
   let cursor = 0;
   let failed = 0;
   let lastFailure: unknown;
   const worker = async (): Promise<void> => {
-    while (cursor < batches.length) {
+    while (cursor < jobs.length) {
       const index = cursor++;
       try {
-        answered[index] = await askBatch(asker, state, batches[index]!);
+        const job = jobs[index]!;
+        answered[index] = await askBatch(asker, job.state, job.batch);
       } catch (error) {
         failed += 1;
         lastFailure = error;
@@ -272,9 +272,72 @@ async function askBatches(
       }
     }
   };
-  await Promise.all(Array.from({ length: Math.min(concurrency, batches.length) }, worker));
-  if (failed > 0 && failed === batches.length) throw lastFailure;
+  await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
+  if (failed > 0 && failed === jobs.length) throw lastFailure;
   return { answered, failed };
+}
+
+type StateGroup = { state: ReturnType<typeof fitState>; calls: ToolCall[] };
+
+function tooLarge(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith('history too large for Jev');
+}
+
+/**
+ * One state for all candidates when the history fits `maxStateTokens`. When it
+ * does not (long sessions), the candidates are split into contiguous windows,
+ * halved until each window's state fits: a window's state keeps the goal, the
+ * first message, the pinned newest messages and its own messages in full, and
+ * blanks the rest (text and calls). Whether an old call is still needed depends
+ * mostly on the goal and the recent turns, which every window carries. A call
+ * whose window cannot fit even alone is returned in `unasked`; it gets no
+ * answer and so stays, like any call Jev was not asked about.
+ * (Ported from upstream tamaratran/fast-jev-compaction#119.)
+ */
+export function stateGroups(
+  messages: readonly Message[],
+  calls: readonly ToolCall[],
+  candidates: readonly ToolCall[],
+  options: ResolvedCompactOptions,
+): { groups: StateGroup[]; unasked: ToolCall[]; stage: string } {
+  try {
+    const state = fitState(messages, calls, options);
+    return { groups: [{ state, calls: [...candidates] }], unasked: [], stage: state.stage };
+  } catch (error) {
+    if (!tooLarge(error)) throw error;
+  }
+  const windowOptions = { ...options, goal: options.goal || goalFromMessages(messages) };
+  const groups: StateGroup[] = [];
+  const unasked: ToolCall[] = [];
+  const fit = (group: ToolCall[]): void => {
+    const lo = Math.min(...group.map((call) => call.callIndex));
+    const hi = Math.max(...group.map((call) => call.resultIndex));
+    const inWindow = new Set(group.map((call) => call.id));
+    const view = messages.map((message, i) =>
+      (i >= lo && i <= hi) || isPinned(i, messages.length, options.preserveRecentMessages)
+        ? message
+        : // Outside the window a call left in place would read as pending.
+          { role: message.role, text: '', toolUses: [] },
+    );
+    try {
+      const state = fitState(view, calls.filter((call) => call.pinned || inWindow.has(call.id)), windowOptions);
+      groups.push({ state, calls: group });
+    } catch (error) {
+      if (!tooLarge(error)) throw error;
+      if (group.length === 1) {
+        unasked.push(group[0]!);
+        return;
+      }
+      const half = Math.ceil(group.length / 2);
+      fit(group.slice(0, half));
+      fit(group.slice(half));
+    }
+  };
+  const half = Math.ceil(candidates.length / 2);
+  fit(candidates.slice(0, half));
+  if (candidates.length > half) fit(candidates.slice(half));
+  const stage = `windows:${groups.length}${unasked.length > 0 ? ` unasked:${unasked.length}` : ''}`;
+  return { groups, unasked, stage };
 }
 
 /** Whether ending `text` at `index` would separate the two halves of a surrogate pair. */
@@ -346,8 +409,15 @@ function truncatedResultText(
   return salvaged ? `${head}${note}\n${salvaged}` : `${head}${note}`;
 }
 
-/** One line standing in for a dropped call, naming where its output went. */
-function droppedCallNote(tool: ToolUse, archivedPath: string | undefined): string {
+/** Tools whose output a re-run reproduces; other tools observed something that may not happen again. */
+const REPRODUCIBLE_TOOLS = new Set(['Read', 'Glob', 'Grep', 'LS', 'NotebookRead']);
+
+/**
+ * One line standing in for a dropped call, naming where its output went. For a
+ * tool whose output a re-run may not reproduce (a command, a test run, a
+ * request), the error lines and identifiers of that output follow it.
+ */
+function droppedCallNote(tool: ToolUse, archivedPath: string | undefined, salvageChars = 0): string {
   let input = '';
   try {
     input = JSON.stringify(tool.input);
@@ -355,9 +425,11 @@ function droppedCallNote(tool: ToolUse, archivedPath: string | undefined): strin
     input = '{}';
   }
   if (input.length > 160) input = `${headOf(input, 159)}…`;
-  return `[fast-jev-compaction removed the ${tool.tool} call ${input}${
+  const note = `[fast-jev-compaction removed the ${tool.tool} call ${input}${
     archivedPath ? `; full output: ${archivedPath}` : ''
   }]`;
+  const salvaged = REPRODUCIBLE_TOOLS.has(tool.tool) ? '' : salvageBlock(tool.text ?? '', salvageChars);
+  return salvaged ? `${note}\n${salvaged}` : note;
 }
 
 function isEmptyMessage(message: {
@@ -434,7 +506,7 @@ export function applyDecisions(
     // archived, so a detail inside it can still be recovered.
     const droppedCallNotes = message.toolUses
       .filter((tool) => actions.get(tool.tool_use_id) === 'drop_call')
-      .map((tool) => droppedCallNote(tool, archive?.(tool.tool_use_id, tool.text ?? '')));
+      .map((tool) => droppedCallNote(tool, archive?.(tool.tool_use_id, tool.text ?? ''), salvageChars));
     const toolUses = message.toolUses
       .filter((tool) => actions.get(tool.tool_use_id) !== 'drop_call')
       .map((tool) => {
@@ -561,7 +633,7 @@ export async function compact(
   const candidates = calls.filter((call) => !call.pinned && !settled.has(call.id));
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
-  let batches: ToolCall[][] = [];
+  let requests = 0;
   let failedRequests = 0;
   const answers = new Map<string, CallAnswer>();
   if (candidates.length > 0) {
@@ -576,18 +648,17 @@ export async function compact(
     if (stateBudget < 1) {
       throw new Error('request budget leaves no room for state and questions');
     }
-    const state = fitState(source, calls, {
+    const { groups, stage } = stateGroups(source, calls, candidates, {
       ...resolved,
       maxStateTokens: Math.min(resolved.maxStateTokens, stateBudget),
     });
-    fitted = state;
-    batches = batchCalls(candidates, state.tokens, resolved);
-    const { answered, failed } = await askBatches(
-      asker,
-      state.state,
-      batches,
-      resolved.maxConcurrentRequests,
+    fitted = { tokens: Math.max(0, ...groups.map((group) => group.state.tokens)), stage };
+    const jobs = groups.flatMap((group) =>
+      batchCalls(group.calls, group.state.tokens, resolved).map((batch) => ({ state: group.state.state, batch })),
     );
+    requests = jobs.length;
+    const { answered, failed } =
+      jobs.length > 0 ? await askBatches(asker, jobs, resolved.maxConcurrentRequests) : { answered: [], failed: 0 };
     failedRequests = failed;
     for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
   }
@@ -652,7 +723,7 @@ export async function compact(
       blocksDeduped: deduped.removed,
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
-      requests: batches.length,
+      requests,
       failedRequests,
       ms: Date.now() - started,
     },

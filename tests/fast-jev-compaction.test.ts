@@ -905,3 +905,40 @@ describe('request body', () => {
     expect(JSON.parse(request.body).state.output).toBe('a� b � c 😀');
   });
 });
+
+describe('windowed states when the history does not fit', () => {
+  function long(n: number): Message[] {
+    const out: Message[] = [message('user', 'Fix the failing build; never touch src/generated.')];
+    for (let i = 0; i < n; i++) {
+      out.push(message('assistant', `Step ${i}: ${'checking the next module and its callers '.repeat(6)}`));
+      out.push(call(`w${i}`, 'Bash', { command: `npm test -- module${i}` }, ''));
+      out.push(result(`w${i}`, `module${i}: 3 passed, 1 failed (exit code 1)\n${'x'.repeat(400)}`));
+    }
+    out.push(message('user', 'go on'));
+    return out;
+  }
+  const options = { maxStateTokens: 3_000, maxRequestTokens: 6_000, preserveRecentMessages: 2 };
+
+  it('splits into windows that each fit, and every candidate is asked', async () => {
+    const messages = long(400);
+    const calls = collectToolCalls(messages, 2);
+    expect(() => fitState(messages, calls, resolveOptions(options))).toThrow(/history too large/);
+    const seen: Seen[] = [];
+    const out = await compact(messages, fakeJev(() => 0.1, seen), options);
+    expect(out.stats.stateStage).toMatch(/^windows:\d+$/);
+    expect(out.stats.stateTokens).toBeLessThanOrEqual(options.maxStateTokens);
+    const asked = new Set(seen.flatMap((s) => s.questions).filter((q) => q.startsWith('call_')));
+    expect(asked.size).toBe(calls.filter((c) => !c.pinned).length);
+    expect(out.stats.requests).toBe(seen.length);
+  });
+
+  it('keeps a call that no window can fit, instead of throwing', async () => {
+    const messages = long(5);
+    const seen: Seen[] = [];
+    const out = await compact(messages, fakeJev(() => 0.1, seen), { ...options, maxStateTokens: 200, goal: 'g'.repeat(5_000) });
+    expect(seen.length).toBe(0);
+    expect(out.stats.stateStage).toMatch(/unasked:\d+/);
+    expect(out.decisions.every((d) => d.action === 'keep')).toBe(true);
+    expect(out.messages).toEqual(messages);
+  });
+});

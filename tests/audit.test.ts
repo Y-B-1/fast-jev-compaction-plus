@@ -122,3 +122,33 @@ describe('empty assistant rows', () => {
     expect(out.some((m) => (m as { handle?: string }).handle === 'thinking')).toBe(true);
   });
 });
+
+describe('dropped-call notes', () => {
+  const drop = (tool: string, input: Record<string, unknown>, output: string) => {
+    const messages = [
+      msg('user', 's'),
+      msg('assistant', '', { toolUses: [{ tool_use_id: 'x', tool, input, text: output }] }),
+      msg('user', '', { toolResults: [{ tool_use_id: 'x', text: output }] }),
+      msg('user', 'e'),
+    ];
+    return applyDecisions(
+      messages,
+      [{ id: 't1', tool, action: 'drop_call', reason: 'call_dropped', keepCall: 0, keepResult: 0 }] as never,
+      collectToolCalls(messages, 0),
+      150,
+      undefined,
+      300,
+    )
+      .map((m) => m.text)
+      .join('\n');
+  };
+  const output = `${'progress line\n'.repeat(50)}Error: listen EADDRINUSE 127.0.0.1:5173\n${'more\n'.repeat(20)}`;
+
+  it('keeps the error lines of a command that may not reproduce', () => {
+    expect(drop('Bash', { command: 'npm run dev' }, output)).toMatch(/errors: .*EADDRINUSE/);
+  });
+
+  it('keeps only the one-line note for a read a re-run reproduces', () => {
+    expect(drop('Read', { file_path: 'a.ts' }, output)).not.toContain('EADDRINUSE');
+  });
+});
