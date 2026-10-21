@@ -24,4 +24,13 @@ describe('hooks module shape', () => {
     expect(callees.size).toBeGreaterThan(3);
     expect([...callees].filter((name) => !topLevel(name))).toEqual([]);
   });
+
+  it('never declares or assigns a name that a function handed $ also has', () => {
+    const source = readFileSync(new URL('../hooks/fast-jev.ts', import.meta.url), 'utf8');
+    const callees = new Set([...source.matchAll(/([A-Za-z_]\w*)\(\s*\$\s*[,)]/g)].map((m) => m[1]!));
+    const shadowed = [...callees].filter((name) =>
+      new RegExp(`(?:\\b(?:let|var)\\s+${name}\\b|^\\s+const\\s+${name}\\b|[^.\\w]${name}\\s*=(?![=>]))`, 'm').test(source),
+    );
+    expect(shadowed).toEqual([]);
+  });
 });

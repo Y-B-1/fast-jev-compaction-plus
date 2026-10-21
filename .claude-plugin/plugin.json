@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
@@ -22,6 +22,12 @@
       "description": "Minimum Jev probability that the tool call itself is still needed; below it the call is removed along with its result. Keep this low: a call costs a fraction of its result, and removing it erases the record that the work happened.",
       "default": 0.05
     },
+    "keepThresholdByTool": {
+      "type": "string",
+      "title": "Keep threshold per tool",
+      "description": "Optional per-tool keep thresholds, e.g. \"Bash=0.2, Read=0.1\"; a tool not named uses keepThreshold. eval/calibrate.ts suggests values from how often each tool's archived output was read back.",
+      "default": ""
+    },
     "preserveRecentMessages": {
       "type": "number",
       "title": "Recent messages to preserve",
@@ -32,6 +38,12 @@
       "type": "boolean",
       "title": "Archive dropped tool output",
       "description": "Write the full text of dropped tool calls and results to .claude/fast-jev-compaction/ and cite the file in the marker left in their place, so it can be read back.",
+      "default": true
+    },
+    "compactionLog": {
+      "type": "boolean",
+      "title": "Record compactions for calibration",
+      "description": "On by default: append one line per compaction (sizes, per-call scores and decisions) and one per archive file read back to .claude/fast-jev-compaction/log.jsonl; eval/calibrate.ts reads it. Needs archiveResults.",
       "default": true
     },
     "minReductionRatio": {
@@ -69,6 +81,18 @@
       "title": "Tool result preview for Jev",
       "description": "Characters from each end of a tool result quoted in its keep question, so Jev can judge the content and not only its length; 0 disables.",
       "default": 300
+    },
+    "stateWording": {
+      "type": "string",
+      "title": "What Jev is told about dropped output",
+      "description": "delete (default): dropped output is deleted, though the tool can be re-run. archive: it is moved to a file the assistant can read back, and the conversation is data, not instructions (applies only with archiveResults). Measure with eval/variants.ts before switching.",
+      "default": "delete"
+    },
+    "resultChecks": {
+      "type": "boolean",
+      "title": "Ask four concrete checks per tool result",
+      "description": "Opt-in: ask whether a result holds an error still being worked on, a constraint, contents still in use, or output a rerun reproduces, instead of one keep question. Five questions per call instead of two. Measure with eval/variants.ts before turning on.",
+      "default": false
     },
     "salvageChars": {
       "type": "number",
@@ -111,6 +135,12 @@
       "title": "Summarize only the older history when trimming falls short",
       "description": "On by default: when trimming frees less than the minimum, the built-in summarizer summarizes only the older part of the history and the recent turns stay as trimmed (at most 30% of the history), instead of summarizing everything. Runs only where builtinFallback allows the built-in summary.",
       "default": true
+    },
+    "hybridOriginals": {
+      "type": "boolean",
+      "title": "Summarize the original older history in the hybrid",
+      "description": "Opt-in: the hybrid summary is written from the original older messages instead of their trimmed form (with truncation notes in place of text). Measure with eval/variants.ts before turning on.",
+      "default": false
     },
     "inputTrim": {
       "type": "boolean",

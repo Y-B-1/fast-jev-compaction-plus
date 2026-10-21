@@ -74,7 +74,7 @@ export function confirmFromStream(question: string, input: NodeJS.ReadableStream
 }
 
 /** At most `n` tasks run at once; the rest wait their turn. */
-const limiter = (n: number) => {
+export const limiter = (n: number) => {
   let active = 0;
   const waiting: (() => void)[] = [];
   return async <T>(task: () => Promise<T>): Promise<T> => {
@@ -88,10 +88,10 @@ const limiter = (n: number) => {
     }
   };
 };
-type Gate = ReturnType<typeof limiter>;
+export type Gate = ReturnType<typeof limiter>;
 
 /** Maps with up to `k` in flight; results keep the input order. */
-const mapLimit = async <T, R>(items: T[], k: number, fn: (item: T) => Promise<R>): Promise<R[]> => {
+export const mapLimit = async <T, R>(items: T[], k: number, fn: (item: T) => Promise<R>): Promise<R[]> => {
   const out: R[] = new Array(items.length);
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(k, items.length) }, async () => {
@@ -394,7 +394,7 @@ async function armN(messages: Message[], t0: CompactResult, asker: JevAsker): Pr
 }
 
 /** An archive writer that names paths like the hook's but writes nothing. */
-const noWriteArchive = () => archiveWriter({ fs: { exists: async () => true, write: async () => {} } });
+const noWriteArchive = () => archiveWriter({ fs: { exists: async () => true, write: async () => {}, read: async () => '' } });
 
 type NMetrics = { notifChars: number; foldedChars: number; stripChars: number; foldChars: number };
 
@@ -416,7 +416,7 @@ export function nMetrics(trim: TrimRescue | undefined): NMetrics | undefined {
   return m;
 }
 
-function scoreArm(text: string, qs: Question[], deps: Deps, stats: ReturnType<typeof makeStats>, gate: Gate): Promise<boolean[]> {
+export function scoreArm(text: string, qs: Question[], deps: Deps, stats: ReturnType<typeof makeStats>, gate: Gate): Promise<boolean[]> {
   return Promise.all(qs.map(async (q) => {
     let judgeRefused = false;
     const judge = async (prompt: string): Promise<string> => {
@@ -433,7 +433,7 @@ function scoreArm(text: string, qs: Question[], deps: Deps, stats: ReturnType<ty
 const count = (xs: boolean[]): number => xs.filter(Boolean).length;
 
 /** The case's cached questions, or generated, filtered by the original and cached (the existing questions flow). */
-async function questionsFor(c: Case, deps: Deps, stats: ReturnType<typeof makeStats>, gate: Gate): Promise<Question[]> {
+export async function questionsFor(c: Case, deps: Deps, stats: ReturnType<typeof makeStats>, gate: Gate): Promise<Question[]> {
   const cached = loadQuestions(deps.cacheDir, c.id);
   if (cached) return cached.questions;
   const history = renderMessages(deps.messages(c));
@@ -637,9 +637,9 @@ export async function main(argv: string[], deps: Deps): Promise<number> {
 
 // ---- Live wiring ----
 
-const EVAL_DIR = join(homedir(), '.claude', 'fast-jev-eval');
+export const EVAL_DIR = join(homedir(), '.claude', 'fast-jev-eval');
 
-const hookFetch: HookFetch = async (url, init) => {
+export const hookFetch: HookFetch = async (url, init) => {
   const r = await fetch(url, init as RequestInit);
   const text = await r.text();
   return { status: r.status, ok: r.ok, text, headers: Object.fromEntries(r.headers.entries()) };

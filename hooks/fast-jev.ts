@@ -72,6 +72,14 @@ const HOOK_DEFAULTS = {
    * Runs only where `builtinFallback` allows the built-in summary.
    */
   hybridSummary: true,
+  /**
+   * Opt-in: the hybrid summary is written from the original older messages
+   * rather than their trimmed form (which carries truncation notes and archive
+   * paths instead of the text). Measure with `eval/variants.ts` before turning on.
+   */
+  hybridOriginals: false,
+  /** On by default: append one line per compaction to the archive's `log.jsonl`, and note when an archive file is read back; see `eval/calibrate.ts`. */
+  compactionLog: true,
   /** On by default: when trimming falls short, fold old skill bodies, browser element selections, pastes and long user rows to a head and a marker, archiving each original; typed text around them and the last three prompts stay. Needs `archiveResults`; see `src/inject.ts`. */
   injectTrim: true,
   /** On by default: when tool compaction already reaches the minimum, also archive old replies and work steps before the last prompt that Jev scores below the mildest cut-off; and archive each prose cut's original reply. Needs `archiveResults`; see `src/steps.ts`. */
@@ -119,6 +127,10 @@ export type HookConfig = CompactOptions & {
   inputTrim: boolean;
   /** See `HOOK_DEFAULTS.hybridSummary`. */
   hybridSummary: boolean;
+  /** See `HOOK_DEFAULTS.hybridOriginals`. */
+  hybridOriginals: boolean;
+  /** See `HOOK_DEFAULTS.compactionLog`. */
+  compactionLog: boolean;
   /** See `HOOK_DEFAULTS.injectTrim`. */
   injectTrim: boolean;
   /** See `HOOK_DEFAULTS.replyTrim`. */
@@ -212,6 +224,17 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       typeof options['inputTrim'] === 'boolean' ? options['inputTrim'] : HOOK_DEFAULTS.inputTrim,
     hybridSummary:
       typeof options['hybridSummary'] === 'boolean' ? options['hybridSummary'] : HOOK_DEFAULTS.hybridSummary,
+    hybridOriginals:
+      typeof options['hybridOriginals'] === 'boolean' ? options['hybridOriginals'] : HOOK_DEFAULTS.hybridOriginals,
+    compactionLog:
+      typeof options['compactionLog'] === 'boolean' ? options['compactionLog'] : HOOK_DEFAULTS.compactionLog,
+    ...(options['stateWording'] === 'archive' || options['stateWording'] === 'delete'
+      ? { stateWording: options['stateWording'] }
+      : {}),
+    ...(typeof options['resultChecks'] === 'boolean' ? { resultChecks: options['resultChecks'] } : {}),
+    ...(parseToolThresholds(options['keepThresholdByTool'])
+      ? { keepThresholdByTool: parseToolThresholds(options['keepThresholdByTool']) }
+      : {}),
     injectTrim:
       typeof options['injectTrim'] === 'boolean' ? options['injectTrim'] : HOOK_DEFAULTS.injectTrim,
     replyTrim:
@@ -228,6 +251,23 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
   return config;
+}
+
+/**
+ * `keepThresholdByTool` as written in the plugin options, `Bash=0.2, Read=0.1`
+ * (what `eval/calibrate.ts` prints): tool name to a threshold in [0, 1].
+ * Undefined when nothing valid is given; invalid entries are left out.
+ */
+export function parseToolThresholds(value: unknown): Record<string, number> | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const out: Record<string, number> = {};
+  for (const part of value.split(',')) {
+    const match = /^\s*([A-Za-z0-9_:.-]+)\s*=\s*([0-9]*\.?[0-9]+)\s*$/.exec(part);
+    if (!match) continue;
+    const threshold = Number(match[2]);
+    if (threshold >= 0 && threshold <= 1) out[match[1]!] = threshold;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Resolves after `ms`; rejects with the signal's reason when `signal` aborts. */
@@ -616,6 +656,63 @@ export function archiveWriter($: {
       pending.clear();
     },
   };
+}
+
+/** Past this size `log.jsonl` keeps only its newer half. */
+const LOG_MAX_CHARS = 2_000_000;
+
+/**
+ * Appends JSON lines to the archive's `log.jsonl`: one per compaction (figures
+ * and per-call decisions) and one per archive file read back, the record
+ * `eval/calibrate.ts` fits per-tool thresholds from. Best effort: a failure
+ * changes nothing else.
+ */
+async function appendLog(
+  $: { fs: { write: (path: string, text: string) => Promise<void>; read: (path: string) => Promise<unknown> } },
+  path: string,
+  entries: readonly Record<string, unknown>[],
+): Promise<void> {
+  try {
+    let previous = '';
+    try {
+      const existing = await $.fs.read(path);
+      if (typeof existing === 'string') previous = existing;
+    } catch {
+      previous = '';
+    }
+    if (previous.length > LOG_MAX_CHARS) previous = previous.slice(previous.indexOf('\n', previous.length - LOG_MAX_CHARS / 2) + 1);
+    await $.fs.write(path, `${previous}${entries.map((entry) => JSON.stringify(entry)).join('\n')}\n`);
+  } catch {
+    // The log is a record for calibration; losing a line loses nothing else.
+  }
+}
+
+/** The archive files (`name.txt`) a tool call's input names, for the read-back record. */
+export function archiveFilesNamed(input: Record<string, unknown>): string[] {
+  const text = ['file_path', 'path', 'command', 'pattern']
+    .map((key) => (typeof input[key] === 'string' ? (input[key] as string) : ''))
+    .join(' ');
+  if (!text.includes(ARCHIVE_DIR)) return [];
+  const files = [...text.matchAll(/fast-jev-compaction\/([A-Za-z0-9_.-]+\.txt)/g)].map((m) => m[1]!);
+  return files.length > 0 ? [...new Set(files)] : ['*'];
+}
+
+/** Records the archive files a Read, Grep or Bash call read back (see `compactionLog`). */
+async function noteReadBack(
+  $: Parameters<Hook<'tool.call'>>[0],
+  configured: HookConfig,
+  tool: string,
+  input: Record<string, unknown>,
+): Promise<void> {
+  if (!configured.compactionLog || !configured.archiveResults) return;
+  const files = archiveFilesNamed(input);
+  if (files.length === 0) return;
+  try {
+    const at = await $.clock.now();
+    await appendLog($, `${await archiveDir($)}/log.jsonl`, [{ time: new Date(at).toISOString(), readBack: files, via: tool }]);
+  } catch {
+    // A missing record changes nothing for the tool call.
+  }
 }
 
 /** Largest INDEX.md the plugin keeps adding to; past it the index stops growing. */
@@ -1020,7 +1117,12 @@ type UiLog = { ui: { log: (text: string, options?: { to?: 'transcript' | 'debug'
  * where every compaction would add a dozen dim rows to the chat.
  */
 /** The debug lines and the toast of one compaction, kept for `/jev`. */
-type Report = { lines: string[]; toast?: string };
+type Report = {
+  lines: string[];
+  toast?: string;
+  /** The compaction's figures and per-call decisions, for the archive's `log.jsonl`. */
+  ledger?: Record<string, unknown>;
+};
 
 function log($: UiLog, text: string, report?: Report): void {
   report?.lines.push(text);
@@ -1088,6 +1190,33 @@ export function hybridSplit(messages: readonly Message[], historyTokens: number,
     if (closed[i] && m.role === 'user' && m.text.trim() !== '' && (m.toolResults?.length ?? 0) === 0) split = i;
   }
   return split;
+}
+
+/**
+ * The index in `original` of the prompt row at `index` in `trimmed`: the row
+ * with the same engine handle, else the same-text prompt row at the same rank
+ * among the prompt rows with that text. Undefined when none matches.
+ */
+export function originalIndex(
+  original: readonly SessionMessage[],
+  trimmed: readonly SessionMessage[],
+  index: number,
+): number | undefined {
+  const row = trimmed[index];
+  if (!row) return undefined;
+  if (row.handle !== undefined) {
+    const at = original.findIndex((m) => m.handle === row.handle);
+    if (at > 0) return at;
+  }
+  const isPrompt = (m: SessionMessage) => m.role === 'user' && (m.toolResults?.length ?? 0) === 0 && m.text === row.text;
+  const rank = trimmed.slice(0, index).filter(isPrompt).length;
+  let seen = 0;
+  for (let i = 0; i < original.length; i++) {
+    if (!isPrompt(original[i]!)) continue;
+    if (seen === rank) return i > 0 ? i : undefined;
+    seen += 1;
+  }
+  return undefined;
 }
 
 export type ContextBreakdown = {
@@ -1286,6 +1415,30 @@ async function compactHook(
     );
     if (next.signal.aborted) return interrupted($, report);
     for (const line of decisionLogLines(result)) log($, line, report);
+    report.ledger = {
+      messagesBefore: event.messages.length,
+      messagesAfter: messages.length,
+      historyTokens,
+      tokensAfter: messageTokens(messages),
+      contextTokens,
+      historyInContext,
+      reduction: Math.round(reductionRatio(result) * 1000) / 1000,
+      requests: result.stats.requests,
+      failedRequests: result.stats.failedRequests,
+      stateStage: result.stats.stateStage,
+      model: config.model,
+      options: { stateWording: config.stateWording ?? 'delete', resultChecks: config.resultChecks ?? false },
+      // [tool, action, reason, keepCall, keepResult, archive file]
+      calls: result.decisions.map((d) => [
+        d.tool,
+        d.action,
+        d.reason,
+        Math.round(d.keepCall * 100) / 100,
+        Math.round(d.keepResult * 100) / 100,
+        // Only a cut (dropped or truncated) result has its output in the archive for good.
+        d.action === 'keep' ? '' : `${result.toolUseIds?.[d.id] ?? d.id}.txt`,
+      ]),
+    };
     if (reductionRatio(result) < config.minReductionRatio) {
       const tried = `${prose ? ', prose trim tried' : ''}${notifications ? ', notification trim tried' : ''}${injected ? ', injected-content fold tried' : ''}${exchanges ? ', exchange drop tried' : ''}${steps ? ', step trim tried' : ''}${
         target > configured.minReductionRatio ? `, history needs ${percent(target)} to free ${percent(configured.minReductionRatio)} of context` : ''
@@ -1334,7 +1487,12 @@ async function compactHook(
       const share = Math.min(HYBRID_RECENT_SHARE, 1 - target - HYBRID_SUMMARY_ALLOWANCE);
       const split = config.hybridSummary && share > 0 ? hybridSplit(messages, historyTokens, share) : 0;
       if (split > 0) {
-        const summarized = await summary({ ...event, messages: messages.slice(0, split) });
+        // hybridOriginals: the summarizer reads the older history as it was,
+        // not with truncation notes in place of the text.
+        const original = config.hybridOriginals ? originalIndex(event.messages, messages, split) : undefined;
+        const older = original !== undefined ? event.messages.slice(0, original) : messages.slice(0, split);
+        if (config.hybridOriginals) log($, `hybrid: summarizing ${original !== undefined ? 'the original' : 'the trimmed (no matching prompt)'} older messages`, report);
+        const summarized = await summary({ ...event, messages: older });
         if (summarized === partial) return partial;
         if (next.signal.aborted) return interrupted($, report);
         if (summarized.skip !== undefined) return summarized;
@@ -1429,6 +1587,16 @@ export const register: Register = (on: On, options: PluginOptions) => {
     try {
       return await compactHook($, event, next, configured, once, current);
     } finally {
+      if (configured.compactionLog && configured.archiveResults && current.ledger) {
+        try {
+          const at = await $.clock.now();
+          await appendLog($, `${await archiveDir($)}/log.jsonl`, [
+            { time: new Date(at).toISOString(), trigger: event.trigger ?? 'unknown', subagent: event.agentId !== undefined, outcome: current.toast ?? '', ...current.ledger },
+          ]);
+        } catch {
+          // The ledger is a record only; the compaction's result stands.
+        }
+      }
       // Only a record for /jev: a clock that fails must never replace the result.
       let at = 0;
       try {
@@ -1451,8 +1619,24 @@ export const register: Register = (on: On, options: PluginOptions) => {
   // compaction applied at tool.call time to one result. A short-circuit on
   // length runs before anything else, so a plugin left enabled costs nothing
   // on the ordinary, short-output case.
+  // compactionLog: notes each archive file the assistant reads back (Read, Grep
+  // or a shell command over the archive), so calibration can tell which tools'
+  // dropped output turned out to be needed. Only these tools are hooked: every
+  // hooked call pays a hop to the plugin's worker.
+  on('tool.call', { tool: 'Read' }, async ($, e, next) => {
+    const result = await next(e);
+    await noteReadBack($, configured, e.tool, e as unknown as Record<string, unknown>);
+    return result;
+  });
+  on('tool.call', { tool: 'Grep' }, async ($, e, next) => {
+    const result = await next(e);
+    await noteReadBack($, configured, e.tool, e as unknown as Record<string, unknown>);
+    return result;
+  });
+
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const result = await next(e);
+    await noteReadBack($, configured, e.tool, e as unknown as Record<string, unknown>);
     if (!configured.jevPruneBashOutput || result.deny || !result.result) return result;
     const output = result.result as {
       stdout?: string;

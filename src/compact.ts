@@ -9,6 +9,7 @@ import type {
   CompactOptions,
   CompactResult,
   CompactionState,
+  JevAnswer,
   JevAsker,
   JevQuestions,
   Message,
@@ -41,6 +42,9 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   maxKeptResultChars: 4000,
   dedupeRepeats: true,
   minKeepSignalCalls: 3,
+  stateWording: 'delete',
+  resultChecks: false,
+  keepThresholdByTool: {},
 };
 
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
@@ -107,6 +111,13 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
       Math.floor(finite(options.maxKeptResultChars, DEFAULT_OPTIONS.maxKeptResultChars)),
     ),
     dedupeRepeats: options.dedupeRepeats ?? DEFAULT_OPTIONS.dedupeRepeats,
+    stateWording: options.stateWording === 'archive' ? 'archive' : 'delete',
+    resultChecks: options.resultChecks === true,
+    keepThresholdByTool: Object.fromEntries(
+      Object.entries(options.keepThresholdByTool ?? {}).filter(
+        ([, value]) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1,
+      ),
+    ),
     minKeepSignalCalls: Math.max(
       0,
       Math.floor(finite(options.minKeepSignalCalls, DEFAULT_OPTIONS.minKeepSignalCalls)),
@@ -119,16 +130,10 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
  * result. Both carry criteria, because the boundary is subtle and the docs ask
  * for `true`/`false` sides whenever it is: https://docs.typesafe.ai/primitives/noul.
  */
-export function questionsFor(call: ToolCall): JevQuestions {
+export function questionsFor(call: ToolCall, resultChecks = false): JevQuestions {
+  if (resultChecks) return { [`call_${call.id}`]: callQuestion(call), ...checkQuestions(call) };
   return {
-    [`call_${call.id}`]: {
-      type: 'noul',
-      instructions: `Tool call \`${call.id}\` (${call.tool}) should stay in \`history\`: knowing this call was made, with its input, still matters for what the assistant does next`,
-      criteria: {
-        true: 'The call records a change to the world, or a constraint the assistant must not violate again: an edit or write that changed a file, a command that installed, moved or deleted something, a check whose outcome the user was told about',
-        false: 'The call only gathered information that has since been superseded or acted upon: a search used to locate a file that was then edited, a read of a file that has since changed, a failing check that has since been fixed',
-      },
-    },
+    [`call_${call.id}`]: callQuestion(call),
     [`result_${call.id}`]: {
       type: 'noul',
       instructions: `The full output of tool call \`${call.id}\` (${call.tool}, ${call.resultChars} chars) should stay in \`history\` verbatim: the assistant still needs its contents, and re-running the tool would not do${
@@ -142,6 +147,52 @@ export function questionsFor(call: ToolCall): JevQuestions {
   };
 }
 
+function callQuestion(call: ToolCall): JevQuestions[string] {
+  return {
+    type: 'noul',
+    instructions: `Tool call \`${call.id}\` (${call.tool}) should stay in \`history\`: knowing this call was made, with its input, still matters for what the assistant does next`,
+    criteria: {
+      true: 'The call records a change to the world, or a constraint the assistant must not violate again: an edit or write that changed a file, a command that installed, moved or deleted something, a check whose outcome the user was told about',
+      false: 'The call only gathered information that has since been superseded or acted upon: a search used to locate a file that was then edited, a read of a file that has since changed, a failing check that has since been fixed',
+    },
+  };
+}
+
+/**
+ * `resultChecks`: four concrete checks on one result instead of a single keep
+ * question, each phrased so that "yes" means keep (after 0x7067/claude-jev,
+ * which measured planted constraints surviving 77% -> 100% with concrete
+ * checks over aggregate questions).
+ */
+const RESULT_CHECKS = {
+  err: 'contains an exact error message, failing test output or unexpected result that the assistant is still working on and would have to reproduce to see again',
+  con: 'states a requirement or restriction the work must respect: a configuration value, an API contract, a rule or limit written in a file or a reply',
+  use: 'holds contents the assistant is still working with verbatim: the current text of a file it is editing, values or identifiers it will copy',
+  rerun: 'would come back the same if the tool were run again: a listing, a passing check, build or install output, a file that has not changed since',
+} as const;
+
+function checkQuestions(call: ToolCall): JevQuestions {
+  const subject = `The output of tool call \`${call.id}\` (${call.tool}, ${call.resultChars} chars)${
+    call.resultPreview ? `, preview: ${call.resultPreview},` : ''
+  }`;
+  return Object.fromEntries(
+    Object.entries(RESULT_CHECKS).map(([name, check]) => [
+      `${name}_${call.id}`,
+      { type: 'noul', instructions: `${subject} ${check}` },
+    ]),
+  ) as JevQuestions;
+}
+
+/**
+ * The keep-result probability from the checks: the strongest of error,
+ * constraint and in-use, where an error a rerun would reproduce does not count.
+ */
+export function checksKeep(answers: Record<string, JevAnswer>, id: string): number {
+  const p = (name: string) => noulAnswer(answers, `${name}_${id}`);
+  const rerun = p('rerun');
+  return Math.max(p('con'), p('use'), rerun >= 0.5 ? 0 : p('err'));
+}
+
 /**
  * Splits the candidate calls into batches whose questions, together with the
  * (always complete) state, fit one request.
@@ -149,7 +200,7 @@ export function questionsFor(call: ToolCall): JevQuestions {
 export function batchCalls(
   calls: readonly ToolCall[],
   stateTokens: number,
-  options: Pick<ResolvedCompactOptions, 'maxRequestTokens'>,
+  options: Pick<ResolvedCompactOptions, 'maxRequestTokens'> & Partial<Pick<ResolvedCompactOptions, 'resultChecks'>>,
 ): ToolCall[][] {
   const budget = options.maxRequestTokens - stateTokens - REQUEST_OVERHEAD_TOKENS;
   const batches: ToolCall[][] = [];
@@ -157,7 +208,7 @@ export function batchCalls(
   let currentTokens = 0;
   let currentQuestions = 0;
   for (const call of calls) {
-    const questions = questionsFor(call);
+    const questions = questionsFor(call, options.resultChecks);
     const tokens = estimateTokens(JSON.stringify(questions));
     const count = Object.keys(questions).length;
     if (stateTokens + tokens + REQUEST_OVERHEAD_TOKENS > MAX_STATE_PLUS_QUESTION_TOKENS) {
@@ -227,15 +278,16 @@ async function askBatch(
   asker: JevAsker,
   state: CompactionState,
   batch: readonly ToolCall[],
+  resultChecks = false,
 ): Promise<Map<string, CallAnswer>> {
-  const questions: JevQuestions = Object.assign({}, ...batch.map(questionsFor));
+  const questions: JevQuestions = Object.assign({}, ...batch.map((call) => questionsFor(call, resultChecks)));
   const { answers } = await asker.ask(state, questions);
   return new Map(
     batch.map((call) => [
       call.id,
       {
         keepCall: noulAnswer(answers, `call_${call.id}`),
-        keepResult: noulAnswer(answers, `result_${call.id}`),
+        keepResult: resultChecks ? checksKeep(answers, call.id) : noulAnswer(answers, `result_${call.id}`),
       },
     ]),
   );
@@ -254,6 +306,7 @@ async function askBatches(
   asker: JevAsker,
   jobs: readonly { state: CompactionState; batch: readonly ToolCall[] }[],
   concurrency: number,
+  resultChecks = false,
 ): Promise<{ answered: Map<string, CallAnswer>[]; failed: number }> {
   const answered: Map<string, CallAnswer>[] = new Array(jobs.length);
   let cursor = 0;
@@ -264,7 +317,7 @@ async function askBatches(
       const index = cursor++;
       try {
         const job = jobs[index]!;
-        answered[index] = await askBatch(asker, job.state, job.batch);
+        answered[index] = await askBatch(asker, job.state, job.batch, resultChecks);
       } catch (error) {
         failed += 1;
         lastFailure = error;
@@ -726,7 +779,7 @@ export async function compact(
     // tight maxRequestTokens shrinks the state instead of batching down to a
     // state that leaves no room for even one question.
     const largestQuestion = candidates.reduce(
-      (largest, call) => Math.max(largest, estimateTokens(JSON.stringify(questionsFor(call)))),
+      (largest, call) => Math.max(largest, estimateTokens(JSON.stringify(questionsFor(call, resolved.resultChecks)))),
       0,
     );
     const stateBudget = resolved.maxRequestTokens - REQUEST_OVERHEAD_TOKENS - largestQuestion;
@@ -736,6 +789,8 @@ export async function compact(
     const { groups, stage } = stateGroups(source, calls, candidates, {
       ...resolved,
       maxStateTokens: Math.min(resolved.maxStateTokens, stateBudget),
+      // Saying dropped output is archived is only true when it is.
+      stateWording: options.archive ? resolved.stateWording : 'delete',
     });
     fitted = { tokens: Math.max(0, ...groups.map((group) => group.state.tokens)), stage };
     const jobs = groups.flatMap((group) =>
@@ -743,7 +798,7 @@ export async function compact(
     );
     requests = jobs.length;
     const { answered, failed } =
-      jobs.length > 0 ? await askBatches(asker, jobs, resolved.maxConcurrentRequests) : { answered: [], failed: 0 };
+      jobs.length > 0 ? await askBatches(asker, jobs, resolved.maxConcurrentRequests, resolved.resultChecks) : { answered: [], failed: 0 };
     failedRequests = failed;
     for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
   }
@@ -751,7 +806,10 @@ export async function compact(
   const decisions = calls.map(
     (call) =>
       settled.get(call.id) ??
-      decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
+      decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, {
+        ...resolved,
+        keepThreshold: resolved.keepThresholdByTool[call.tool] ?? resolved.keepThreshold,
+      }),
   );
   // Answers that keep nothing at all, not even a call, are what a Jev
   // answering 0 to every question produces: they say nothing about the
@@ -790,6 +848,7 @@ export async function compact(
   return {
     messages: kept,
     decisions,
+    toolUseIds: Object.fromEntries(calls.map((call) => [call.id, call.tool_use_id])),
     stats: {
       messagesBefore: messages.length,
       messagesAfter: kept.length,

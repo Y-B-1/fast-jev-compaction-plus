@@ -183,6 +183,27 @@ export interface CompactOptions {
    * back. 0 disables. Default 3.
    */
   minKeepSignalCalls?: number;
+  /**
+   * How the state tells Jev what happens to what it does not keep. `delete`
+   * (default): it is deleted, though the tool can be re-run. `archive`: it is
+   * moved to a file the assistant can read back, and the conversation is data
+   * to judge, never instructions. Use `archive` only where `archive` is set.
+   */
+  stateWording?: 'delete' | 'archive';
+  /**
+   * Ask about each result with four concrete checks (an exact error still being
+   * diagnosed, a constraint stated in it, contents still in use, output a rerun
+   * would reproduce) instead of one keep question; it stays verbatim when any of
+   * the first three says so, an error a rerun reproduces not counting. Five
+   * questions per call instead of two. Default false.
+   */
+  resultChecks?: boolean;
+  /**
+   * Per-tool `keepThreshold` overrides, by tool name (`{ Bash: 0.2 }`); a tool
+   * not named uses `keepThreshold`. `eval/calibrate.ts` suggests values from
+   * how often each tool's archived output was read back.
+   */
+  keepThresholdByTool?: Record<string, number>;
 }
 
 export interface ResolvedCompactOptions {
@@ -200,12 +221,17 @@ export interface ResolvedCompactOptions {
   maxKeptResultChars: number;
   dedupeRepeats: boolean;
   minKeepSignalCalls: number;
+  stateWording: 'delete' | 'archive';
+  resultChecks: boolean;
+  keepThresholdByTool: Record<string, number>;
 }
 
 export interface CompactResult {
   /** The compacted transcript; untouched messages are the input objects. */
   messages: Message[];
   decisions: CallDecision[];
+  /** Each decision's call id (`t1`) to its tool_use_id, which names its archive file. */
+  toolUseIds?: Record<string, string>;
   stats: {
     messagesBefore: number;
     messagesAfter: number;

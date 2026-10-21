@@ -265,12 +265,18 @@ export function split(all: Case[], cap: number, seed = DEFAULT_SEED): Split {
 const EVAL_DIR = join(homedir(), '.claude', 'fast-jev-eval');
 const MANIFEST = join(EVAL_DIR, 'out', 'manifest.json');
 
-// CLI: `npx tsx eval/load.ts freeze` writes the manifest once; `report [cap]` prints counts only.
+// CLI: `npx tsx eval/load.ts freeze [--before <ISO date>] [--force]` writes the manifest (sessions touched in the
+// last hour are left out by default); `report [cap]` prints counts only.
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const cmd = process.argv[2];
   if (cmd === 'freeze') {
-    if (existsSync(MANIFEST)) throw new Error(`Already frozen: ${MANIFEST}`);
-    const manifest = freeze(join(homedir(), '.claude', 'projects'));
+    const flag = (name: string) => (process.argv.includes(name) ? process.argv[process.argv.indexOf(name) + 1] : undefined);
+    if (existsSync(MANIFEST) && !process.argv.includes('--force')) throw new Error(`Already frozen: ${MANIFEST} (--force to refreeze)`);
+    // Sessions touched in the last hour may still be live; --before <ISO date> moves the cutoff.
+    const before = flag('--before');
+    const cutoff = before ? Date.parse(before) : Date.now() - 3_600_000;
+    if (Number.isNaN(cutoff)) throw new Error(`--before is not a date: ${before}`);
+    const manifest = freeze(join(homedir(), '.claude', 'projects'), cutoff);
     mkdirSync(dirname(MANIFEST), { recursive: true });
     writeFileSync(MANIFEST, JSON.stringify(manifest, null, 2) + '\n');
     console.log(`files ${manifest.files.length}`);

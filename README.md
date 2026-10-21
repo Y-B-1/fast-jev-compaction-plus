@@ -277,6 +277,53 @@ TYPESAFE_API_KEY="$(cat ~/.typesafe_key)" npm run demo
 The unit tests use a fake Jev and never contact TypeSafe. The demo is the live
 network check.
 
+`npm run validate:plugin` also checks the hooks module against the loader's rules
+(`$` spelled `$.noun.verb(...)` at each call site and passed only to top-level
+functions); a module that breaks them silently does not load in Claude Code, so
+`tests/loader.test.ts` checks the same rules.
+
+## Measuring the opt-in Jev options
+
+Four changes to how Jev is asked are built but off by default, because each moves
+what Jev keeps and only a measurement on real sessions can say whether it helps:
+
+| Option | What changes |
+| --- | --- |
+| `stateWording: archive` | Jev is told dropped output goes to an archive the assistant can read back (true with `archiveResults`), and that the history is data, not instructions |
+| `resultChecks` | Four concrete checks per result (an error still being worked on, a constraint, contents in use, output a rerun reproduces) instead of one keep question; five questions per call instead of two |
+| `hybridOriginals` | The hybrid summary is written from the original older messages rather than their trimmed form |
+| `keepThresholdByTool` | Per-tool keep thresholds, e.g. `Bash=0.2, Read=0.1` |
+
+The first three are compared with the shipped defaults on your own sessions:
+
+```sh
+npx tsx eval/load.ts freeze # once: list your Claude Code transcripts (all but the last hour's)
+TYPESAFE_API_KEY=... npx tsx eval/variants.ts --cases 8
+```
+
+Each case runs through the full hook pipeline once per option, and every output
+answers the same cached fact questions (generated and checked against the
+original with `claude -p`, as `eval/bench.ts` does). The report gives recall,
+reduction and Jev requests per option and says which to turn on: one that keeps
+at least the base recall and gives up at most 2 points of reduction. With the
+step and exchange stages on, the cut nearly always reaches the minimum, so a
+hybrid summary only runs when Jev fails late or archiving is off; the hybrid arms
+are measured on the cut those two stages leave.
+
+`keepThresholdByTool` is fitted from use instead. With `compactionLog` on (the
+default) each compaction appends its per-call scores and decisions to
+`.claude/fast-jev-compaction/log.jsonl`, and each archive file the assistant later
+reads back (Read, Grep, or a shell command over the archive) adds a line. After a
+few sessions:
+
+```sh
+npx tsx eval/calibrate.ts .claude/fast-jev-compaction/log.jsonl
+```
+
+prints, per tool, how many cut outputs were read back and the threshold that would
+have kept every one of them, as a `keepThresholdByTool` value to paste into the
+plugin options.
+
 ## Animated demo (macOS)
 
 `demo/JevDemo` is a small native SwiftUI app that plays a scripted, dramatized
