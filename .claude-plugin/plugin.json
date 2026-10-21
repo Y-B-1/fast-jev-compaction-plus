@@ -40,6 +40,12 @@
       "description": "Minimum share of the real context (system prompt, tools and history together) the cut must free before history is replaced; without a context reading it applies to the history alone.",
       "default": 0.25
     },
+    "builtinFallback": {
+      "type": "string",
+      "title": "When to use Claude's own summary",
+      "description": "auto (default): when Jev cannot compact (unreachable, or it cannot free the minimum), automatic compaction falls back to Claude Code's summary, while a manual /compact is left as it is. always: /compact falls back too, so it always compacts. never: never summarize.",
+      "default": "auto"
+    },
     "maxStateTokens": {
       "type": "number",
       "title": "Maximum Jev state tokens",
@@ -73,7 +79,7 @@
     "maxKeptResultChars": {
       "type": "number",
       "title": "Cap on tool results Jev keeps whole",
-      "description": "A tool result outside the newest messages that Jev keeps whole is still cut to its first this many characters, with the full text archived and cited; 0 disables.",
+      "description": "A tool result outside the newest messages that Jev keeps whole is still cut to about this many characters: its head and its tail (where summaries and the last error sit) with errors and identifiers from the middle, the full text archived and cited; 0 disables.",
       "default": 4000
     },
     "injectTrim": {

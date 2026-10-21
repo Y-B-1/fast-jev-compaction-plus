@@ -53,6 +53,7 @@ The plugin declares these `userConfig` values in
 | `preserveRecentMessages` | `6` |
 | `archiveResults` | `true` |
 | `minReductionRatio` | `0.25` |
+| `builtinFallback` | `auto` (`always`, `never`) |
 | `maxStateTokens` | `25000` |
 | `maxRequestTokens` | `60000` |
 | `truncateHeadChars` | `150` |
@@ -118,9 +119,10 @@ schemas and attachments count toward Claude Code's trigger but are never
 compacted, so a cut of 25% of the history can free as little as 10% of the
 context and the next compaction fires minutes later. When the history is too
 small a share of the context to free the minimum even if all of it went, the
-hook falls back without asking Jev. The outcome is shown as a toast and logged with the
-reduction, per-reason counts, state size and request count; a per-call
-`decisions:` line with both probabilities is logged for diagnosis.
+hook falls back without asking Jev. The outcome is one short toast; nothing is
+written to the chat. The debug log (`claude --debug`) gets the reduction,
+per-reason counts, state size and request count, and a per-call `decisions:`
+line with both probabilities for diagnosis.
 The plugin installs no compaction trigger of its own: compaction runs whenever
 Claude Code compacts (its built-in auto-compact or a manual `/compact`), both
 of which go through the `session.compact` hook.

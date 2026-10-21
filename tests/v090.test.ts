@@ -49,6 +49,7 @@ function archive() {
 const BIG = 'line of real output with detail\n'.repeat(400); // 12,800 chars
 const tail = [message('assistant', 'Working.'), message('user', 'continue'), message('assistant', 'ok'), message('user', 'go')];
 
+const NOTICE = /^(fallback to built-in summary|skipped \(|kept \d+\/\d+ messages|summarized \d+ older|built-in summary failed)/;
 describe('defaults', () => {
   it('keeps a shorter head and salvage, and caps kept results at 4000 chars', () => {
     const o = resolveOptions();
@@ -226,6 +227,7 @@ describe('hybrid rescue: built-in summary of the older part only', () => {
       { apiKey: 'k', preserveRecentMessages: 2, archiveResults: false, ...options },
     );
     const toasts: string[] = [];
+    const notices: string[] = [];
     const calls: SessionMessage[][] = [];
     const $ = {
       // A sleep that only ends on abort: the request timeout never fires first.
@@ -234,7 +236,7 @@ describe('hybrid rescue: built-in summary of the older part only', () => {
           new Promise<void>((_r, reject) => o?.signal?.addEventListener('abort', () => reject(o.signal?.reason), { once: true })),
       },
       http: { fetch: async (url: string, init?: { body?: string }) => jevFetch(() => 0.99)(url, init) },
-      ui: { log: () => {}, toast: (t: string) => toasts.push(t) },
+      ui: { log: (t: string) => void (NOTICE.test(t) && notices.push(t)), toast: (t: string) => toasts.push(t) },
     };
     const next = Object.assign(
       async (e: { messages: SessionMessage[] }) => {
@@ -243,7 +245,7 @@ describe('hybrid rescue: built-in summary of the older part only', () => {
       },
       { signal: new AbortController().signal, budget: { ms: 10_000, remainingMs: 10_000 } },
     );
-    return { run: () => hooks['session.compact']!($, { trigger, messages: transcript() }, next), toasts, calls };
+    return { run: () => hooks['session.compact']!($, { trigger, messages: transcript() }, next), toasts, notices, calls };
   };
 
   it('summarizes only the older turns and keeps the recent ones after the summary', async () => {
@@ -258,7 +260,7 @@ describe('hybrid rescue: built-in summary of the older part only', () => {
     expect(recent[0]!.role).toBe('user');
     expect(recent[0]!.text).toMatch(/^Step \d: /);
     expect(recent.at(-1)!.text).toBe('Done with step 8.');
-    expect(on.toasts[0]).toMatch(/^summarized 24 older messages, kept 8 recent \(trim alone below 25% minimum, prose trim tried: \d+% reduction; /);
+    expect(on.notices[0]).toMatch(/^summarized 24 older messages, kept 8 recent \(trim alone below 25% minimum, prose trim tried: \d+% reduction; /);
   });
 
   it('splits only at a user turn, so no tool call is separated from its result', async () => {
@@ -275,7 +277,7 @@ describe('hybrid rescue: built-in summary of the older part only', () => {
     const on = setup({ hybridSummary: false });
     await on.run();
     expect(on.calls[0]).toHaveLength(transcript().length);
-    expect(on.toasts[0]).toMatch(/^fallback to built-in summary \(below 25% minimum/);
+    expect(on.notices[0]).toMatch(/^fallback to built-in summary \(below 25% minimum/);
   });
 
   it('never summarizes when the built-in fallback is not allowed for the trigger', async () => {

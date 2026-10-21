@@ -157,8 +157,9 @@ put it in a source file.
 | `salvageChars` | `150` | Characters of identifiers and error lines recovered from the dropped part of a tool result and kept next to its truncation note; `0` disables |
 | `proseTrim` | `true` | Plugin hook only. On by default (set `false` to turn it off). Rescue: when tool compaction cuts less than `minReductionRatio`, Jev scores the clauses of old assistant text and prose tool inputs once, then drops the filler at the first fixed keep cut-off (`0.05`, `0.15`, `0.35`) that reaches the minimum, and cuts old code bodies in tool inputs. User messages, pinned messages and protected spans (code, paths, identifiers, numbers) are never trimmed. If no cut-off reaches the minimum, the built-in fallback runs as before |
 | `notificationTrim` | `true` | Plugin hook only. On by default (set `false` to turn it off; it needs `archiveResults`, and does nothing while that is off). Rescue, run only when tool compaction cuts less than `minReductionRatio` and `archiveResults` is on: removes the `<usage>` and `<diagnostics>` of finished background-worker reports (`<task-notification>` messages), and folds the reports Jev scores as stale to a `truncateHeadChars` head, a marker and the errors, paths, urls, shas and names from the rest, at the first keep cut-off (`0.05`, `0.15`, `0.35`, then every report) that reaches the minimum. Each original is archived whole under `.claude/fast-jev-compaction/notif-<task-id>.txt` and cited in the marker. Nothing is reworded; bare numbers in a folded tail are recoverable only from the archive. Costs one extra Jev request on a shortfall. User text, pinned messages and reports that are not `completed` are never touched |
+| `builtinFallback` | `auto` | Plugin hook only. When Jev cannot compact (unreachable, or it cannot free the minimum): `auto` falls back to Claude Code's summary for automatic compaction and leaves a manual `/compact` as it is; `always` falls back for `/compact` too; `never` never summarizes |
 | `minResultChars` | `500` | Tool results shorter than this are always kept and never asked about |
-| `maxKeptResultChars` | `4000` | A result outside the newest messages that Jev keeps whole is still cut to its first this many characters, archived and cited like a dropped one; `0` disables |
+| `maxKeptResultChars` | `4000` | A result outside the newest messages that Jev keeps whole is still cut to about this many characters: its head and tail (half of each for an error, otherwise three quarters head) with the errors and identifiers of the middle, archived and cited; a capped result is never capped again; `0` disables |
 | `hybridSummary` | `true` | Plugin hook only. When trimming frees less than the minimum, the built-in summarizer summarizes only the older history and the recent turns (at most 30% of the history) stay as trimmed, instead of a summary of everything; see `hooks/README.md` |
 | `inputTrim` | `true` | Plugin hook only. On every compaction, cut the code bodies of old tool inputs (Write/Edit contents, notebook sources, workflow scripts, Bash heredocs) to a `truncateHeadChars` head and a note, by rule with no Jev request, archiving the full text when `archiveResults` is on. Prose inputs (Agent prompts), pinned messages and dropped calls are not touched |
 | `injectTrim` | `true` | Plugin hook only; needs `archiveResults`. When trimming falls short, fold old injected content in user rows (skill bodies, browser element selections, pastes, and other user rows of 3,000+ chars that are not among the last three prompts) to a head, a marker naming the archived original, and a salvage block. Jev decides which blocks stay; at the last rung every old skill body and element selection folds. Text typed around a block (a skill's `ARGUMENTS:`, the request after an element) stays verbatim. |
@@ -215,10 +216,13 @@ The install prompts for the plugin options (API key, thresholds, `truncateHeadCh
 …); leave them at their defaults to use `TYPESAFE_API_KEY` from the environment.
 Restart Claude Code or run `/reload-plugins`. From then on `/compact` (and
 auto-compaction) goes through Jev. The plugin never starts a compaction itself; it
-runs whenever Claude Code compacts: the toast reads
-`fast-jev-compaction: kept N/M messages, no summary (…)` when the pruned history
-replaced the built-in summary, or `fallback to built-in summary (…)` when Jev
-could not remove enough (short sessions, or when it fails).
+runs whenever Claude Code compacts and shows one short toast, nothing in the chat:
+`Compacted with Jev: N → M messages, X% smaller, no summary` when the pruned
+history replaced the built-in summary, or `Using Claude's summary: …` when Jev
+could not remove enough (short sessions) or failed. A manual `/compact` that Jev
+cannot serve is left as it is (`Not compacted: …`) unless `builtinFallback` is
+`always`. The full detail (context size, per-stage counts, per-call decisions)
+goes to Claude Code's debug log (`claude --debug`), under `[fast-jev-compaction]`.
 
 To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
 from the repository root. No publishing step is required; the marketplace is

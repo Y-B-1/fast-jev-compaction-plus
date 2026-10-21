@@ -1091,17 +1091,25 @@ function interrupted($: UiLog): { skip: string } {
   return { skip: 'fast-jev-compaction: interrupted' };
 }
 
+/** An error's message for a toast: its first line, at most 100 characters. */
+function shortError(error: unknown): string {
+  const text = (error instanceof Error ? error.message : String(error)).split('\n')[0]!.replace(/^fast-jev-compaction: /, '');
+  return text.length > 100 ? `${text.slice(0, 99)}…` : text;
+}
+
+/** One toast in the chat, short; the full detail goes to the debug log. */
 function notify(
   $: {
     ui: UiLog['ui'] & {
       toast: (text: string, options?: { timeoutMs?: number }) => void;
     };
   },
-  text: string,
+  toast: string,
+  detail: string = toast,
 ): void {
-  log($, text);
+  log($, detail);
   try {
-    $.ui.toast(text, { timeoutMs: TOAST_MS });
+    $.ui.toast(toast, { timeoutMs: TOAST_MS });
   } catch {
     // A disconnected UI must not prevent the native fallback.
   }
@@ -1146,10 +1154,18 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (target >= 1 && target > configured.minReductionRatio) {
         const reason = `history is too small a share of the context to free ${percent(configured.minReductionRatio)}`;
         if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
-          notify($, `skipped (${reason}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger)`);
+          notify(
+            $,
+            'Not compacted: the history is too small a share of the context for Jev to free enough',
+            `skipped (${reason}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger)`,
+          );
           return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
         }
-        notify($, `fallback to built-in summary (${reason})`);
+        notify(
+          $,
+          "Using Claude's summary: the history is too small a share of the context for Jev",
+          `fallback to built-in summary (${reason})`,
+        );
         return next(event);
       }
       config.minReductionRatio = target;
@@ -1180,6 +1196,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
           notify(
             $,
+            `Not compacted: Jev freed ${percent(reductionRatio(result))}, below the ${percent(configured.minReductionRatio)} minimum`,
             `skipped (below ${percent(configured.minReductionRatio)} minimum${tried}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result)})`,
           );
           return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
@@ -1193,7 +1210,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
             return await next(e);
           } catch (error) {
             if (next.signal.aborted || !partial) throw error;
-            notify($, `built-in summary failed, kept the Jev cut (${summarize(result)})`);
+            notify(
+              $,
+              `Claude's summary failed; kept Jev's ${percent(reductionRatio(result))} cut`,
+              `built-in summary failed, kept the Jev cut (${summarize(result)})`,
+            );
             return partial;
           }
         };
@@ -1208,12 +1229,14 @@ export const register: Register = (on: On, options: PluginOptions) => {
           log($, `hybrid: summarized ${split} older messages, kept ${recent.length} recent (~${messageTokens(recent)} tokens)`);
           notify(
             $,
+            `Compacted: summarized ${split} older messages, kept ${recent.length} recent ones verbatim`,
             `summarized ${split} older messages, kept ${recent.length} recent (trim alone below ${percent(configured.minReductionRatio)} minimum${tried}: ${summarize(result)})`,
           );
           return { messages: [...summarized.messages, ...recent] };
         }
         notify(
           $,
+          `Using Claude's summary: Jev freed ${percent(reductionRatio(result))}, below the ${percent(configured.minReductionRatio)} minimum`,
           `fallback to built-in summary (below ${percent(configured.minReductionRatio)} minimum${tried}: ${summarize(result)})`,
         );
         return summary(event);
@@ -1222,6 +1245,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       log($, `kept history ~${tokensAfter} tokens of ~${historyTokens}`);
       notify(
         $,
+        `Compacted with Jev: ${event.messages.length} → ${messages.length} messages, ${percent(1 - tokensAfter / Math.max(1, historyTokens))} smaller, no summary`,
         `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose, notifications, injected, exchanges, steps)})`,
       );
       return { messages, tokensBefore: historyTokens, tokensAfter };
@@ -1230,12 +1254,14 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (!mayUseBuiltin(event.trigger, configured.builtinFallback)) {
         notify(
           $,
+          `Not compacted: Jev request failed (${shortError(error)})`,
           `skipped (builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${error instanceof Error ? error.message : String(error)})`,
         );
         return { skip: 'fast-jev-compaction: request failed, builtin fallback disabled' };
       }
       notify(
         $,
+        `Using Claude's summary: Jev request failed (${shortError(error)})`,
         `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
       );
       return next(event);
