@@ -913,7 +913,6 @@ function settingsEnv(settings: Readonly<Record<string, unknown>>, name: string):
 /**
  * The `apiKey` option, then TYPESAFE_API_KEY from the environment and then
  * the settings' `env` block; an empty string counts as unset at every step.
- * An OpenRouter key (`sk-or-`) is refused, never sent to TypeSafe.
  */
 export async function getApiKey(
   $: {
@@ -928,9 +927,6 @@ export async function getApiKey(
     // $.env.get needs a literal name at each call site so the plugin's env
     // reads can be listed statically.
     key = (await $.env.get('TYPESAFE_API_KEY')) || settingsEnv(settings, 'TYPESAFE_API_KEY');
-  }
-  if (key?.startsWith('sk-or-')) {
-    throw new Error('an OpenRouter key is configured; fast-jev now uses TypeSafe: set TYPESAFE_API_KEY');
   }
   return key || undefined;
 }

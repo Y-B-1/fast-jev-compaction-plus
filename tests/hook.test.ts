@@ -468,23 +468,6 @@ describe('getApiKey', () => {
     ).toBe('from-settings');
   });
 
-  it('ignores OPENROUTER_API_KEY entirely', async () => {
-    expect(await getApiKey(engine({ OPENROUTER_API_KEY: 'router' }), resolveHookConfig({}))).toBeUndefined();
-    expect(await getApiKey(engine({}, { OPENROUTER_API_KEY: 'router' }), resolveHookConfig({}))).toBeUndefined();
-  });
-
-  it('refuses an OpenRouter sk-or- key from any source', async () => {
-    const refusal = 'an OpenRouter key is configured; fast-jev now uses TypeSafe: set TYPESAFE_API_KEY';
-    await expect(
-      getApiKey(engine(), { ...resolveHookConfig({}), apiKey: 'sk-or-v1-abc' }),
-    ).rejects.toThrow(refusal);
-    await expect(getApiKey(engine({ TYPESAFE_API_KEY: 'sk-or-v1-abc' }), resolveHookConfig({}))).rejects.toThrow(
-      refusal,
-    );
-    await expect(
-      getApiKey(engine({}, { TYPESAFE_API_KEY: 'sk-or-v1-abc' }), resolveHookConfig({})),
-    ).rejects.toThrow(refusal);
-  });
 });
 
 describe('register', () => {
@@ -620,19 +603,6 @@ describe('register', () => {
     expect(out).toEqual({ skip: 'fast-jev-compaction: request failed, builtin fallback disabled' });
     expect(e.toasts).toHaveLength(1);
     expect(e.toasts[0]).toMatch(/builtin fallback disabled/);
-  });
-
-  it('sends nothing to the network when the configured key is an OpenRouter key', async () => {
-    const hooks = registered({ apiKey: 'sk-or-v1-abc', preserveRecentMessages: 1, minReductionRatio: 0 });
-    let calls = 0;
-    const e = engine(async () => (++calls, { status: 200, ok: true, text: '{}' }));
-    const out = await hooks['session.compact']!(
-      e.$,
-      { trigger: 'manual', messages: transcript() },
-      next(),
-    );
-    expect(calls).toBe(0);
-    expect(out).toEqual({ skip: 'fast-jev-compaction: request failed, builtin fallback disabled' });
   });
 
   it('skips a below-minimum reduction instead of falling back for a manual /compact', async () => {

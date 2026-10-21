@@ -27,7 +27,7 @@ describe('redactText', () => {
       '[REDACTED]db.example.com/prod',
     );
     expect(redactText('--api-key sk_live_abcdefghijklmnop', undefined)).toBe('[REDACTED]');
-    expect(redactText('export OPENROUTER_API_KEY=sk-or-v1-abcdef1234567890', undefined)).toBe(
+    expect(redactText('export SERVICE_API_KEY=sk-v1-abcdef1234567890', undefined)).toBe(
       'export [REDACTED]',
     );
   });
@@ -77,7 +77,7 @@ describe('redactCompactionState', () => {
         {
           i: 0,
           role: 'user',
-          text: 'export OPENROUTER_API_KEY=sk-or-v1-abcdef1234567890',
+          text: 'export SERVICE_API_KEY=sk-v1-abcdef1234567890',
           tool_calls: [
             { id: 't1', tool: 'Bash', input: 'AKIAABCDEFGHIJKLMNOP', result: 'ok, 3 chars (omitted)' },
           ],

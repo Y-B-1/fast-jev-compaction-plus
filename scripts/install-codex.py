@@ -33,8 +33,6 @@ def check_credentials(credentials):
     key = credentials.get("apiKey")
     if credentials.get("provider") != "typesafe" or not isinstance(key, str) or not key.strip():
         raise ValueError("Configure TYPESAFE_API_KEY or a typesafe credentials.json first")
-    if key.startswith("sk-or-"):
-        raise ValueError("An OpenRouter key is configured; fast-jev uses TypeSafe: set TYPESAFE_API_KEY")
 
 
 def link(source, destination):

@@ -30,7 +30,6 @@ async function main() {
     if (credentials.provider !== 'typesafe' || typeof credentials.apiKey !== 'string') throw new Error('Configure a TypeSafe key for fast compaction');
     apiKey = credentials.apiKey;
   }
-  if (apiKey.startsWith('sk-or-')) throw new Error('An OpenRouter key is configured; fast-jev uses TypeSafe');
   let options: CompactOptions & { minReductionRatio?: number } = {};
   try { options = JSON.parse(await readFile(join(data, 'config.json'), 'utf8')); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }

@@ -56,8 +56,7 @@ class InstallerTests(unittest.TestCase):
     def test_credentials_only_typesafe(self):
         installer.check_credentials({"provider": "typesafe", "apiKey": "synthetic-test-key"})
         for credentials in (
-            {"provider": "openrouter", "apiKey": "synthetic-test-key"},
-            {"provider": "typesafe", "apiKey": "sk-or-synthetic"},
+            {"provider": "other", "apiKey": "synthetic-test-key"},
             {"provider": "typesafe", "apiKey": " "},
         ):
             with self.assertRaises(ValueError):

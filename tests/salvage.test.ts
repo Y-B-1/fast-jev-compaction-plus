@@ -51,7 +51,7 @@ describe('salvageIdentifiers and secrets', () => {
   });
 
   test('never keeps a secret value that is shaped like a path', () => {
-    const out = salvageIdentifiers('API_KEY=sk-or-v1/abcdef/ghijkl').join(' ');
+    const out = salvageIdentifiers('API_KEY=sk-v1/abcdef/ghijkl').join(' ');
 
     expect(out).not.toContain('abcdef');
   });

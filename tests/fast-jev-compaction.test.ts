@@ -736,10 +736,9 @@ describe('HTTP client', () => {
     ).rejects.toThrow(/TYPESAFE_API_KEY is not configured/);
   });
 
-  it('reads only TYPESAFE_API_KEY from the environment, ignoring OPENROUTER_API_KEY', async () => {
-    const original = { or: process.env.OPENROUTER_API_KEY, ts: process.env.TYPESAFE_API_KEY };
+  it('reads TYPESAFE_API_KEY from the environment', async () => {
+    const original = { ts: process.env.TYPESAFE_API_KEY };
     try {
-      process.env.OPENROUTER_API_KEY = 'router-key';
       process.env.TYPESAFE_API_KEY = 'typesafe-key';
       const bodies: Array<Record<string, string>> = [];
       const fetchFn = (async (_url: string | URL | Request, init?: RequestInit) => {
@@ -754,8 +753,6 @@ describe('HTTP client', () => {
         /TYPESAFE_API_KEY is not configured/,
       );
     } finally {
-      if (original.or === undefined) delete process.env.OPENROUTER_API_KEY;
-      else process.env.OPENROUTER_API_KEY = original.or;
       if (original.ts === undefined) delete process.env.TYPESAFE_API_KEY;
       else process.env.TYPESAFE_API_KEY = original.ts;
     }
