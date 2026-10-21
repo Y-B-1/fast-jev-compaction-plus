@@ -10,6 +10,8 @@ describe('release versions', () => {
     expect(json('.claude-plugin/plugin.json').version).toBe(version);
     expect(json('.codex-plugin/plugin.json').version).toBe(version);
     expect(market.version).toBe(version);
+    expect(json('package-lock.json').version).toBe(version);
+    expect(json('package-lock.json').packages[''].version).toBe(version);
     for (const plugin of market.plugins) expect(plugin.version).toBe(version);
   });
 });

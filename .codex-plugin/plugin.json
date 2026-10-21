@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "description": "Native Jev-guided tool-output compaction with the bundled Codex runtime bridge.",
   "license": "MIT",
   "hooks": "./hooks/codex.json"
