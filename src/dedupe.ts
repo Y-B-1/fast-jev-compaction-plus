@@ -86,17 +86,21 @@ function callKey(call: Pick<ToolCall, 'tool' | 'input'>): string | undefined {
 /**
  * The ids of calls that a later call repeats exactly (same tool, same input):
  * the later output supersedes the earlier one. The latest copy of each is
- * never in the set.
+ * never in the set, and a later copy supersedes only when it is no error and
+ * at least half as long: a repeat Read that answers "File unchanged since
+ * last read" or fails leaves the earlier full output as the only copy.
  */
 export function supersededCalls(calls: readonly ToolCall[]): Set<string> {
-  const seen = new Set<string>();
+  // Per key, the longest output of a later copy that did not fail.
+  const later = new Map<string, number>();
   const superseded = new Set<string>();
   for (let index = calls.length - 1; index >= 0; index -= 1) {
     const call = calls[index]!;
     const key = callKey(call);
     if (key === undefined) continue;
-    if (seen.has(key)) superseded.add(call.id);
-    else seen.add(key);
+    const best = later.get(key);
+    if (best !== undefined && best * 2 >= call.resultChars) superseded.add(call.id);
+    if (!call.isError) later.set(key, Math.max(best ?? 0, call.resultChars));
   }
   return superseded;
 }

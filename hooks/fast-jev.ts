@@ -321,7 +321,9 @@ async function bounded<T>(
 /**
  * A `JevAsker` over the engine's `$.http.fetch`: each attempt is bounded by a
  * timeout and the hook's signal, and a 429 or 5xx is retried once, after the
- * `retry-after` delay when the engine reports one.
+ * `retry-after` delay when the engine reports one. Once one attempt times out,
+ * every later ask fails at once: the stages after it would otherwise each wait
+ * out their own timeout before the fallback runs.
  */
 export function jevAsker(
   fetchFn: HookFetch,
@@ -333,8 +335,10 @@ export function jevAsker(
   const { signal } = options;
   const sleep = options.sleep ?? timerSleep;
   const remainingMs = options.remainingMs ?? (() => Infinity);
+  let timedOut: Error | undefined;
   return {
     async ask(state, questions) {
+      if (timedOut) throw new Error(`Jev unavailable: ${timedOut.message}`);
       // The state carries transcript text and tool inputs verbatim, and each
       // keep question quotes a head and tail of its tool result; a command,
       // an env var, or a pasted key in either must not leave the machine.
@@ -350,7 +354,10 @@ export function jevAsker(
           signal,
           'Jev request',
           sleep,
-        );
+        ).catch((error: unknown) => {
+          if (error instanceof Error && error.name === 'TimeoutError') timedOut = error;
+          throw error;
+        });
       let response = await attempt();
       if (!response.ok && isRetryableStatus(response.status)) {
         const delay = retryDelayMs(response.headers?.['retry-after']);

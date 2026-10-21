@@ -96,3 +96,44 @@ describe('redactCompactionState', () => {
     expect(state).toEqual(original);
   });
 });
+
+describe('secret-named fields and more provider keys', () => {
+  it('redacts the value of secret-named keys in config, JSON, headers and query strings', () => {
+    const cases: [string, string][] = [
+      ['password: hunter2xyz', 'password: [REDACTED]'],
+      ['"password": "hunter2xyz"', '"password": "[REDACTED]"'],
+      ['db_password=hunter2xyz', 'db_password=[REDACTED]'],
+      ['DB_PASS=s3cr3tValue', 'DB_PASS=[REDACTED]'],
+      ['aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', 'aws_secret_access_key = [REDACTED]'],
+      ['curl -H "X-Api-Key: 9f8e7d6c5b4a39281706f5e4d3c2b1a0"', 'curl -H "X-Api-Key: [REDACTED]"'],
+      ['https://api.x.com/v1?api_key=AbCdEf123456&q=1', 'https://api.x.com/v1?api_key=[REDACTED]&q=1'],
+      ['"apiKey": "AbC123xyz789"', '"apiKey": "[REDACTED]"'],
+    ];
+    for (const [input, output] of cases) expect(redactText(input, undefined)).toBe(output);
+  });
+
+  it('redacts more provider key formats and Authorization schemes', () => {
+    for (const secret of [
+      'sk_live_51HabcdefGHIJKLmnop1234',
+      'AIzaSyA-abcdefghijklmnopqrstuvwxyz12345',
+      'npm_abcdefghijklmnopqrstuvwxyz0123456789',
+      'glpat-abcdefghij1234567890',
+      'Authorization: token abcdef0123456789',
+    ]) {
+      expect(redactText(`x ${secret} y`, undefined)).toBe('x [REDACTED] y');
+    }
+  });
+
+  it('leaves code that only names a secret alone', () => {
+    for (const code of [
+      'const token = getToken();',
+      'token = req.headers.authorization',
+      'password: ${PASSWORD}',
+      'API_KEY: $API_KEY',
+      'max_tokens: 4096',
+      'tests passed: 12 of 12',
+    ]) {
+      expect(redactText(code, undefined)).toBe(code);
+    }
+  });
+});

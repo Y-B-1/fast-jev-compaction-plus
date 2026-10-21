@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { applyDecisions } from '../src/compact.js';
 import { applyExchanges, findExchanges } from '../src/exchanges.js';
 import { findBlocks } from '../src/inject.js';
+import { supersededCalls } from '../src/dedupe.js';
 import { collectToolCalls } from '../src/state.js';
 import { findSteps, planSteps } from '../src/steps.js';
 import type { Message } from '../src/types.js';
@@ -90,5 +91,34 @@ describe('injected-content fold and images', () => {
 
   it('leaves a long engine-held prompt whole when the conversation holds images', () => {
     expect(findBlocks(rows(), 2, 150, true).map((b) => b.kind)).not.toContain('long');
+  });
+});
+
+describe('duplicate calls', () => {
+  const read = (id: string, chars: number, isError = false) =>
+    ({ id, tool_use_id: id, tool: 'Read', input: { file_path: '/r/x.ts' }, callIndex: 0, resultIndex: 1, resultChars: chars, isError, pinned: false }) as never;
+
+  it('a later full copy supersedes the earlier one', () => {
+    expect([...supersededCalls([read('t1', 3000), read('t2', 3000)])]).toEqual(['t1']);
+  });
+
+  it('a later "File unchanged" stub or error does not supersede the full output', () => {
+    expect(supersededCalls([read('t1', 3500), read('t2', 150)]).size).toBe(0);
+    expect(supersededCalls([read('t1', 3500), read('t2', 3500, true)]).size).toBe(0);
+  });
+});
+
+describe('empty assistant rows', () => {
+  it('drops an old empty assistant row but keeps one in the pinned newest messages', () => {
+    const messages = [
+      msg('user', 'start'),
+      msg('assistant', ''),
+      msg('user', 'continue'),
+      { ...msg('assistant', ''), handle: 'thinking' } as Message,
+      msg('assistant', 'working'),
+    ];
+    const out = applyDecisions(messages, [], [], 150, undefined, 0, 0, 3);
+    expect(out).toHaveLength(4);
+    expect(out.some((m) => (m as { handle?: string }).handle === 'thinking')).toBe(true);
   });
 });

@@ -7,6 +7,7 @@ import {
   decisionLog,
   decisionLogLines,
   getApiKey,
+  jevAsker,
   messageTarget,
   messageTokens,
   register,
@@ -250,6 +251,18 @@ describe('compactSession', () => {
     const pending = compactSession(transcript(), config, never, undefined, { signal: controller.signal });
     controller.abort(new Error('dispatch ended'));
     await expect(pending).rejects.toThrow(/dispatch ended/);
+  });
+
+  it('stops calling Jev for the rest of the compaction once a call times out', async () => {
+    let calls = 0;
+    const never = () => {
+      calls++;
+      return new Promise<never>(() => {});
+    };
+    const asker = jevAsker(never, 'k', 'jev-latest', { timeoutMs: 30 });
+    await expect(asker.ask({}, {})).rejects.toThrow(/timed out after 30 ms/);
+    await expect(asker.ask({}, {})).rejects.toThrow(/^Jev unavailable: .*timed out/);
+    expect(calls).toBe(1);
   });
 
   it('bounds a Jev call with the injected sleep when the runtime has no AbortSignal.timeout or .any', async () => {

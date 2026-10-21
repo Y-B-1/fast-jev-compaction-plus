@@ -8,6 +8,7 @@ import {
   register,
   resolveHookConfig,
 } from '../hooks/fast-jev.ts';
+import { CAPPED_MARKER } from '../src/compact.js';
 import { COMPACTED_MARKER } from '../src/dedupe.js';
 import { elideBody } from '../src/prose.js';
 import { estimateTokens } from '../src/state.js';
@@ -75,15 +76,30 @@ describe('shorter truncation note', () => {
 describe('cap on kept results', () => {
   const session = () => [message('user', 'Find the bug.'), call('t1', 'Read', { file_path: 'a' }, BIG), result('t1', BIG), ...tail];
 
-  it('cuts a result Jev keeps whole to its first maxKeptResultChars and archives it', async () => {
+  it('cuts a result Jev keeps whole to its head and tail within maxKeptResultChars and archives it', async () => {
     const a = archive();
     const out = await compact(session(), jev(0.9), { archive: a.cite, preserveRecentMessages: 4 });
     expect(out.decisions[0]!.action).toBe('keep');
     expect(out.stats.resultsCapped).toBe(1);
     const text = out.messages.flatMap((m) => m.toolResults ?? [])[0]!.text;
-    expect(text.startsWith(BIG.slice(0, 4000))).toBe(true);
-    expect(text).toContain(`${COMPACTED_MARKER}${BIG.length - 4000} chars; full output: arch/t1.txt]`);
-    expect(text.length).toBeLessThan(4200);
+    expect(text.startsWith(BIG.slice(0, 3000))).toBe(true);
+    expect(text.endsWith(BIG.slice(-1000))).toBe(true);
+    expect(text).toContain(`${CAPPED_MARKER}${BIG.length} chars, ${BIG.length - 4000} omitted; full output: arch/t1.txt]`);
+    expect(text.length).toBeLessThan(4400);
+    expect(a.files.get('arch/t1.txt')).toBe(BIG);
+  });
+
+  it('leaves a capped result alone when kept again, and cites the full archive when it is dropped later', async () => {
+    const a = archive();
+    const first = await compact(session(), jev(0.9), { archive: a.cite, preserveRecentMessages: 4 });
+    const capped = first.messages.flatMap((m) => m.toolResults ?? [])[0]!.text;
+    const again = await compact(first.messages, jev(0.9), { archive: a.cite, preserveRecentMessages: 4 });
+    expect(again.messages.flatMap((m) => m.toolResults ?? [])[0]!.text).toBe(capped);
+    expect(again.stats.resultsCapped).toBe(0);
+    const dropped = await compact(first.messages, jev(0.01, 0.9), { archive: a.cite, preserveRecentMessages: 4 });
+    const text = dropped.messages.flatMap((m) => m.toolResults ?? [])[0]!.text;
+    expect(text).toContain('full output: arch/t1.txt]');
+    expect(text.length).toBeLessThan(capped.length);
     expect(a.files.get('arch/t1.txt')).toBe(BIG);
   });
 

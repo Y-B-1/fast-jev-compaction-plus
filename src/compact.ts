@@ -289,6 +289,41 @@ export function headOf(text: string, chars: number): string {
   return text.slice(0, splitsSurrogatePair(text, chars) ? chars - 1 : chars);
 }
 
+/** Starts the note of a result Jev kept whole but that was cut to `maxKeptResultChars`. */
+export const CAPPED_MARKER = '[fast-jev-compaction kept the head and tail of ';
+
+/**
+ * A result Jev kept whole, cut to about `capChars`: its head, then its tail
+ * (where test and build summaries and the last error sit; half of the cap for
+ * an error result, a quarter otherwise), with the identifiers and error lines
+ * of the omitted middle salvaged between them.
+ */
+function cappedResultText(
+  text: string,
+  isError: boolean,
+  capChars: number,
+  archivedPath?: string,
+  salvageChars = 0,
+): string {
+  if (text.length <= capChars + 120) return text;
+  const tailChars = Math.floor(capChars * (isError ? 0.5 : 0.25));
+  const head = headOf(text, capChars - tailChars);
+  let tailStart = text.length - tailChars;
+  if (splitsSurrogatePair(text, tailStart)) tailStart += 1;
+  const middle = text.slice(head.length, tailStart);
+  const where = archivedPath ? `; full output: ${archivedPath}` : '; re-run the tool if needed';
+  const note = `${CAPPED_MARKER}${text.length} chars, ${middle.length} omitted${isError ? ' (error)' : ''}${where}]`;
+  const salvaged = salvageBlock(middle, salvageChars);
+  return `${head}\n${note}${salvaged ? `\n${salvaged}` : ''}\n${text.slice(tailStart)}`;
+}
+
+/** The archive path an earlier cap cited in `text`, if any. */
+function cappedPath(text: string): string | undefined {
+  const at = text.indexOf(CAPPED_MARKER);
+  if (at === -1) return undefined;
+  return /; full output: ([^\]\n]+)\]/.exec(text.slice(at))?.[1];
+}
+
 function truncatedResultText(
   text: string,
   isError: boolean,
@@ -351,6 +386,7 @@ export function applyDecisions(
   archive?: ArchiveResult,
   salvageChars = 0,
   capChars = 0,
+  pinnedFrom = Infinity,
 ): Message[] {
   const byId = new Map(calls.map((call) => [call.id, call]));
   // `cap`: a result Jev kept whole that is longer than `capChars`, cut to its
@@ -367,12 +403,18 @@ export function applyDecisions(
   const cutResult = (id: string, text: string, isError: boolean): string => {
     const action = actions.get(id);
     if (action !== 'drop_result' && action !== 'cap') return text;
+    // A result an earlier compaction capped is not capped again, and when Jev
+    // now drops it, the archive of its full output is cited, never overwritten
+    // with the capped copy.
+    if (text.includes(CAPPED_MARKER)) {
+      return action === 'cap' ? text : truncatedResultText(text, isError, headChars, cappedPath(text), salvageChars);
+    }
     return action === 'cap'
-      ? truncatedResultText(text, isError, capChars, archive?.(id, text), 0)
+      ? cappedResultText(text, isError, capChars, archive?.(id, text), salvageChars)
       : truncatedResultText(text, isError, headChars, archive?.(id, text), salvageChars);
   };
   const kept: Message[] = [];
-  for (const message of messages) {
+  for (const [index, message] of messages.entries()) {
     const touched =
       message.toolUses.some((tool) => actions.has(tool.tool_use_id)) ||
       (message.toolResults ?? []).some((result) => actions.has(result.tool_use_id));
@@ -381,8 +423,10 @@ export function applyDecisions(
       // tool call, no tool result) carries nothing for Jev's history and
       // nothing to answer with later; a user or tool-carrier message is
       // never dropped this way, since even an empty user turn is a real
-      // step in the conversation.
-      if (message.role === 'assistant' && isEmptyMessage(message)) continue;
+      // step in the conversation. Within the pinned newest messages it stays:
+      // there it can be the thinking block of the response still running,
+      // which the API requires back.
+      if (message.role === 'assistant' && isEmptyMessage(message) && index < pinnedFrom) continue;
       kept.push(message);
       continue;
     }
@@ -575,10 +619,16 @@ export async function compact(
     options.archive,
     resolved.salvageChars,
     resolved.maxKeptResultChars,
+    source.length - resolved.preserveRecentMessages,
   );
   const capped = new Set(
     calls
-      .filter((call) => resolved.maxKeptResultChars > 0 && call.resultChars > resolved.maxKeptResultChars + 120)
+      .filter(
+        (call) =>
+          resolved.maxKeptResultChars > 0 &&
+          call.resultChars > resolved.maxKeptResultChars + 120 &&
+          !(resultTexts.get(call.tool_use_id) ?? '').includes(CAPPED_MARKER),
+      )
       .map((call) => call.id),
   );
   return {
