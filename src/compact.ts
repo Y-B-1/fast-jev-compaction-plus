@@ -1,4 +1,4 @@
-import { COMPACTED_MARKER, dedupeBlocks, supersededCalls } from './dedupe.js';
+import { dedupeBlocks, supersededCalls } from './dedupe.js';
 import { MAX_QUESTIONS_PER_REQUEST, noulAnswer } from './request.js';
 import { salvageBlock } from './salvage.js';
 import { collectToolCalls, estimateTokens, fitState, goalFromMessages, isPinned } from './state.js';
@@ -380,6 +380,20 @@ function cappedResultText(
   return `${head}\n${note}${salvaged ? `\n${salvaged}` : ''}\n${text.slice(tailStart)}`;
 }
 
+/**
+ * Whether `text` is a result an earlier compaction cut: its note starts a line
+ * and carries a count, so a tool output that only quotes the marker (this
+ * plugin's own source, a Read with line numbers) is not mistaken for one.
+ */
+export function wasTruncated(text: string): boolean {
+  return /(?:^|\n)\[fast-jev-compaction truncated \d+ chars/.test(text);
+}
+
+/** Whether `text` is a result an earlier compaction capped (see `wasTruncated`). */
+export function wasCapped(text: string): boolean {
+  return /\n\[fast-jev-compaction kept the head and tail of \d+ chars/.test(text);
+}
+
 /** The archive path an earlier cap cited in `text`, if any. */
 function cappedPath(text: string): string | undefined {
   const at = text.indexOf(CAPPED_MARKER);
@@ -478,9 +492,12 @@ export function applyDecisions(
     // A result an earlier compaction capped is not capped again, and when Jev
     // now drops it, the archive of its full output is cited, never overwritten
     // with the capped copy.
-    if (text.includes(CAPPED_MARKER)) {
+    if (wasCapped(text)) {
       return action === 'cap' ? text : truncatedResultText(text, isError, headChars, cappedPath(text), salvageChars);
     }
+    // Archive only what is actually cut: a short duplicate stays as it is.
+    const limit = action === 'cap' ? capChars : headChars;
+    if (text.length <= limit + 120) return text;
     return action === 'cap'
       ? cappedResultText(text, isError, capChars, archive?.(id, text), salvageChars)
       : truncatedResultText(text, isError, headChars, archive?.(id, text), salvageChars);
@@ -622,7 +639,7 @@ export async function compact(
   for (const call of calls) {
     if (call.pinned) continue;
     const base = { id: call.id, tool: call.tool, keepCall: 1, keepResult: 1 };
-    if ((resultTexts.get(call.tool_use_id) ?? '').includes(COMPACTED_MARKER)) {
+    if (wasTruncated(resultTexts.get(call.tool_use_id) ?? '')) {
       settled.set(call.id, { ...base, action: 'keep', reason: 'compacted' });
     } else if (call.resultChars < resolved.minResultChars) {
       settled.set(call.id, { ...base, action: 'keep', reason: 'small' });
@@ -698,7 +715,7 @@ export async function compact(
         (call) =>
           resolved.maxKeptResultChars > 0 &&
           call.resultChars > resolved.maxKeptResultChars + 120 &&
-          !(resultTexts.get(call.tool_use_id) ?? '').includes(CAPPED_MARKER),
+          !wasCapped(resultTexts.get(call.tool_use_id) ?? ''),
       )
       .map((call) => call.id),
   );

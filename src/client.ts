@@ -1,3 +1,4 @@
+import { redactCompactionState } from './redact.js';
 import { buildJevRequest, isRetryableStatus, parseJevResponse, retryDelayMs } from './request.js';
 import type { JevAsker, JevQuestions, JevResponse, JevState } from './types.js';
 
@@ -92,10 +93,11 @@ export class JevClient implements JevAsker {
 
   async ask(state: JevState, questions: JevQuestions): Promise<JevResponse> {
     if (!this.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
+    // Credential-shaped text in the transcript must not leave the machine.
     const request = buildJevRequest(
       { apiKey: this.apiKey, model: this.model, baseUrl: this.baseUrl },
-      state,
-      questions,
+      redactCompactionState(state, this.apiKey),
+      redactCompactionState(questions, this.apiKey),
     );
     const first = await this.attempt(request);
     if (first.ok || !isRetryableStatus(first.status)) {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { applyDecisions } from '../src/compact.js';
+import { JevClient } from '../src/client.js';
+import { applyDecisions, compact, wasCapped, wasTruncated } from '../src/compact.js';
 import { applyExchanges, findExchanges } from '../src/exchanges.js';
 import { findBlocks } from '../src/inject.js';
 import { supersededCalls } from '../src/dedupe.js';
@@ -150,5 +151,50 @@ describe('dropped-call notes', () => {
 
   it('keeps only the one-line note for a read a re-run reproduces', () => {
     expect(drop('Read', { file_path: 'a.ts' }, output)).not.toContain('EADDRINUSE');
+  });
+});
+
+describe('recognising earlier cuts', () => {
+  it('treats only a real note as an earlier cut, not a file that quotes the marker', () => {
+    expect(wasTruncated('head\n[fast-jev-compaction truncated 1200 chars; full output: a.txt]')).toBe(true);
+    expect(wasTruncated("  12→  const note = `[fast-jev-compaction truncated ${n} chars`;")).toBe(false);
+    expect(wasCapped('head\n[fast-jev-compaction kept the head and tail of 9000 chars, 5000 omitted]\ntail')).toBe(true);
+    expect(wasCapped("const CAPPED = '[fast-jev-compaction kept the head and tail of ';")).toBe(false);
+  });
+});
+
+describe('archiving', () => {
+  it('does not archive a duplicate result too short to be cut', async () => {
+    const archived: string[] = [];
+    const small = 'x'.repeat(200);
+    const messages = [
+      msg('user', 'start'),
+      msg('assistant', '', { toolUses: [{ tool_use_id: 'a', tool: 'Read', input: { file_path: 'f' }, text: small }] }),
+      msg('user', '', { toolResults: [{ tool_use_id: 'a', text: small }] }),
+      msg('assistant', '', { toolUses: [{ tool_use_id: 'b', tool: 'Read', input: { file_path: 'f' }, text: small }] }),
+      msg('user', '', { toolResults: [{ tool_use_id: 'b', text: small }] }),
+      msg('user', 'one'),
+      msg('assistant', 'two'),
+    ];
+    const jev = { ask: async (_s: unknown, q: Record<string, unknown>) => ({ answers: Object.fromEntries(Object.keys(q).map((k) => [k, { type: 'noul', noul: 0.9 }])) }) };
+    const out = await compact(messages, jev as never, {
+      preserveRecentMessages: 2,
+      minResultChars: 0,
+      archive: (id: string) => (archived.push(id), `arch/${id}`),
+    });
+    expect(out.decisions.find((d) => d.reason === 'duplicate')).toBeDefined();
+    expect(archived).toEqual([]);
+  });
+});
+
+describe('library client', () => {
+  it('redacts credential-shaped text before it is sent', async () => {
+    const bodies: string[] = [];
+    const fetchFn = (async (_url: string, init?: RequestInit) => {
+      bodies.push(String(init?.body));
+      return new Response(JSON.stringify({ answers: {} }), { status: 200 });
+    }) as typeof fetch;
+    await new JevClient({ apiKey: 'k-123456', fetch: fetchFn }).ask({ text: 'password: hunter2xyz' } as never, {});
+    expect(bodies[0]).not.toContain('hunter2xyz');
   });
 });
