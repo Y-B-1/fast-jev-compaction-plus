@@ -237,7 +237,23 @@ history replaced the built-in summary, or `Using Claude's summary: …` when Jev
 could not remove enough (short sessions) or failed. A manual `/compact` that Jev
 cannot serve is left as it is (`Not compacted: …`) unless `builtinFallback` is
 `always`. The full detail (context size, per-stage counts, per-call decisions)
-goes to Claude Code's debug log (`claude --debug`), under `[fast-jev-compaction]`.
+goes to Claude Code's debug log (`claude --debug`), under `[fast-jev-compaction]`,
+and `/jev` prints the last compaction's outcome and detail and the settings in use
+(key found, endpoint, model, `builtinFallback`) without the debug log.
+
+Subagents Claude Code starts (the Task tool) compact through the same hook, each
+on its own transcript. An agent of another tool (a Codex or Cursor worker an app
+starts beside Claude) compacts with that tool's own method; what it hands back to
+the Claude session is ordinary tool output there, which this plugin then scores
+like any other.
+
+`TYPESAFE_BASE_URL` (environment or the settings' `env` block) replaces TypeSafe's
+endpoint with another one that speaks the same API, such as a staging host or a
+local test server.
+
+Claude Code loads plugin hook modules once a startup feature flag answers, at the
+start of a turn: a `/compact` typed as the very first thing in a freshly started
+process can run before the plugin is loaded and use Claude's own summary.
 
 To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
 from the repository root. No publishing step is required; the marketplace is

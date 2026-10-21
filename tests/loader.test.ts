@@ -14,4 +14,14 @@ describe('hooks module shape', () => {
     expect(uses.length).toBeGreaterThan(10);
     expect(uses.filter((use) => !/^\$\.[a-z]+\.[A-Za-z]+\s*\($/.test(use))).toEqual([]);
   });
+
+  it('passes $ only to functions declared at the top of the file or imported', () => {
+    const source = readFileSync(new URL('../hooks/fast-jev.ts', import.meta.url), 'utf8');
+    const callees = new Set([...source.matchAll(/([A-Za-z_]\w*)\(\s*\$\s*[,)]/g)].map((m) => m[1]!));
+    const topLevel = (name: string) =>
+      new RegExp(`^(?:export )?(?:async )?function ${name}\\b|^(?:export )?const ${name}\\b`, 'm').test(source) ||
+      new RegExp(`^import [^;]*\\b${name}\\b`, 'm').test(source);
+    expect(callees.size).toBeGreaterThan(3);
+    expect([...callees].filter((name) => !topLevel(name))).toEqual([]);
+  });
 });

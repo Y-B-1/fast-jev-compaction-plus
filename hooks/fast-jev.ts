@@ -1,4 +1,5 @@
 import type {
+  Hook,
   On,
   PluginOptions,
   Register,
@@ -974,7 +975,11 @@ type UiLog = { ui: { log: (text: string, options?: { to?: 'transcript' | 'debug'
  * Diagnostics go to the debug log only: `$.ui.log` defaults to the transcript,
  * where every compaction would add a dozen dim rows to the chat.
  */
+/** The debug lines and the toast of the compaction in flight, kept for `/jev`. */
+let report: { lines: string[]; toast?: string } | undefined;
+
 function log($: UiLog, text: string): void {
+  report?.lines.push(text);
   try {
     $.ui.log(text, { to: 'debug' });
   } catch {
@@ -1129,6 +1134,7 @@ function notify(
   detail: string = toast,
 ): void {
   log($, detail);
+  if (report) report.toast = toast;
   try {
     $.ui.toast(toast, { timeoutMs: TOAST_MS });
   } catch {
@@ -1136,185 +1142,254 @@ function notify(
   }
 }
 
-export const register: Register = (on: On, options: PluginOptions) => {
-  const configured = resolveHookConfig(options);
-  let inertNoticeLogged = false;
-
-  on('session.compact', async ($, event, next) => {
-    // A subagent's or a fork's own transcript is compacted like the main one;
-    // only the context reading, which is the main conversation's, is left out.
-    // `precompute` computes nothing yet and installs no result, so there is
-    // nothing useful for Jev to do here.
-    if (event.trigger === 'precompute') {
-      return { skip: 'fast-jev-compaction does not handle speculative compactions' };
-    }
+/**
+ * The `session.compact` hook proper; `register` wraps it to keep a report for
+ * `/jev`. Top-level, since the hooks loader follows `$` only into functions
+ * declared at the top of the file.
+ */
+async function compactHook(
+  $: Parameters<Hook<'session.compact'>>[0],
+  event: Parameters<Hook<'session.compact'>>[1],
+  next: Parameters<Hook<'session.compact'>>[2],
+  configured: HookConfig,
+  once: { inertNoticeLogged: boolean },
+): Promise<Awaited<ReturnType<Hook<'session.compact'>>>> {
+  // A subagent's or a fork's own transcript is compacted like the main one;
+  // only the context reading, which is the main conversation's, is left out.
+  // `precompute` computes nothing yet and installs no result, so there is
+  // nothing useful for Jev to do here.
+  if (event.trigger === 'precompute') {
+    return { skip: 'fast-jev-compaction does not handle speculative compactions' };
+  }
+  try {
+    const config = { ...configured, apiKey: await getApiKey($, configured) };
+    // The last response's input tokens: the size the engine compacts at.
+    // The history's share of it comes from the engine's own count of the
+    // `Messages` row (Claude's tokenizer), not from the plugin's estimate,
+    // which is calibrated to Jev's and can read half of Claude's count.
+    let contextTokens: number | undefined;
+    let messagesInContext: number | undefined;
     try {
-      const config = { ...configured, apiKey: await getApiKey($, configured) };
-      // The last response's input tokens: the size the engine compacts at.
-      // The history's share of it comes from the engine's own count of the
-      // `Messages` row (Claude's tokenizer), not from the plugin's estimate,
-      // which is calibrated to Jev's and can read half of Claude's count.
-      let contextTokens: number | undefined;
-      let messagesInContext: number | undefined;
-      try {
-        if (!event.agentId) {
-          const usage = await $.session.usage({ breakdown: 'summary' });
-          contextTokens = usage.context.tokens;
-          messagesInContext = usage.context.breakdown?.categories.find(
-            (row) => row.kind === 'used' && row.name === 'Messages',
-          )?.tokens;
-        }
-      } catch {
-        contextTokens = undefined;
+      if (!event.agentId) {
+        const usage = await $.session.usage({ breakdown: 'summary' });
+        contextTokens = usage.context.tokens;
+        messagesInContext = usage.context.breakdown?.categories.find(
+          (row) => row.kind === 'used' && row.name === 'Messages',
+        )?.tokens;
       }
-      const historyTokens = messageTokens(event.messages);
-      const historyInContext = messagesInContext && messagesInContext > 0 ? messagesInContext : historyTokens;
-      const target = messageTarget(contextTokens, historyInContext, configured.minReductionRatio);
-      if (contextTokens !== undefined) {
-        log(
-          $,
-          `context ${contextTokens} tokens, history ${messagesInContext ? `${messagesInContext} tokens (engine count)` : `~${historyTokens} tokens (estimate)`}, history cut needed ${percent(target)}`,
-        );
-      }
-      // Unknown (a subagent, or an engine without the API form) counts as having images.
-      let imagesInContext = true;
-      if (!event.agentId) try {
-        const breakdown = contextBreakdown(await $.session.messages({ as: 'api' }));
-        imagesInContext = breakdown.images > 0;
-        log($, `history as the model sees it: ${formatBreakdown(breakdown)}`);
-      } catch {
-        // Diagnostics only: an engine without the API form still compacts.
-      }
-      config.imagesInContext = imagesInContext;
-      if (target >= 1 && target > configured.minReductionRatio) {
-        const reason = `history is too small a share of the context to free ${percent(configured.minReductionRatio)}`;
-        if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
-          notify(
-            $,
-            'Not compacted: the history is too small a share of the context for Jev to free enough',
-            `skipped (${reason}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger)`,
-          );
-          return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
-        }
-        notify(
-          $,
-          "Using Claude's summary: the history is too small a share of the context for Jev",
-          `fallback to built-in summary (${reason})`,
-        );
-        return next(event);
-      }
-      config.minReductionRatio = target;
-      if (event.instructions?.trim()) {
-        const goal = config.goal || goalFromMessages(event.messages);
-        config.goal = `${goal}\n\nCompaction instructions: ${event.instructions}`;
-      }
-      if (config.notificationTrim && !config.archiveResults && !inertNoticeLogged) {
-        inertNoticeLogged = true;
-        log($, 'notification trim skipped: archiveResults is off');
-      }
-      const { result, messages, prose, notifications, injected, exchanges, steps } = await compactSession(
-        event.messages,
-        config,
-        async (url, init) => {
-          const response = await $.http.fetch(url, init);
-          return { status: response.status, ok: response.ok, text: response.text, headers: response.headers };
-        },
-        config.archiveResults ? archiveWriter($, await archiveDir($), config.apiKey) : undefined,
-        { signal: next.signal, sleep: clockSleep($), remainingMs: () => next.budget.remainingMs, baseUrl: await getBaseUrl($) },
-      );
-      if (next.signal.aborted) return interrupted($);
-      for (const line of decisionLogLines(result)) log($, line);
-      if (reductionRatio(result) < config.minReductionRatio) {
-        const tried = `${prose ? ', prose trim tried' : ''}${notifications ? ', notification trim tried' : ''}${injected ? ', injected-content fold tried' : ''}${exchanges ? ', exchange drop tried' : ''}${steps ? ', step trim tried' : ''}${
-          target > configured.minReductionRatio ? `, history needs ${percent(target)} to free ${percent(configured.minReductionRatio)} of context` : ''
-        }`;
-        // The cut Jev did make: below the minimum, but where no summary may run
-        // (or the summary fails) it still beats leaving the session as it is.
-        const tokensAfter = messageTokens(messages);
-        const partial = tokensAfter < historyTokens ? { messages, tokensBefore: historyTokens, tokensAfter } : undefined;
-        // What the cut frees of the whole context, the share the minimum is about.
-        const freed = percent(
-          (1 - tokensAfter / Math.max(1, historyTokens)) *
-            (contextTokens && contextTokens > historyInContext ? historyInContext / contextTokens : 1),
-        );
-        if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
-          if (partial) {
-            notify(
-              $,
-              `Compacted with Jev: ${event.messages.length} → ${messages.length} messages, frees ${freed} of the context (below the ${percent(configured.minReductionRatio)} target)`,
-              `kept the cut below the minimum (${percent(configured.minReductionRatio)} minimum${tried}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result, prose, notifications, injected, exchanges, steps)})`,
-            );
-            return partial;
-          }
-          notify(
-            $,
-            'Not compacted: Jev found nothing it could remove',
-            `skipped (below ${percent(configured.minReductionRatio)} minimum${tried}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result)})`,
-          );
-          return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
-        }
-        const summary = async (e: typeof event): ReturnType<typeof next> => {
-          try {
-            return await next(e);
-          } catch (error) {
-            if (next.signal.aborted || !partial) throw error;
-            notify(
-              $,
-              `Claude's summary failed; kept Jev's cut (frees ${freed} of the context)`,
-              `built-in summary failed, kept the Jev cut (${summarize(result)})`,
-            );
-            return partial;
-          }
-        };
-        const share = Math.min(HYBRID_RECENT_SHARE, 1 - target - HYBRID_SUMMARY_ALLOWANCE);
-        const split = config.hybridSummary && share > 0 ? hybridSplit(messages, historyTokens, share) : 0;
-        if (split > 0) {
-          const summarized = await summary({ ...event, messages: messages.slice(0, split) });
-          if (summarized === partial) return partial;
-          if (next.signal.aborted) return interrupted($);
-          if (summarized.skip !== undefined) return summarized;
-          const recent = messages.slice(split);
-          log($, `hybrid: summarized ${split} older messages, kept ${recent.length} recent (~${messageTokens(recent)} tokens)`);
-          notify(
-            $,
-            `Compacted: summarized ${split} older messages, kept ${recent.length} recent ones verbatim`,
-            `summarized ${split} older messages, kept ${recent.length} recent (trim alone below ${percent(configured.minReductionRatio)} minimum${tried}: ${summarize(result)})`,
-          );
-          return { messages: [...summarized.messages, ...recent] };
-        }
-        notify(
-          $,
-          `Using Claude's summary: Jev's cut frees ${freed} of the context, below the ${percent(configured.minReductionRatio)} minimum`,
-          `fallback to built-in summary (below ${percent(configured.minReductionRatio)} minimum${tried}: ${summarize(result)})`,
-        );
-        return summary(event);
-      }
-      const tokensAfter = messageTokens(messages);
-      log($, `kept history ~${tokensAfter} tokens of ~${historyTokens}`);
-      notify(
+    } catch {
+      contextTokens = undefined;
+    }
+    const historyTokens = messageTokens(event.messages);
+    const historyInContext = messagesInContext && messagesInContext > 0 ? messagesInContext : historyTokens;
+    const target = messageTarget(contextTokens, historyInContext, configured.minReductionRatio);
+    if (contextTokens !== undefined) {
+      log(
         $,
-        `Compacted with Jev: ${event.messages.length} → ${messages.length} messages, ${percent(1 - tokensAfter / Math.max(1, historyTokens))} smaller, no summary`,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose, notifications, injected, exchanges, steps)})`,
+        `context ${contextTokens} tokens, history ${messagesInContext ? `${messagesInContext} tokens (engine count)` : `~${historyTokens} tokens (estimate)`}, history cut needed ${percent(target)}`,
       );
-      return { messages, tokensBefore: historyTokens, tokensAfter };
-    } catch (error) {
-      if (next.signal.aborted) return interrupted($);
-      if (!mayUseBuiltin(event.trigger, configured.builtinFallback)) {
+    }
+    // Unknown (a subagent, or an engine without the API form) counts as having images.
+    let imagesInContext = true;
+    if (!event.agentId) try {
+      const breakdown = contextBreakdown(await $.session.messages({ as: 'api' }));
+      imagesInContext = breakdown.images > 0;
+      log($, `history as the model sees it: ${formatBreakdown(breakdown)}`);
+    } catch {
+      // Diagnostics only: an engine without the API form still compacts.
+    }
+    config.imagesInContext = imagesInContext;
+    if (target >= 1 && target > configured.minReductionRatio) {
+      const reason = `history is too small a share of the context to free ${percent(configured.minReductionRatio)}`;
+      if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
         notify(
           $,
-          `Not compacted: Jev request failed (${shortError(error)})`,
-          `skipped (builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${error instanceof Error ? error.message : String(error)})`,
+          'Not compacted: the history is too small a share of the context for Jev to free enough',
+          `skipped (${reason}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger)`,
         );
-        return { skip: 'fast-jev-compaction: request failed, builtin fallback disabled' };
+        return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
       }
       notify(
         $,
-        `Using Claude's summary: Jev request failed (${shortError(error)})`,
-        `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
+        "Using Claude's summary: the history is too small a share of the context for Jev",
+        `fallback to built-in summary (${reason})`,
       );
       return next(event);
     }
+    config.minReductionRatio = target;
+    if (event.instructions?.trim()) {
+      const goal = config.goal || goalFromMessages(event.messages);
+      config.goal = `${goal}\n\nCompaction instructions: ${event.instructions}`;
+    }
+    if (config.notificationTrim && !config.archiveResults && !once.inertNoticeLogged) {
+      once.inertNoticeLogged = true;
+      log($, 'notification trim skipped: archiveResults is off');
+    }
+    const { result, messages, prose, notifications, injected, exchanges, steps } = await compactSession(
+      event.messages,
+      config,
+      async (url, init) => {
+        const response = await $.http.fetch(url, init);
+        return { status: response.status, ok: response.ok, text: response.text, headers: response.headers };
+      },
+      config.archiveResults ? archiveWriter($, await archiveDir($), config.apiKey) : undefined,
+      { signal: next.signal, sleep: clockSleep($), remainingMs: () => next.budget.remainingMs, baseUrl: await getBaseUrl($) },
+    );
+    if (next.signal.aborted) return interrupted($);
+    for (const line of decisionLogLines(result)) log($, line);
+    if (reductionRatio(result) < config.minReductionRatio) {
+      const tried = `${prose ? ', prose trim tried' : ''}${notifications ? ', notification trim tried' : ''}${injected ? ', injected-content fold tried' : ''}${exchanges ? ', exchange drop tried' : ''}${steps ? ', step trim tried' : ''}${
+        target > configured.minReductionRatio ? `, history needs ${percent(target)} to free ${percent(configured.minReductionRatio)} of context` : ''
+      }`;
+      // The cut Jev did make: below the minimum, but where no summary may run
+      // (or the summary fails) it still beats leaving the session as it is.
+      const tokensAfter = messageTokens(messages);
+      const partial = tokensAfter < historyTokens ? { messages, tokensBefore: historyTokens, tokensAfter } : undefined;
+      // What the cut frees of the whole context, the share the minimum is about.
+      const freed = percent(
+        (1 - tokensAfter / Math.max(1, historyTokens)) *
+          (contextTokens && contextTokens > historyInContext ? historyInContext / contextTokens : 1),
+      );
+      if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
+        if (partial) {
+          notify(
+            $,
+            `Compacted with Jev: ${event.messages.length} → ${messages.length} messages, frees ${freed} of the context (below the ${percent(configured.minReductionRatio)} target)`,
+            `kept the cut below the minimum (${percent(configured.minReductionRatio)} minimum${tried}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result, prose, notifications, injected, exchanges, steps)})`,
+          );
+          return partial;
+        }
+        notify(
+          $,
+          'Not compacted: Jev found nothing it could remove',
+          `skipped (below ${percent(configured.minReductionRatio)} minimum${tried}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result)})`,
+        );
+        return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
+      }
+      const summary = async (e: typeof event): ReturnType<typeof next> => {
+        try {
+          return await next(e);
+        } catch (error) {
+          if (next.signal.aborted || !partial) throw error;
+          notify(
+            $,
+            `Claude's summary failed; kept Jev's cut (frees ${freed} of the context)`,
+            `built-in summary failed, kept the Jev cut (${summarize(result)})`,
+          );
+          return partial;
+        }
+      };
+      const share = Math.min(HYBRID_RECENT_SHARE, 1 - target - HYBRID_SUMMARY_ALLOWANCE);
+      const split = config.hybridSummary && share > 0 ? hybridSplit(messages, historyTokens, share) : 0;
+      if (split > 0) {
+        const summarized = await summary({ ...event, messages: messages.slice(0, split) });
+        if (summarized === partial) return partial;
+        if (next.signal.aborted) return interrupted($);
+        if (summarized.skip !== undefined) return summarized;
+        const recent = messages.slice(split);
+        log($, `hybrid: summarized ${split} older messages, kept ${recent.length} recent (~${messageTokens(recent)} tokens)`);
+        notify(
+          $,
+          `Compacted: summarized ${split} older messages, kept ${recent.length} recent ones verbatim`,
+          `summarized ${split} older messages, kept ${recent.length} recent (trim alone below ${percent(configured.minReductionRatio)} minimum${tried}: ${summarize(result)})`,
+        );
+        return { messages: [...summarized.messages, ...recent] };
+      }
+      notify(
+        $,
+        `Using Claude's summary: Jev's cut frees ${freed} of the context, below the ${percent(configured.minReductionRatio)} minimum`,
+        `fallback to built-in summary (below ${percent(configured.minReductionRatio)} minimum${tried}: ${summarize(result)})`,
+      );
+      return summary(event);
+    }
+    const tokensAfter = messageTokens(messages);
+    log($, `kept history ~${tokensAfter} tokens of ~${historyTokens}`);
+    notify(
+      $,
+      `Compacted with Jev: ${event.messages.length} → ${messages.length} messages, ${percent(1 - tokensAfter / Math.max(1, historyTokens))} smaller, no summary`,
+      `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose, notifications, injected, exchanges, steps)})`,
+    );
+    return { messages, tokensBefore: historyTokens, tokensAfter };
+  } catch (error) {
+    if (next.signal.aborted) return interrupted($);
+    if (!mayUseBuiltin(event.trigger, configured.builtinFallback)) {
+      notify(
+        $,
+        `Not compacted: Jev request failed (${shortError(error)})`,
+        `skipped (builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${error instanceof Error ? error.message : String(error)})`,
+      );
+      return { skip: 'fast-jev-compaction: request failed, builtin fallback disabled' };
+    }
+    notify(
+      $,
+      `Using Claude's summary: Jev request failed (${shortError(error)})`,
+      `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
+    );
+    return next(event);
+  }
+}
+
+export const register: Register = (on: On, options: PluginOptions) => {
+  const configured = resolveHookConfig(options);
+  const once = { inertNoticeLogged: false };
+  let lastReport: { at: number; trigger: string; agentId?: string; lines: string[]; toast?: string } | undefined;
+
+  // `/jev`: what the last compaction did and the settings it ran with, without
+  // turning on the debug log. Registered at each (re)load of the plugin.
+  on('session.start', async ($, e, next) => {
+    try {
+      await $.command.register({
+        name: 'jev',
+        description: 'fast-jev-compaction: the last compaction and the current settings',
+        immediate: true,
+      });
+    } catch {
+      // A host without plugin commands still compacts.
+    }
+    return next(e);
   });
+
+  on('command.run', { command: 'jev' }, async ($) => {
+    const key = await getApiKey($, configured).catch(() => undefined);
+    const baseUrl = await getBaseUrl($);
+    const settings = `Settings: TypeSafe key ${key ? 'set' : 'missing (set TYPESAFE_API_KEY)'} · endpoint ${baseUrl ?? 'TypeSafe'} · model ${configured.model} · builtinFallback ${configured.builtinFallback} · minimum ${percent(configured.minReductionRatio)} of the context`;
+    if (!lastReport) return { text: `No compaction yet in this session.\n${settings}` };
+    const minutes = lastReport.at > 0 ? Math.max(0, Math.round(((await $.clock.now()) - lastReport.at) / 60_000)) : undefined;
+    const lines = lastReport.lines.filter((line) => !line.startsWith('decisions'));
+    return {
+      text: [
+        `Last compaction${minutes === undefined ? '' : minutes === 0 ? ' just now' : ` ${minutes} min ago`} (${lastReport.trigger}${lastReport.agentId ? ', subagent' : ''})`,
+        lastReport.toast ?? '(no outcome recorded)',
+        ...lines.map((line) => `  ${line}`),
+        settings,
+      ].join('\n'),
+    };
+  });
+
+  on('session.compact', async ($, event, next) => {
+    if (event.trigger === 'precompute') return compactHook($, event, next, configured, once);
+    const current: { lines: string[]; toast?: string } = { lines: [] };
+    report = current;
+    try {
+      return await compactHook($, event, next, configured, once);
+    } finally {
+      if (report === current) report = undefined;
+      // Only a record for /jev: a clock that fails must never replace the result.
+      let at = 0;
+      try {
+        at = await $.clock.now();
+      } catch {
+        at = 0;
+      }
+      lastReport = {
+        at,
+        trigger: event.trigger ?? 'unknown',
+        ...(event.agentId ? { agentId: event.agentId } : {}),
+        ...current,
+      };
+    }
+  });
+
 
   // Opt-in (see HOOK_DEFAULTS.jevPruneBashOutput): trims a Bash command's
   // stdout through Jev before the model ever sees it, the same idea as

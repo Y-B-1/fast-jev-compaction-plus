@@ -516,8 +516,30 @@ describe('register', () => {
     return Object.assign(async (e: unknown) => e, { signal, budget: { ms: 10_000, remainingMs: 10_000 } });
   }
 
+  it('/jev reports the last compaction and the settings, without the per-call decisions', async () => {
+    const hooks = registered({ preserveRecentMessages: 1, minReductionRatio: 0, archiveResults: false });
+    const e = engine(jevFetch((name) => (name.startsWith('result_') ? 0.01 : 0.9)));
+    const $ = { ...e.$, env: { get: async () => undefined }, settings: { read: async () => ({}) } };
+    const before = await hooks['command.run']!($, { command: 'jev', args: '' }, next());
+    expect(before.text).toMatch(/^No compaction yet in this session\.\nSettings: TypeSafe key set · endpoint TypeSafe · model jev-latest/);
+    await hooks['session.compact']!($, { trigger: 'manual', messages: transcript() }, next());
+    const after = await hooks['command.run']!($, { command: 'jev', args: '' }, next());
+    expect(after.text).toMatch(/^Last compaction \(manual\)\nCompacted with Jev: /);
+    expect(after.text).toContain('  kept ');
+    expect(after.text).not.toContain('decisions');
+    expect(after.text).toMatch(/\nSettings: /);
+  });
+
+  it('registers /jev when the plugin loads', async () => {
+    const hooks = registered();
+    const registeredCommands: unknown[] = [];
+    const $ = { command: { register: async (spec: unknown) => void registeredCommands.push(spec) } };
+    await hooks['session.start']!($, { cwd: '/' }, Object.assign(async (e: unknown) => e, {}));
+    expect(registeredCommands).toEqual([expect.objectContaining({ name: 'jev', immediate: true })]);
+  });
+
   it('installs no turn.complete hook, so compaction only runs when Claude Code compacts', () => {
-    expect(Object.keys(registered()).sort()).toEqual(['session.compact', 'tool.call']);
+    expect(Object.keys(registered()).sort()).toEqual(['command.run', 'session.compact', 'session.start', 'tool.call']);
   });
 
   it('skips a 429 retry the hook budget from next.budget cannot afford', async () => {
