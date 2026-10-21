@@ -1,6 +1,9 @@
 import type { JevAnswer, JevQuestions, JevResponse, JevState } from './types.js';
 
 export const SYSTEM_ONE_URL = 'https://api.typesafe.ai/v1/systemone';
+
+/** Jev answers 400 "Each request needs between 1 and 128 questions" above this. */
+export const MAX_QUESTIONS_PER_REQUEST = 128;
 export const DEFAULT_MODEL = 'jev-latest';
 
 export interface JevRequest {

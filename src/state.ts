@@ -122,21 +122,20 @@ export function collectToolCalls(
   preserveRecentMessages: number,
   previewChars = 0,
 ): ToolCall[] {
+  // An id seen twice (real transcripts have them) makes the pairing ambiguous
+  // and a decision keyed by it would hit both calls: such calls stay verbatim.
+  const repeated = new Set<string>();
   const uses = new Set<string>();
   for (const message of messages) {
     for (const tool of message.toolUses) {
-      if (uses.has(tool.tool_use_id)) {
-        throw new Error(`Duplicate tool_use_id: ${tool.tool_use_id}`);
-      }
+      if (uses.has(tool.tool_use_id)) repeated.add(tool.tool_use_id);
       uses.add(tool.tool_use_id);
     }
   }
   const results = new Map<string, { index: number; result: ToolResult }>();
   messages.forEach((message, index) => {
     for (const result of message.toolResults ?? []) {
-      if (results.has(result.tool_use_id)) {
-        throw new Error(`Duplicate tool_result: ${result.tool_use_id}`);
-      }
+      if (results.has(result.tool_use_id)) repeated.add(result.tool_use_id);
       results.set(result.tool_use_id, { index, result });
     }
   });
@@ -144,7 +143,7 @@ export function collectToolCalls(
   messages.forEach((message, callIndex) => {
     for (const tool of message.toolUses) {
       const found = results.get(tool.tool_use_id);
-      if (!found) continue;
+      if (!found || repeated.has(tool.tool_use_id)) continue;
       if (found.index < callIndex) {
         throw new Error(`Tool result precedes its call: ${tool.tool_use_id}`);
       }

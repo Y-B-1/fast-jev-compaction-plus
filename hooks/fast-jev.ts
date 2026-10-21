@@ -1159,10 +1159,24 @@ export const register: Register = (on: On, options: PluginOptions) => {
           );
           return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
         }
+        // When the built-in summary itself fails, the shorter cut still beats
+        // leaving the session over its limit.
+        const tokensAfter = messageTokens(messages);
+        const partial = tokensAfter < historyTokens ? { messages, tokensBefore: historyTokens, tokensAfter } : undefined;
+        const summary = async (e: typeof event): ReturnType<typeof next> => {
+          try {
+            return await next(e);
+          } catch (error) {
+            if (next.signal.aborted || !partial) throw error;
+            notify($, `built-in summary failed, kept the Jev cut (${summarize(result)})`);
+            return partial;
+          }
+        };
         const share = Math.min(HYBRID_RECENT_SHARE, 1 - target - HYBRID_SUMMARY_ALLOWANCE);
         const split = config.hybridSummary && share > 0 ? hybridSplit(messages, historyTokens, share) : 0;
         if (split > 0) {
-          const summarized = await next({ ...event, messages: messages.slice(0, split) });
+          const summarized = await summary({ ...event, messages: messages.slice(0, split) });
+          if (summarized === partial) return partial;
           if (next.signal.aborted) return interrupted($);
           if (summarized.skip !== undefined) return summarized;
           const recent = messages.slice(split);
@@ -1177,7 +1191,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
           $,
           `fallback to built-in summary (below ${percent(configured.minReductionRatio)} minimum${tried}: ${summarize(result)})`,
         );
-        return next(event);
+        return summary(event);
       }
       const tokensAfter = messageTokens(messages);
       log($, `kept history ~${tokensAfter} tokens of ~${historyTokens}`);

@@ -308,6 +308,17 @@ describe('question batching', () => {
   it('throws when a single question does not fit', () => {
     expect(() => batchCalls(calls, 29_990, options)).toThrow(/no room/);
   });
+
+  it('caps each request at 128 questions even when the token budget allows more', () => {
+    const many = Array.from({ length: 200 }, (_, i) => ({ ...calls[0]!, id: `t${i + 1}`, tool_use_id: `tool-${i + 1}` }));
+    const batches = batchCalls(many, 1000, { maxRequestTokens: 60_000 });
+    expect(batches.length).toBeGreaterThan(1);
+    for (const batch of batches) {
+      const questions = batch.reduce((n, call) => n + Object.keys(questionsFor(call)).length, 0);
+      expect(questions).toBeLessThanOrEqual(128);
+    }
+    expect(batches.flat()).toHaveLength(200);
+  });
 });
 
 describe('decisions', () => {
@@ -541,17 +552,21 @@ describe('compact', () => {
     expect(() => parseJevResponse(200, true, '{"answers":[]}')).toThrow(/missing answers/);
   });
 
-  it('rejects a duplicate tool_use_id', () => {
+  it('leaves calls that share a tool_use_id out of the candidates', () => {
     const messages = [
       call('dup', 'Read', { file_path: 'a.ts' }, ''),
+      result('dup', 'a'),
       call('dup', 'Read', { file_path: 'b.ts' }, ''),
+      result('dup', 'b'),
+      call('ok', 'Read', { file_path: 'c.ts' }, ''),
+      result('ok', 'c'),
     ];
-    expect(() => collectToolCalls(messages, 0)).toThrow(/Duplicate tool_use_id/);
+    expect(collectToolCalls(messages, 0).map((c) => c.tool_use_id)).toEqual(['ok']);
   });
 
-  it('rejects a duplicate tool_result for the same id', () => {
+  it('leaves a call with a duplicate tool_result out of the candidates', () => {
     const messages = [call('dup', 'Read', { file_path: 'a.ts' }, ''), result('dup', 'a'), result('dup', 'b')];
-    expect(() => collectToolCalls(messages, 0)).toThrow(/Duplicate tool_result/);
+    expect(collectToolCalls(messages, 0)).toEqual([]);
   });
 
   it('rejects a tool_result that precedes its call', () => {
@@ -815,12 +830,12 @@ describe('jev context limits', () => {
   });
 
   it('uses the whole 64k request budget, not 32k', () => {
-    const calls = Array.from({ length: 90 }, (_, i) => call(`t${i + 1}`));
+    const calls = Array.from({ length: 60 }, (_, i) => call(`t${i + 1}`));
     // One request under the real 64k limit, several under the old 30k ceiling.
     expect(batchCalls(calls, 25_000, { maxRequestTokens: 60_000 })).toHaveLength(1);
     expect(
       batchCalls(calls, 25_000, { maxRequestTokens: 30_000 }).length,
-    ).toBeGreaterThan(5);
+    ).toBeGreaterThan(2);
   });
 
   it('rejects a state that leaves no room for a single question', () => {

@@ -1,5 +1,5 @@
 import { messageChars, reductionRatio, splitsSurrogatePair } from './compact.js';
-import { noulAnswer } from './request.js';
+import { MAX_QUESTIONS_PER_REQUEST, noulAnswer } from './request.js';
 import { ERROR_LINE, SCAN, salvageBlock } from './salvage.js';
 import { sha256Hex } from './sha256.js';
 import { MARKER, collectToolCalls, estimateTokens, goalFromMessages, isPinned, truncate } from './state.js';
@@ -614,7 +614,7 @@ export async function scoreProse(
         batches.push({ state, questions: {}, ids: [id], error: `state of ~${stateTokens} tokens leaves no room for a question` });
         continue;
       }
-      if (batch.ids.length > 0 && used + tokens > budget) {
+      if (batch.ids.length > 0 && (used + tokens > budget || batch.ids.length === MAX_QUESTIONS_PER_REQUEST)) {
         batches.push(batch);
         batch = { state, questions: {}, ids: [] };
         used = 0;

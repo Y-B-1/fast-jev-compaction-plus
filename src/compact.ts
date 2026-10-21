@@ -1,5 +1,5 @@
 import { COMPACTED_MARKER, dedupeBlocks, supersededCalls } from './dedupe.js';
-import { noulAnswer } from './request.js';
+import { MAX_QUESTIONS_PER_REQUEST, noulAnswer } from './request.js';
 import { salvageBlock } from './salvage.js';
 import { collectToolCalls, estimateTokens, fitState } from './state.js';
 import type {
@@ -155,18 +155,22 @@ export function batchCalls(
   const batches: ToolCall[][] = [];
   let current: ToolCall[] = [];
   let currentTokens = 0;
+  let currentQuestions = 0;
   for (const call of calls) {
-    const tokens = estimateTokens(JSON.stringify(questionsFor(call)));
+    const questions = questionsFor(call);
+    const tokens = estimateTokens(JSON.stringify(questions));
+    const count = Object.keys(questions).length;
     if (stateTokens + tokens + REQUEST_OVERHEAD_TOKENS > MAX_STATE_PLUS_QUESTION_TOKENS) {
       throw new Error(
         `state plus one question exceeds Jev's ${MAX_STATE_PLUS_QUESTION_TOKENS}-token limit ` +
           `(~${stateTokens} state + ~${tokens} question); lower maxStateTokens`,
       );
     }
-    if (current.length > 0 && currentTokens + tokens > budget) {
+    if (current.length > 0 && (currentTokens + tokens > budget || currentQuestions + count > MAX_QUESTIONS_PER_REQUEST)) {
       batches.push(current);
       current = [];
       currentTokens = 0;
+      currentQuestions = 0;
     }
     if (current.length === 0 && tokens > budget) {
       throw new Error(
@@ -175,6 +179,7 @@ export function batchCalls(
     }
     current.push(call);
     currentTokens += tokens;
+    currentQuestions += count;
   }
   if (current.length > 0) batches.push(current);
   return batches;

@@ -1,6 +1,6 @@
 import { messageChars, reductionRatio, splitsSurrogatePair } from './compact.js';
 import { PROSE_KEEP_LADDER } from './prose.js';
-import { noulAnswer } from './request.js';
+import { MAX_QUESTIONS_PER_REQUEST, noulAnswer } from './request.js';
 import { ERROR_LINE, capped, redact, salvageErrorLines, salvageIdentifiers } from './salvage.js';
 import { MARKER, collectToolCalls, estimateTokens, fitState, isPinned, resultPreview } from './state.js';
 import type {
@@ -176,7 +176,7 @@ export async function askNoul(
     if (fitted.tokens + tokens + OVERHEAD_TOKENS > STATE_PLUS_QUESTION_TOKENS || tokens > budget) {
       throw new Error(`state of ~${fitted.tokens} tokens leaves no room for a question of ~${tokens}`);
     }
-    if (current.length > 0 && used + tokens > budget) {
+    if (current.length > 0 && (used + tokens > budget || current.length === MAX_QUESTIONS_PER_REQUEST)) {
       batches.push(current);
       current = [];
       used = 0;

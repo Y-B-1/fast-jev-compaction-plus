@@ -914,7 +914,12 @@ describe('proseTrim rescue', () => {
   });
 
   describe('through the hook', () => {
-    const hook = (options: Record<string, unknown>, fetchFn = fetchWith(0.1), usageTokens?: number) => {
+    const hook = (
+      options: Record<string, unknown>,
+      fetchFn = fetchWith(0.1),
+      usageTokens?: number,
+      builtin: (e: unknown) => Promise<unknown> = async (e) => e,
+    ) => {
       const hooks: Record<string, (...args: any[]) => Promise<any>> = {};
       (register as any)(
         (event: string, a: unknown, b?: any) => {
@@ -931,7 +936,7 @@ describe('proseTrim rescue', () => {
           ? {}
           : { session: { usage: async () => ({ context: { tokens: usageTokens, window: 200_000 } }) } }),
       };
-      const next = Object.assign(async (e: unknown) => e, {
+      const next = Object.assign(builtin, {
         signal: new AbortController().signal,
         budget: { ms: 10_000, remainingMs: 10_000 },
       });
@@ -961,6 +966,16 @@ describe('proseTrim rescue', () => {
         expect(await on.run(event)).toBe(event);
         expect(on.toasts[0]).toMatch(/^fallback to built-in summary \(below 25% minimum, prose trim tried, history needs 9\d% to free 25% of context: /);
       });
+
+      it('rethrows a failed built-in summary when its own cut freed nothing', async () => {
+        const failing = async () => {
+          throw new Error('summary failed');
+        };
+        const event = { trigger: 'auto', messages: proseTranscript() };
+        const on = hook({ proseTrim: true }, fetchWith(0.1), Math.round(history() * 3.9), failing);
+        await expect(on.run(event)).rejects.toThrow('summary failed');
+      });
+
     });
 
     it('replaces history and names the cut-off', async () => {
@@ -1327,7 +1342,12 @@ describe('notificationTrim rescue', () => {
   });
 
   describe('through the hook', () => {
-    const hook = (options: Record<string, unknown>, fetchFn = fetchWith(0.1), logs: string[] = []) => {
+    const hook = (
+      options: Record<string, unknown>,
+      fetchFn = fetchWith(0.1),
+      logs: string[] = [],
+      builtin: (e: unknown) => Promise<unknown> = async (e) => e,
+    ) => {
       const hooks: Record<string, (...args: any[]) => Promise<any>> = {};
       (register as any)(
         (event: string, a: unknown, b?: any) => {
@@ -1353,7 +1373,7 @@ describe('notificationTrim rescue', () => {
           write: async (p: string, t: string) => void files.set(p, t),
         },
       };
-      const next = Object.assign(async (e: unknown) => e, {
+      const next = Object.assign(builtin, {
         signal: new AbortController().signal,
         budget: { ms: 10_000, remainingMs: 10_000 },
       });
@@ -1377,6 +1397,24 @@ describe('notificationTrim rescue', () => {
       expect(on.sinks.length).toBeGreaterThan(0);
       expect(on.sinks.every((to) => to === 'debug')).toBe(true);
       expect(on.toasts).toHaveLength(1);
+    });
+
+    it('keeps its own shorter cut when the built-in summary then fails, calling it once', async () => {
+      let calls = 0;
+      const failing = async () => {
+        calls++;
+        throw new Error('summary failed');
+      };
+      for (const hybridSummary of [false, true]) {
+        calls = 0;
+        const event = { trigger: 'auto', messages: transcriptWithReports() };
+        const on = hook({ notificationTrim: true, proseTrim: false, minReductionRatio: 0.99, hybridSummary }, fetchWith(0.1), [], failing);
+        const out = await on.run(event);
+        expect(calls).toBe(1);
+        expect(Object.keys(out)).toEqual(['messages', 'tokensBefore', 'tokensAfter']);
+        expect(out.tokensAfter).toBeLessThan(out.tokensBefore);
+        expect(on.toasts.at(-1)).toMatch(/^built-in summary failed, kept the Jev cut/);
+      }
     });
 
     it('falls back, saying notification trim was tried, when no rung reaches the minimum', async () => {
