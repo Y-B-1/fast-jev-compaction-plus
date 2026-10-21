@@ -254,6 +254,10 @@ local test server.
 Claude Code loads plugin hook modules once a startup feature flag answers, at the
 start of a turn: a `/compact` typed as the very first thing in a freshly started
 process can run before the plugin is loaded and use Claude's own summary.
+In Claude Code cloud sessions (claude.ai/code), automatic compaction takes a
+path that does not call plugin hooks (seen in 2.1.306), so there only a manual
+`/compact` goes through Jev; a local `claude` (and apps built on it) runs both
+automatic and manual compaction through the plugin.
 
 To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
 from the repository root. No publishing step is required; the marketplace is
