@@ -84,8 +84,32 @@ function callKey(call: Pick<ToolCall, 'tool' | 'input'>): string | undefined {
 }
 
 /**
- * The ids of calls that a later call repeats exactly (same tool, same input):
- * the later output supersedes the earlier one. The latest copy of each is
+ * The key a call's output is identified by, and the keys of the later calls
+ * whose output covers it. Bash is keyed on its command (a different
+ * `description` or `timeout` runs the same thing); a Read of a whole file
+ * covers any earlier Read of that file, partial or whole; anything else is
+ * keyed on its exact tool and input.
+ */
+function coverage(call: Pick<ToolCall, 'tool' | 'input'>): { own: string; coveredBy: string[] } | undefined {
+  const input = (call.input ?? {}) as Record<string, unknown>;
+  if (call.tool === 'Bash' && typeof input.command === 'string') {
+    const own = `Bash\u0000${input.command}\u0000${input.run_in_background === true ? 'bg' : ''}`;
+    return { own, coveredBy: [own] };
+  }
+  if (call.tool === 'Read' && typeof input.file_path === 'string') {
+    const whole = `Read\u0000${input.file_path}`;
+    const partial = input.offset !== undefined || input.limit !== undefined || input.pages !== undefined;
+    if (!partial) return { own: whole, coveredBy: [whole] };
+    const own = callKey(call);
+    return own === undefined ? undefined : { own, coveredBy: [own, whole] };
+  }
+  const own = callKey(call);
+  return own === undefined ? undefined : { own, coveredBy: [own] };
+}
+
+/**
+ * The ids of calls whose output a later call repeats or covers (see
+ * `coverage`): the later output supersedes the earlier one. The latest copy of each is
  * never in the set, and a later copy supersedes only when it is no error and
  * at least half as long: a repeat Read that answers "File unchanged since
  * last read" or fails leaves the earlier full output as the only copy.
@@ -96,11 +120,11 @@ export function supersededCalls(calls: readonly ToolCall[]): Set<string> {
   const superseded = new Set<string>();
   for (let index = calls.length - 1; index >= 0; index -= 1) {
     const call = calls[index]!;
-    const key = callKey(call);
-    if (key === undefined) continue;
-    const best = later.get(key);
-    if (best !== undefined && best * 2 >= call.resultChars) superseded.add(call.id);
-    if (!call.isError) later.set(key, Math.max(best ?? 0, call.resultChars));
+    const keys = coverage(call);
+    if (keys === undefined) continue;
+    const best = Math.max(-1, ...keys.coveredBy.map((key) => later.get(key) ?? -1));
+    if (best >= 0 && best * 2 >= call.resultChars) superseded.add(call.id);
+    if (!call.isError) later.set(keys.own, Math.max(later.get(keys.own) ?? 0, call.resultChars));
   }
   return superseded;
 }

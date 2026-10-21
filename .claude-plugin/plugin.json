@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
@@ -157,7 +157,7 @@
     "dedupeRepeats": {
       "type": "boolean",
       "title": "Remove exact repeats without asking Jev",
-      "description": "On by default: an earlier call with the same tool and input as a later one has its result truncated (archived as usual), and earlier copies of repeated <system-reminder> or <local-command-stdout> blocks and long repeated user messages (a skill loaded twice) become a one-line marker. The latest copy always stays. A user prompt Claude Code still holds whole is never rewritten, since it may carry images the hook cannot see.",
+      "description": "On by default: an earlier call a later one repeats (the same Bash command, a Read a later whole-file Read covers, or the same tool and input) has its result truncated (archived as usual) when the later output did not fail and is at least half as long, and earlier copies of repeated <system-reminder> or <local-command-stdout> blocks and long repeated user messages (a skill loaded twice) become a one-line marker. The latest copy always stays. A user prompt Claude Code still holds whole is never rewritten, since it may carry images the hook cannot see.",
       "default": true
     },
     "minKeepSignalCalls": {

@@ -930,6 +930,8 @@ describe('windowed states when the history does not fit', () => {
     const asked = new Set(seen.flatMap((s) => s.questions).filter((q) => q.startsWith('call_')));
     expect(asked.size).toBe(calls.filter((c) => !c.pinned).length);
     expect(out.stats.requests).toBe(seen.length);
+    // Calls inside a window keep their results: none reads as never returned.
+    expect(JSON.stringify(seen.map((s) => s.state))).not.toContain('pending_calls');
   });
 
   it('keeps a call that no window can fit, instead of throwing', async () => {

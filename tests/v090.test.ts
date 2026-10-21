@@ -104,6 +104,28 @@ describe('cap on kept results', () => {
     expect(a.files.get('arch/t1.txt')).toBe(BIG);
   });
 
+  it('keeps the full archive when a capped result is later dropped with its call', async () => {
+    const a = archive();
+    const first = await compact(session(), jev(0.9), { archive: a.cite, preserveRecentMessages: 4 });
+    const dropped = await compact(first.messages, jev(0.01, 0.01), { archive: a.cite, preserveRecentMessages: 4, minKeepSignalCalls: 0 });
+    expect(dropped.decisions[0]!.action).toBe('drop_call');
+    expect(dropped.messages.map((m) => m.text).join('\n')).toContain('full output: arch/t1.txt]');
+    expect(a.files.get('arch/t1.txt')).toBe(BIG);
+  });
+
+  it('never caps a result the cap would not shorten', async () => {
+    const near = 'y'.repeat(4300);
+    const a = archive();
+    const out = await compact(
+      [message('user', 'Find the bug.'), call('t1', 'Read', { file_path: 'a' }, near), result('t1', near), ...tail],
+      jev(0.9),
+      { archive: a.cite, preserveRecentMessages: 4 },
+    );
+    expect(out.stats.resultsCapped).toBe(0);
+    expect(out.messages.flatMap((m) => m.toolResults ?? [])[0]!.text).toBe(near);
+    expect(a.files.size).toBe(0);
+  });
+
   it('leaves kept results whole when the cap is 0, and never caps the newest messages', async () => {
     const off = await compact(session(), jev(0.9), { preserveRecentMessages: 4, maxKeptResultChars: 0 });
     expect(off.stats.resultsCapped).toBe(0);

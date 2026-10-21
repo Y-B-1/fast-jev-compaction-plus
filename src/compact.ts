@@ -300,11 +300,25 @@ export function stateGroups(
   candidates: readonly ToolCall[],
   options: ResolvedCompactOptions,
 ): { groups: StateGroup[]; unasked: ToolCall[]; stage: string } {
-  try {
-    const state = fitState(messages, calls, options);
-    return { groups: [{ state, calls: [...candidates] }], unasked: [], stage: state.stage };
-  } catch (error) {
-    if (!tooLarge(error)) throw error;
+  // A rough per-message cost (text, then each input as fitState first cuts it):
+  // a history many times the budget goes straight to windows, sized up front,
+  // since every failed fitState walks its whole shrink ladder over the history.
+  const costs = messages.map(
+    (message) =>
+      estimateTokens(message.text.length > 4000 ? message.text.slice(0, 4000) : message.text) +
+      message.toolUses.reduce((sum, tool) => sum + Math.min(300, estimateTokens(safeJson(tool.input).slice(0, 1000))), 0) +
+      10,
+  );
+  const prefix = [0];
+  for (const cost of costs) prefix.push(prefix[prefix.length - 1]! + cost);
+  const span = (lo: number, hi: number) => prefix[hi + 1]! - prefix[lo]!;
+  if (prefix[prefix.length - 1]! <= options.maxStateTokens * WHOLE_STATE_FACTOR) {
+    try {
+      const state = fitState(messages, calls, options);
+      return { groups: [{ state, calls: [...candidates] }], unasked: [], stage: state.stage };
+    } catch (error) {
+      if (!tooLarge(error)) throw error;
+    }
   }
   const windowOptions = { ...options, goal: options.goal || goalFromMessages(messages) };
   const groups: StateGroup[] = [];
@@ -312,15 +326,18 @@ export function stateGroups(
   const fit = (group: ToolCall[]): void => {
     const lo = Math.min(...group.map((call) => call.callIndex));
     const hi = Math.max(...group.map((call) => call.resultIndex));
-    const inWindow = new Set(group.map((call) => call.id));
     const view = messages.map((message, i) =>
       (i >= lo && i <= hi) || isPinned(i, messages.length, options.preserveRecentMessages)
         ? message
         : // Outside the window a call left in place would read as pending.
           { role: message.role, text: '', toolUses: [] },
     );
+    // Every call whose call and result both sit in the shown rows keeps its
+    // pairing (settled calls and other windows' candidates included), so Jev
+    // does not read them as calls that never returned.
+    const shown = (i: number) => (i >= lo && i <= hi) || isPinned(i, messages.length, options.preserveRecentMessages);
     try {
-      const state = fitState(view, calls.filter((call) => call.pinned || inWindow.has(call.id)), windowOptions);
+      const state = fitState(view, calls.filter((call) => shown(call.callIndex) && shown(call.resultIndex)), windowOptions);
       groups.push({ state, calls: group });
     } catch (error) {
       if (!tooLarge(error)) throw error;
@@ -333,11 +350,37 @@ export function stateGroups(
       fit(group.slice(half));
     }
   };
-  const half = Math.ceil(candidates.length / 2);
-  fit(candidates.slice(0, half));
-  if (candidates.length > half) fit(candidates.slice(half));
+  // Contiguous windows whose rows cost at most WINDOW_SHARE of the budget, so
+  // most fit at the first try.
+  const sorted = [...candidates].sort((a, b) => a.callIndex - b.callIndex);
+  let group: ToolCall[] = [];
+  let lo = 0;
+  for (const call of sorted) {
+    if (group.length === 0) lo = call.callIndex;
+    const hi = Math.max(call.resultIndex, ...group.map((c) => c.resultIndex));
+    if (group.length > 0 && span(lo, hi) > options.maxStateTokens * WINDOW_SHARE) {
+      fit(group);
+      group = [];
+      lo = call.callIndex;
+    }
+    group.push(call);
+  }
+  if (group.length > 0) fit(group);
   const stage = `windows:${groups.length}${unasked.length > 0 ? ` unasked:${unasked.length}` : ''}`;
   return { groups, unasked, stage };
+}
+
+/** A history estimated above this many times `maxStateTokens` skips the single-state attempt. */
+const WHOLE_STATE_FACTOR = 4;
+/** Share of `maxStateTokens` a window's own rows may cost, leaving room for the goal and pinned rows. */
+const WINDOW_SHARE = 0.5;
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value ?? {});
+  } catch {
+    return '{}';
+  }
 }
 
 /** Whether ending `text` at `index` would separate the two halves of a surrogate pair. */
@@ -351,6 +394,13 @@ export function splitsSurrogatePair(text: string, index: number): boolean {
 export function headOf(text: string, chars: number): string {
   return text.slice(0, splitsSurrogatePair(text, chars) ? chars - 1 : chars);
 }
+
+/**
+ * How much longer than `maxKeptResultChars` a kept result must be before it is
+ * capped: the note, the salvaged lines and the archive path take room too, and
+ * a cap must never make a result longer.
+ */
+const CAP_MARGIN = 600;
 
 /** Starts the note of a result Jev kept whole but that was cut to `maxKeptResultChars`. */
 export const CAPPED_MARKER = '[fast-jev-compaction kept the head and tail of ';
@@ -368,7 +418,7 @@ function cappedResultText(
   archivedPath?: string,
   salvageChars = 0,
 ): string {
-  if (text.length <= capChars + 120) return text;
+  if (text.length <= capChars + CAP_MARGIN) return text;
   const tailChars = Math.floor(capChars * (isError ? 0.5 : 0.25));
   const head = headOf(text, capChars - tailChars);
   let tailStart = text.length - tailChars;
@@ -401,6 +451,9 @@ function cappedPath(text: string): string | undefined {
   return /; full output: ([^\]\n]+)\]/.exec(text.slice(at))?.[1];
 }
 
+/** Characters from the end of a failing result kept when it is truncated. */
+const ERROR_TAIL_CHARS = 800;
+
 function truncatedResultText(
   text: string,
   isError: boolean,
@@ -419,8 +472,16 @@ function truncatedResultText(
   // Identifiers and error lines recovered from the dropped tail: the head is
   // preamble for a listing or a build log, and the useful parts live further
   // down where they would otherwise be lost until the tool is re-run.
-  const salvaged = salvageBlock(text.slice(cut), salvageChars);
-  return salvaged ? `${head}${note}\n${salvaged}` : `${head}${note}`;
+  // A failing result keeps its end too: the deepest frame of a stack, the
+  // final error code or the failing assertion sit there, not in the head.
+  let tail = '';
+  if (isError && text.length - cut > ERROR_TAIL_CHARS * 2) {
+    let start = text.length - ERROR_TAIL_CHARS;
+    if (splitsSurrogatePair(text, start)) start += 1;
+    tail = `\n${text.slice(start)}`;
+  }
+  const salvaged = salvageBlock(text.slice(cut, tail ? text.length - tail.length + 1 : undefined), salvageChars);
+  return `${head}${note}${salvaged ? `\n${salvaged}` : ''}${tail}`;
 }
 
 /** Tools whose output a re-run reproduces; other tools observed something that may not happen again. */
@@ -482,7 +543,7 @@ export function applyDecisions(
     const call = byId.get(decision.id);
     if (!call) continue;
     if (decision.action !== 'keep') actions.set(call.tool_use_id, decision.action);
-    else if (decision.reason === 'kept' && capChars > 0 && call.resultChars > capChars + 120) {
+    else if (decision.reason === 'kept' && capChars > 0 && call.resultChars > capChars + CAP_MARGIN) {
       actions.set(call.tool_use_id, 'cap');
     }
   }
@@ -496,8 +557,7 @@ export function applyDecisions(
       return action === 'cap' ? text : truncatedResultText(text, isError, headChars, cappedPath(text), salvageChars);
     }
     // Archive only what is actually cut: a short duplicate stays as it is.
-    const limit = action === 'cap' ? capChars : headChars;
-    if (text.length <= limit + 120) return text;
+    if (text.length <= (action === 'cap' ? capChars + CAP_MARGIN : headChars + 120)) return text;
     return action === 'cap'
       ? cappedResultText(text, isError, capChars, archive?.(id, text), salvageChars)
       : truncatedResultText(text, isError, headChars, archive?.(id, text), salvageChars);
@@ -523,7 +583,15 @@ export function applyDecisions(
     // archived, so a detail inside it can still be recovered.
     const droppedCallNotes = message.toolUses
       .filter((tool) => actions.get(tool.tool_use_id) === 'drop_call')
-      .map((tool) => droppedCallNote(tool, archive?.(tool.tool_use_id, tool.text ?? ''), salvageChars));
+      .map((tool) =>
+        droppedCallNote(
+          tool,
+          // A result an earlier compaction capped already has its full output
+          // archived: cite that file, never overwrite it with the capped copy.
+          wasCapped(tool.text ?? '') ? cappedPath(tool.text ?? '') : archive?.(tool.tool_use_id, tool.text ?? ''),
+          salvageChars,
+        ),
+      );
     const toolUses = message.toolUses
       .filter((tool) => actions.get(tool.tool_use_id) !== 'drop_call')
       .map((tool) => {
@@ -714,7 +782,7 @@ export async function compact(
       .filter(
         (call) =>
           resolved.maxKeptResultChars > 0 &&
-          call.resultChars > resolved.maxKeptResultChars + 120 &&
+          call.resultChars > resolved.maxKeptResultChars + CAP_MARGIN &&
           !wasCapped(resultTexts.get(call.tool_use_id) ?? ''),
       )
       .map((call) => call.id),

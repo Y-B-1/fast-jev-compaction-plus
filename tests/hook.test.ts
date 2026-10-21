@@ -1342,7 +1342,7 @@ describe('notificationTrim rescue', () => {
     const { files, writer } = memoryArchive();
     const out = await compactSession(transcriptWithReports(), cfg({ notificationTrim: true, archiveResults: true }), fetchWith(0.1), writer);
     const cited = [...textOf(out).matchAll(/full notification: (\S+) \(Read or grep it if needed\)/g)].map((m) => m[1]);
-    const written = [...files.keys()].filter((p) => !p.endsWith('.gitignore'));
+    const written = [...files.keys()].filter((p) => !p.endsWith('.gitignore') && !p.endsWith('INDEX.md'));
     expect(cited).toHaveLength(3);
     expect(written.sort()).toEqual([...cited].sort());
     const original = notification('w2');

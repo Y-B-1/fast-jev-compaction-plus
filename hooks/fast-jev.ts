@@ -8,7 +8,7 @@ import type {
   ToolUseSummary,
 } from 'claude-code';
 
-import { compact, messageChars, reductionRatio, resolveOptions } from '../src/compact.js';
+import { compact, headOf, messageChars, reductionRatio, resolveOptions } from '../src/compact.js';
 import { trimOutput } from '../src/output.js';
 import {
   buildJevRequest,
@@ -488,7 +488,12 @@ export function resumeSafeMessages(messages: readonly SessionMessage[]): Session
     if (message.toolResults) copy.toolResults = message.toolResults;
     return copy;
   });
-  return [...mergeRuns(stripped.slice(0, newestRun)), ...mergeRuns(stripped.slice(newestRun))];
+  // A row that carried nothing but its handle (an interrupted response's
+  // thinking) would go back as an empty message, which the API refuses.
+  const isEmpty = (m: SessionMessage) =>
+    m.handle === undefined && m.text.length === 0 && m.toolUses.length === 0 && (m.toolResults?.length ?? 0) === 0;
+  const before = stripped.slice(0, newestRun).filter((m) => !isEmpty(m));
+  return [...mergeRuns(before), ...mergeRuns(stripped.slice(newestRun).filter((m) => !isEmpty(m)))];
 }
 
 /**
@@ -589,6 +594,7 @@ export function archiveWriter($: {
   fs: {
     exists: (path: string) => Promise<boolean>;
     write: (path: string, text: string) => Promise<void>;
+    read: (path: string) => Promise<unknown>;
   };
 }, dir: string = ARCHIVE_DIR, apiKey?: string): ArchiveWriter {
   const pending = new Map<string, string>();
@@ -606,9 +612,47 @@ export function archiveWriter($: {
       const ignorePath = `${dir}/.gitignore`;
       if (!(await $.fs.exists(ignorePath))) await $.fs.write(ignorePath, '*\n');
       for (const [path, text] of pending) await $.fs.write(path, text);
+      await writeIndex($, `${dir}/INDEX.md`, pending);
       pending.clear();
     },
   };
+}
+
+/** Largest INDEX.md the plugin keeps adding to; past it the index stops growing. */
+const INDEX_MAX_CHARS = 1_000_000;
+
+/**
+ * Adds one line per newly archived file to the archive's INDEX.md (file name and
+ * the start of its text), so a detail can be found with one grep instead of
+ * opening every file. Best effort: the archive files themselves are written
+ * first and stay the source of truth.
+ */
+async function writeIndex(
+  $: { fs: { write: (path: string, text: string) => Promise<void>; read: (path: string) => Promise<unknown> } },
+  path: string,
+  files: ReadonlyMap<string, string>,
+): Promise<void> {
+  try {
+    let index = '';
+    try {
+      const existing = await $.fs.read(path);
+      if (typeof existing === 'string') index = existing;
+    } catch {
+      index = '';
+    }
+    if (index.length > INDEX_MAX_CHARS) return;
+    if (!index) index = '# fast-jev-compaction archive\n\nOne line per archived item: its file, then how it starts.\n\n';
+    const lines: string[] = [];
+    for (const [file, text] of files) {
+      const name = file.slice(file.lastIndexOf('/') + 1);
+      if (index.includes(`- ${name}:`)) continue;
+      const start = text.replace(/\s+/g, ' ').trim();
+      lines.push(`- ${name}: ${start.length > 140 ? `${headOf(start, 139)}…` : start}`);
+    }
+    if (lines.length > 0) await $.fs.write(path, `${index}${lines.join('\n')}\n`);
+  } catch {
+    // The index is a convenience; a failed write leaves the archive as it is.
+  }
 }
 
 /** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
@@ -975,10 +1019,10 @@ type UiLog = { ui: { log: (text: string, options?: { to?: 'transcript' | 'debug'
  * Diagnostics go to the debug log only: `$.ui.log` defaults to the transcript,
  * where every compaction would add a dozen dim rows to the chat.
  */
-/** The debug lines and the toast of the compaction in flight, kept for `/jev`. */
-let report: { lines: string[]; toast?: string } | undefined;
+/** The debug lines and the toast of one compaction, kept for `/jev`. */
+type Report = { lines: string[]; toast?: string };
 
-function log($: UiLog, text: string): void {
+function log($: UiLog, text: string, report?: Report): void {
   report?.lines.push(text);
   try {
     $.ui.log(text, { to: 'debug' });
@@ -1112,8 +1156,8 @@ export function formatBreakdown(b: ContextBreakdown): string {
   return `user text ~${b.userText}, assistant text ~${b.assistantText}, thinking ~${b.thinking}, tool inputs ~${b.toolInputs}, tool results ~${b.toolResults}, images ${b.images}`;
 }
 
-function interrupted($: UiLog): { skip: string } {
-  log($, 'compaction interrupted; nothing changed');
+function interrupted($: UiLog, report?: Report): { skip: string } {
+  log($, 'compaction interrupted; nothing changed', report);
   return { skip: 'fast-jev-compaction: interrupted' };
 }
 
@@ -1132,8 +1176,9 @@ function notify(
   },
   toast: string,
   detail: string = toast,
+  report?: Report,
 ): void {
-  log($, detail);
+  log($, detail, report);
   if (report) report.toast = toast;
   try {
     $.ui.toast(toast, { timeoutMs: TOAST_MS });
@@ -1153,6 +1198,7 @@ async function compactHook(
   next: Parameters<Hook<'session.compact'>>[2],
   configured: HookConfig,
   once: { inertNoticeLogged: boolean },
+  report: Report,
 ): Promise<Awaited<ReturnType<Hook<'session.compact'>>>> {
   // A subagent's or a fork's own transcript is compacted like the main one;
   // only the context reading, which is the main conversation's, is left out.
@@ -1187,6 +1233,7 @@ async function compactHook(
       log(
         $,
         `context ${contextTokens} tokens, history ${messagesInContext ? `${messagesInContext} tokens (engine count)` : `~${historyTokens} tokens (estimate)`}, history cut needed ${percent(target)}`,
+        report,
       );
     }
     // Unknown (a subagent, or an engine without the API form) counts as having images.
@@ -1194,7 +1241,7 @@ async function compactHook(
     if (!event.agentId) try {
       const breakdown = contextBreakdown(await $.session.messages({ as: 'api' }));
       imagesInContext = breakdown.images > 0;
-      log($, `history as the model sees it: ${formatBreakdown(breakdown)}`);
+      log($, `history as the model sees it: ${formatBreakdown(breakdown)}`, report);
     } catch {
       // Diagnostics only: an engine without the API form still compacts.
     }
@@ -1206,6 +1253,7 @@ async function compactHook(
           $,
           'Not compacted: the history is too small a share of the context for Jev to free enough',
           `skipped (${reason}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger)`,
+          report,
         );
         return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
       }
@@ -1213,6 +1261,7 @@ async function compactHook(
         $,
         "Using Claude's summary: the history is too small a share of the context for Jev",
         `fallback to built-in summary (${reason})`,
+        report,
       );
       return next(event);
     }
@@ -1223,7 +1272,7 @@ async function compactHook(
     }
     if (config.notificationTrim && !config.archiveResults && !once.inertNoticeLogged) {
       once.inertNoticeLogged = true;
-      log($, 'notification trim skipped: archiveResults is off');
+      log($, 'notification trim skipped: archiveResults is off', report);
     }
     const { result, messages, prose, notifications, injected, exchanges, steps } = await compactSession(
       event.messages,
@@ -1235,8 +1284,8 @@ async function compactHook(
       config.archiveResults ? archiveWriter($, await archiveDir($), config.apiKey) : undefined,
       { signal: next.signal, sleep: clockSleep($), remainingMs: () => next.budget.remainingMs, baseUrl: await getBaseUrl($) },
     );
-    if (next.signal.aborted) return interrupted($);
-    for (const line of decisionLogLines(result)) log($, line);
+    if (next.signal.aborted) return interrupted($, report);
+    for (const line of decisionLogLines(result)) log($, line, report);
     if (reductionRatio(result) < config.minReductionRatio) {
       const tried = `${prose ? ', prose trim tried' : ''}${notifications ? ', notification trim tried' : ''}${injected ? ', injected-content fold tried' : ''}${exchanges ? ', exchange drop tried' : ''}${steps ? ', step trim tried' : ''}${
         target > configured.minReductionRatio ? `, history needs ${percent(target)} to free ${percent(configured.minReductionRatio)} of context` : ''
@@ -1256,6 +1305,7 @@ async function compactHook(
             $,
             `Compacted with Jev: ${event.messages.length} → ${messages.length} messages, frees ${freed} of the context (below the ${percent(configured.minReductionRatio)} target)`,
             `kept the cut below the minimum (${percent(configured.minReductionRatio)} minimum${tried}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result, prose, notifications, injected, exchanges, steps)})`,
+            report,
           );
           return partial;
         }
@@ -1263,6 +1313,7 @@ async function compactHook(
           $,
           'Not compacted: Jev found nothing it could remove',
           `skipped (below ${percent(configured.minReductionRatio)} minimum${tried}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result)})`,
+          report,
         );
         return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
       }
@@ -1275,6 +1326,7 @@ async function compactHook(
             $,
             `Claude's summary failed; kept Jev's cut (frees ${freed} of the context)`,
             `built-in summary failed, kept the Jev cut (${summarize(result)})`,
+            report,
           );
           return partial;
         }
@@ -1284,14 +1336,15 @@ async function compactHook(
       if (split > 0) {
         const summarized = await summary({ ...event, messages: messages.slice(0, split) });
         if (summarized === partial) return partial;
-        if (next.signal.aborted) return interrupted($);
+        if (next.signal.aborted) return interrupted($, report);
         if (summarized.skip !== undefined) return summarized;
         const recent = messages.slice(split);
-        log($, `hybrid: summarized ${split} older messages, kept ${recent.length} recent (~${messageTokens(recent)} tokens)`);
+        log($, `hybrid: summarized ${split} older messages, kept ${recent.length} recent (~${messageTokens(recent)} tokens)`, report);
         notify(
           $,
           `Compacted: summarized ${split} older messages, kept ${recent.length} recent ones verbatim`,
           `summarized ${split} older messages, kept ${recent.length} recent (trim alone below ${percent(configured.minReductionRatio)} minimum${tried}: ${summarize(result)})`,
+          report,
         );
         return { messages: [...summarized.messages, ...recent] };
       }
@@ -1299,24 +1352,27 @@ async function compactHook(
         $,
         `Using Claude's summary: Jev's cut frees ${freed} of the context, below the ${percent(configured.minReductionRatio)} minimum`,
         `fallback to built-in summary (below ${percent(configured.minReductionRatio)} minimum${tried}: ${summarize(result)})`,
+        report,
       );
       return summary(event);
     }
     const tokensAfter = messageTokens(messages);
-    log($, `kept history ~${tokensAfter} tokens of ~${historyTokens}`);
+    log($, `kept history ~${tokensAfter} tokens of ~${historyTokens}`, report);
     notify(
       $,
       `Compacted with Jev: ${event.messages.length} → ${messages.length} messages, ${percent(1 - tokensAfter / Math.max(1, historyTokens))} smaller, no summary`,
       `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose, notifications, injected, exchanges, steps)})`,
+      report,
     );
     return { messages, tokensBefore: historyTokens, tokensAfter };
   } catch (error) {
-    if (next.signal.aborted) return interrupted($);
+    if (next.signal.aborted) return interrupted($, report);
     if (!mayUseBuiltin(event.trigger, configured.builtinFallback)) {
       notify(
         $,
         `Not compacted: Jev request failed (${shortError(error)})`,
         `skipped (builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${error instanceof Error ? error.message : String(error)})`,
+        report,
       );
       return { skip: 'fast-jev-compaction: request failed, builtin fallback disabled' };
     }
@@ -1324,6 +1380,7 @@ async function compactHook(
       $,
       `Using Claude's summary: Jev request failed (${shortError(error)})`,
       `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
+      report,
     );
     return next(event);
   }
@@ -1367,13 +1424,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
   });
 
   on('session.compact', async ($, event, next) => {
-    if (event.trigger === 'precompute') return compactHook($, event, next, configured, once);
-    const current: { lines: string[]; toast?: string } = { lines: [] };
-    report = current;
+    const current: Report = { lines: [] };
+    if (event.trigger === 'precompute') return compactHook($, event, next, configured, once, current);
     try {
-      return await compactHook($, event, next, configured, once);
+      return await compactHook($, event, next, configured, once, current);
     } finally {
-      if (report === current) report = undefined;
       // Only a record for /jev: a clock that fails must never replace the result.
       let at = 0;
       try {

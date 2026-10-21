@@ -3,7 +3,9 @@ import { JevClient } from '../src/client.js';
 import { applyDecisions, compact, wasCapped, wasTruncated } from '../src/compact.js';
 import { applyExchanges, findExchanges } from '../src/exchanges.js';
 import { findBlocks } from '../src/inject.js';
+import { trimOutput } from '../src/output.js';
 import { supersededCalls } from '../src/dedupe.js';
+import { resumeSafeMessages } from '../hooks/fast-jev.js';
 import { collectToolCalls } from '../src/state.js';
 import { findSteps, planSteps } from '../src/steps.js';
 import type { Message } from '../src/types.js';
@@ -103,6 +105,28 @@ describe('duplicate calls', () => {
     expect([...supersededCalls([read('t1', 3000), read('t2', 3000)])]).toEqual(['t1']);
   });
 
+  const call = (id: string, tool: string, input: Record<string, unknown>, chars = 3000) =>
+    ({ id, tool_use_id: id, tool, input, callIndex: 0, resultIndex: 1, resultChars: chars, isError: false, pinned: false }) as never;
+
+  it('matches Bash by its command, whatever its description or timeout', () => {
+    const calls = [
+      call('t1', 'Bash', { command: 'npm test', description: 'Run tests' }),
+      call('t2', 'Bash', { command: 'npm test', description: 'Rerun the tests', timeout: 120000 }),
+      call('t3', 'Bash', { command: 'npm test', run_in_background: true }),
+    ];
+    expect([...supersededCalls(calls)]).toEqual(['t1']);
+  });
+
+  it('lets a later whole-file Read cover earlier partial Reads of that file, not the reverse', () => {
+    const calls = [
+      call('t1', 'Read', { file_path: 'a.ts', offset: 100, limit: 50 }, 1500),
+      call('t2', 'Read', { file_path: 'a.ts' }),
+      call('t3', 'Read', { file_path: 'a.ts', offset: 1, limit: 20 }, 600),
+      call('t4', 'Read', { file_path: 'b.ts' }),
+    ];
+    expect([...supersededCalls(calls)]).toEqual(['t1']);
+  });
+
   it('a later "File unchanged" stub or error does not supersede the full output', () => {
     expect(supersededCalls([read('t1', 3500), read('t2', 150)]).size).toBe(0);
     expect(supersededCalls([read('t1', 3500), read('t2', 3500, true)]).size).toBe(0);
@@ -196,5 +220,67 @@ describe('library client', () => {
     }) as typeof fetch;
     await new JevClient({ apiKey: 'k-123456', fetch: fetchFn }).ask({ text: 'password: hunter2xyz' } as never, {});
     expect(bodies[0]).not.toContain('hunter2xyz');
+  });
+});
+
+describe('truncated failing results', () => {
+  const cut = (isError: boolean) => {
+    const output = `${'collecting tests\n'.repeat(300)}FAILED tests/test_x.py::test_y - AssertionError: deep 7f3a\n`;
+    const messages = [
+      msg('user', 's'),
+      msg('assistant', '', { toolUses: [{ tool_use_id: 'x', tool: 'Bash', input: { command: 'pytest' }, text: output, isError }] }),
+      msg('user', '', { toolResults: [{ tool_use_id: 'x', text: output, isError }] }),
+      msg('user', 'e'),
+    ];
+    const out = applyDecisions(
+      messages,
+      [{ id: 't1', tool: 'Bash', action: 'drop_result', reason: 'result_dropped', keepCall: 1, keepResult: 0 }] as never,
+      collectToolCalls(messages, 0),
+      150,
+    );
+    return out.flatMap((m) => m.toolResults ?? [])[0]!.text;
+  };
+
+  it('keeps the end of a failing result after its note', () => {
+    const text = cut(true);
+    expect(text).toMatch(/\[fast-jev-compaction truncated \d+ chars \(error\)/);
+    expect(text.endsWith('AssertionError: deep 7f3a\n')).toBe(true);
+    expect(text.length).toBeLessThan(1200);
+  });
+
+  it('keeps only the head for a result that did not fail', () => {
+    expect(cut(false)).not.toContain('deep 7f3a');
+  });
+});
+
+describe('resume-safe output', () => {
+  it('never hands back an empty message once a pinned thinking row loses its handle', () => {
+    const rows = [
+      { role: 'user', text: 'why?', toolUses: [], handle: 'h3' },
+      { role: 'assistant', text: '', toolUses: [], handle: 'h4' },
+      { role: 'user', text: '[Request interrupted by user]', toolUses: [], handle: 'h5' },
+      { role: 'assistant', text: 'ok', toolUses: [], handle: 'h7' },
+      { role: 'user', text: 'go', toolUses: [], handle: 'h8' },
+    ] as never[];
+    const out = resumeSafeMessages(rows) as { text: string; toolUses: unknown[]; toolResults?: unknown[] }[];
+    expect(out.some((m) => m.text === '' && m.toolUses.length === 0 && !(m.toolResults?.length))).toBe(false);
+    expect(out).toHaveLength(4);
+  });
+});
+
+describe('Bash output trim batching', () => {
+  it('never asks Jev more than 128 questions in one request', async () => {
+    let max = 0;
+    const asker = {
+      async ask(_s: unknown, q: Record<string, unknown>) {
+        max = Math.max(max, Object.keys(q).length);
+        if (Object.keys(q).length > 128) throw new Error('400 Each request needs between 1 and 128 questions');
+        return { answers: Object.fromEntries(Object.keys(q).map((k) => [k, { type: 'noul', noul: 0.5 }])) };
+      },
+    };
+    const output = Array.from({ length: 4000 }, () => 'x').join('\n');
+    await trimOutput({ command: 'x', goal: 'g', output }, asker as never);
+    expect(max).toBeGreaterThan(0);
+    expect(max).toBeLessThanOrEqual(128);
   });
 });

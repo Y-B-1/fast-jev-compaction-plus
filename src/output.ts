@@ -1,5 +1,5 @@
 import { estimateTokens } from './state.js';
-import { noulAnswer } from './request.js';
+import { MAX_QUESTIONS_PER_REQUEST, noulAnswer } from './request.js';
 import type { JevAsker, JevQuestions } from './types.js';
 
 const DEFAULT_MIN_CHARS = 4_000;
@@ -149,7 +149,7 @@ function batches(chunks: readonly OutputChunk[], stateTokens: number): OutputChu
   let currentTokens = 0;
   for (const chunk of chunks) {
     const tokens = estimateOutputTokens(JSON.stringify(questionFor(chunk)));
-    if (current.length > 0 && currentTokens + tokens > budget) {
+    if (current.length > 0 && (currentTokens + tokens > budget || current.length === MAX_QUESTIONS_PER_REQUEST)) {
       result.push(current);
       current = [];
       currentTokens = 0;
