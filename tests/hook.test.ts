@@ -1366,11 +1366,18 @@ describe('notificationTrim rescue', () => {
         { apiKey: 'k', preserveRecentMessages: 2, ...options },
       );
       const toasts: string[] = [];
+      const sinks: (string | undefined)[] = [];
       const files = new Map<string, string>();
       const $ = {
         clock,
         http: { fetch: async (url: string, init?: { body?: string }) => fetchFn(url, init) },
-        ui: { log: (t: string) => logs.push(t), toast: (t: string) => toasts.push(t) },
+        ui: {
+          log: (t: string, o?: { to?: string }) => {
+            logs.push(t);
+            sinks.push(o?.to);
+          },
+          toast: (t: string) => toasts.push(t),
+        },
         fs: {
           exists: async (p: string) => files.has(p),
           write: async (p: string, t: string) => void files.set(p, t),
@@ -1380,7 +1387,7 @@ describe('notificationTrim rescue', () => {
         signal: new AbortController().signal,
         budget: { ms: 10_000, remainingMs: 10_000 },
       });
-      return { run: (event: Record<string, unknown>) => hooks['session.compact']!($, event, next), toasts, files };
+      return { run: (event: Record<string, unknown>) => hooks['session.compact']!($, event, next), toasts, files, sinks };
     };
 
     it('replaces history and names the rung in the notice', async () => {
@@ -1392,6 +1399,14 @@ describe('notificationTrim rescue', () => {
       expect(on.toasts[0]).toMatch(
         /^kept \d+\/\d+ messages, no summary \(\d+% reduction; .*; notification trim at 0\.15: 3 folded, 0 stripped, \d+ chars\)$/,
       );
+    });
+
+    it('keeps diagnostics out of the transcript: every ui.log goes to the debug log', async () => {
+      const on = hook({ notificationTrim: true });
+      await on.run({ trigger: 'auto', messages: transcriptWithReports() });
+      expect(on.sinks.length).toBeGreaterThan(0);
+      expect(on.sinks.every((to) => to === 'debug')).toBe(true);
+      expect(on.toasts).toHaveLength(1);
     });
 
     it('falls back, saying notification trim was tried, when no rung reaches the minimum', async () => {

@@ -867,6 +867,7 @@ export function summarize(
 }
 
 const UI_LOG_MAX_CHARS = 4096;
+const TOAST_MS = 6_000;
 
 export function decisionLog(result: CompactResult): string {
   return result.decisions
@@ -941,9 +942,15 @@ function clockSleep($: {
   return (ms, signal) => $.clock.sleep(ms, signal ? { signal } : undefined);
 }
 
-function log($: { ui: { log: (text: string) => void } }, text: string): void {
+type UiLog = { ui: { log: (text: string, options?: { to?: 'transcript' | 'debug' }) => void } };
+
+/**
+ * Diagnostics go to the debug log only: `$.ui.log` defaults to the transcript,
+ * where every compaction would add a dozen dim rows to the chat.
+ */
+function log($: UiLog, text: string): void {
   try {
-    $.ui.log(text);
+    $.ui.log(text, { to: 'debug' });
   } catch {
     // Diagnostics are best-effort; the compaction result must still be returned.
   }
@@ -1063,15 +1070,14 @@ export function formatBreakdown(b: ContextBreakdown): string {
   return `user text ~${b.userText}, assistant text ~${b.assistantText}, thinking ~${b.thinking}, tool inputs ~${b.toolInputs}, tool results ~${b.toolResults}, images ${b.images}`;
 }
 
-function interrupted($: { ui: { log: (text: string) => void } }): { skip: string } {
+function interrupted($: UiLog): { skip: string } {
   log($, 'compaction interrupted; nothing changed');
   return { skip: 'fast-jev-compaction: interrupted' };
 }
 
 function notify(
   $: {
-    ui: {
-      log: (text: string) => void;
+    ui: UiLog['ui'] & {
       toast: (text: string, options?: { timeoutMs?: number }) => void;
     };
   },
@@ -1079,7 +1085,7 @@ function notify(
 ): void {
   log($, text);
   try {
-    $.ui.toast(text, { timeoutMs: 15_000 });
+    $.ui.toast(text, { timeoutMs: TOAST_MS });
   } catch {
     // A disconnected UI must not prevent the native fallback.
   }
