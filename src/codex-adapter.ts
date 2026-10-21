@@ -24,12 +24,13 @@ async function main() {
   const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
   if (input.version !== 1 || !Array.isArray(input.items) || typeof input.session_id !== 'string') throw new Error('Unsupported native compaction bridge input');
   if (input.items.some((item: unknown) => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error('Invalid history items');
-  let apiKey = process.env.OPENROUTER_API_KEY;
+  let apiKey: string = process.env.TYPESAFE_API_KEY ?? '';
   if (!apiKey) {
     const credentials = JSON.parse(await readFile(join(data, 'credentials.json'), 'utf8'));
-    if (credentials.provider !== 'openrouter' || typeof credentials.apiKey !== 'string') throw new Error('Configure an OpenRouter key for fast compaction');
+    if (credentials.provider !== 'typesafe' || typeof credentials.apiKey !== 'string') throw new Error('Configure a TypeSafe key for fast compaction');
     apiKey = credentials.apiKey;
   }
+  if (apiKey.startsWith('sk-or-')) throw new Error('An OpenRouter key is configured; fast-jev uses TypeSafe');
   let options: CompactOptions & { minReductionRatio?: number } = {};
   try { options = JSON.parse(await readFile(join(data, 'config.json'), 'utf8')); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }

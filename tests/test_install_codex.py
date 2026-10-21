@@ -53,19 +53,15 @@ class InstallerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "ARM64"):
                 installer.check_runtime(root)
 
-    def test_credentials_private_and_only_openrouter(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source, target = root / "source", root / "target"
-            source.write_text('{"provider":"openrouter","apiKey":"synthetic-test-key"}')
-            target.write_text("old")
-            target.chmod(0o644)
-            installer.copy_credentials(source, target)
-            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(json.loads(target.read_text())["apiKey"], "synthetic-test-key")
-            source.write_text('{"provider":"typesafe","apiKey":"synthetic-test-key"}')
+    def test_credentials_only_typesafe(self):
+        installer.check_credentials({"provider": "typesafe", "apiKey": "synthetic-test-key"})
+        for credentials in (
+            {"provider": "openrouter", "apiKey": "synthetic-test-key"},
+            {"provider": "typesafe", "apiKey": "sk-or-synthetic"},
+            {"provider": "typesafe", "apiKey": " "},
+        ):
             with self.assertRaises(ValueError):
-                installer.copy_credentials(source, target)
+                installer.check_credentials(credentials)
 
     def test_link_preserves_regular_files(self):
         with tempfile.TemporaryDirectory() as directory:

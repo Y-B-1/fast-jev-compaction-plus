@@ -48,7 +48,7 @@ items, oversized strings, or results from unfinished custom calls. It checks
 all edits before applying any. Provider failure uses built-in compaction;
 turn cancellation returns `TurnAborted` and prevents paid fallback.
 
-The installer reuses private OpenRouter credentials, checks the binary SHA256
+The installer stores a private TypeSafe credential, checks the binary SHA256
 and exact package version/architecture, uses native plugin/config APIs, and
 trusts only the three reviewed lifecycle hooks. Its runtime links to the
 signed desktop's helper resources without changing the signed bundle.

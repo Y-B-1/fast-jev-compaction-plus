@@ -13,6 +13,7 @@ import time
 
 
 EVENTS = {"sessionStart", "preCompact", "postCompact"}
+PLUGIN_VERSION = json.loads((Path(__file__).resolve().parents[1] / ".codex-plugin/plugin.json").read_text())["version"]
 
 
 def check_runtime(root):
@@ -28,15 +29,12 @@ def check_runtime(root):
     return binary
 
 
-def copy_credentials(source, destination):
-    credentials = json.loads(source.read_text())
-    if credentials.get("provider") != "openrouter" or not isinstance(credentials.get("apiKey"), str) or not credentials["apiKey"].strip():
-        raise ValueError("Existing Jevgrep credentials must use OpenRouter")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w") as output:
-        json.dump({"provider": "openrouter", "apiKey": credentials["apiKey"]}, output)
+def check_credentials(credentials):
+    key = credentials.get("apiKey")
+    if credentials.get("provider") != "typesafe" or not isinstance(key, str) or not key.strip():
+        raise ValueError("Configure TYPESAFE_API_KEY or a typesafe credentials.json first")
+    if key.startswith("sk-or-"):
+        raise ValueError("An OpenRouter key is configured; fast-jev uses TypeSafe: set TYPESAFE_API_KEY")
 
 
 def link(source, destination):
@@ -53,7 +51,7 @@ class AppServer:
         self.process = subprocess.Popen([str(binary), "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, bufsize=0)
         self.sequence = 0
         self.buffer = b""
-        self.request("initialize", {"clientInfo": {"name": "fast-jev-installer", "version": "0.7.0"}, "capabilities": {"experimentalApi": True}})
+        self.request("initialize", {"clientInfo": {"name": "fast-jev-installer", "version": PLUGIN_VERSION}, "capabilities": {"experimentalApi": True}})
         self.send({"method": "initialized"})
 
     def send(self, message):
@@ -147,15 +145,12 @@ def install(args):
         raise ValueError("Signed desktop resources must contain codex-path")
     root = args.home / ".codex/fast-jev-compaction"
     credential_source = root / "credentials.json"
-    if not credential_source.is_file():
-        credential_source = args.home / ".config/jevgrep/credentials.json"
     # Check credentials before changing the installation. Never print keys.
     if credential_source.is_file():
         credentials = json.loads(credential_source.read_text())
     else:
-        credentials = {"provider": "openrouter", "apiKey": os.environ.get("OPENROUTER_API_KEY", "")}
-    if credentials.get("provider") != "openrouter" or not isinstance(credentials.get("apiKey"), str) or not credentials["apiKey"].strip():
-        raise ValueError("Configure an OpenRouter key or existing Jevgrep credentials first")
+        credentials = {"provider": "typesafe", "apiKey": os.environ.get("TYPESAFE_API_KEY", "")}
+    check_credentials(credentials)
     plugin = root / "plugin"
     for name in ("dist", "bin", "hooks", ".codex-plugin", ".agents", "runtime"):
         if not (source / name).is_dir():
@@ -175,9 +170,7 @@ def install(args):
     resources = args.desktop_resources / "codex-resources"
     if resources.is_dir():
         link(resources.resolve(), bundled / "codex-resources")
-    if credential_source.is_file():
-        copy_credentials(credential_source, root / "credentials.json")
-    else:
+    if not credential_source.is_file():
         destination = root / "credentials.json"
         fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         os.fchmod(fd, 0o600)

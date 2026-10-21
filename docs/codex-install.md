@@ -15,10 +15,11 @@ Claude Code keeps its existing plugin and hook configuration.
    The installer checks the runtime checksum, installs the native plugin,
    enables its three reviewed hooks, and creates `~/.codex/bin/codex-jev`.
 
-The installer reuses an existing OpenRouter credential from Jevgrep without
-printing it. Otherwise configure `OPENROUTER_API_KEY` or create
-`~/.codex/fast-jev-compaction/credentials.json` with provider `openrouter` and
-an `apiKey` value. Keep that file private with mode `0600`.
+The adapter calls TypeSafe's Jev API, like the Claude Code plugin. Set
+`TYPESAFE_API_KEY` before installing (the installer stores it without printing
+it), or create `~/.codex/fast-jev-compaction/credentials.json` with provider
+`typesafe` and an `apiKey` value. Keep that file private with mode `0600`.
+OpenRouter keys (`sk-or-`) are refused.
 
 Use `~/.codex/bin/codex-jev` for CLI sessions. The installer sets
 `CODEX_CLI_PATH` for future desktop launches and restores it at login with
