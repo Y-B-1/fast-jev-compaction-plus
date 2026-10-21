@@ -233,6 +233,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
 export type Sleep = (ms: number, signal?: AbortSignal) => Promise<void>;
 
 export type JevAskerOptions = {
+  /** TypeSafe's System One endpoint; `TYPESAFE_BASE_URL` overrides it (a staging host, a local test server). */
+  baseUrl?: string;
   /** Deadline for each attempt. Default 20000 ms. */
   timeoutMs?: number;
   /** The hook's `next.signal`: ends a pending request when the dispatch ends. */
@@ -343,7 +345,7 @@ export function jevAsker(
       // keep question quotes a head and tail of its tool result; a command,
       // an env var, or a pasted key in either must not leave the machine.
       const request = buildJevRequest(
-        { apiKey, model },
+        { apiKey, model, ...(options.baseUrl ? { baseUrl: options.baseUrl } : {}) },
         redactCompactionState(state, apiKey),
         redactCompactionState(questions, apiKey),
       );
@@ -940,6 +942,25 @@ export async function getApiKey(
   return key || undefined;
 }
 
+/**
+ * `TYPESAFE_BASE_URL` from the environment, then the settings' `env` block: an
+ * http(s) URL that replaces TypeSafe's endpoint, for a staging host or a local
+ * test server. Undefined (TypeSafe's own endpoint) when unset or not http(s).
+ */
+export async function getBaseUrl($: {
+  env: { get: (name: string) => Promise<string | undefined> };
+  settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
+}): Promise<string | undefined> {
+  try {
+    // The loader requires `$.env.get('<literal>')` spelled out at the call site.
+    const url = (await $.env.get('TYPESAFE_BASE_URL')) || settingsEnv(await $.settings.read(), 'TYPESAFE_BASE_URL');
+    return url && /^https?:\/\/\S+$/.test(url) ? url : undefined;
+  } catch {
+    // An engine (or a test double) without env or settings uses TypeSafe's own endpoint.
+    return undefined;
+  }
+}
+
 /** `$.clock.sleep` as a `Sleep`: the hook runtime's only timer. */
 function clockSleep($: {
   clock: { sleep: (ms: number, options?: { signal?: AbortSignal }) => Promise<void> };
@@ -1130,16 +1151,30 @@ export const register: Register = (on: On, options: PluginOptions) => {
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
       // The last response's input tokens: the size the engine compacts at.
+      // The history's share of it comes from the engine's own count of the
+      // `Messages` row (Claude's tokenizer), not from the plugin's estimate,
+      // which is calibrated to Jev's and can read half of Claude's count.
       let contextTokens: number | undefined;
+      let messagesInContext: number | undefined;
       try {
-        contextTokens = event.agentId ? undefined : (await $.session.usage()).context.tokens;
+        if (!event.agentId) {
+          const usage = await $.session.usage({ breakdown: 'summary' });
+          contextTokens = usage.context.tokens;
+          messagesInContext = usage.context.breakdown?.categories.find(
+            (row) => row.kind === 'used' && row.name === 'Messages',
+          )?.tokens;
+        }
       } catch {
         contextTokens = undefined;
       }
       const historyTokens = messageTokens(event.messages);
-      const target = messageTarget(contextTokens, historyTokens, configured.minReductionRatio);
+      const historyInContext = messagesInContext && messagesInContext > 0 ? messagesInContext : historyTokens;
+      const target = messageTarget(contextTokens, historyInContext, configured.minReductionRatio);
       if (contextTokens !== undefined) {
-        log($, `context ${contextTokens} tokens, history ~${historyTokens} tokens, history cut needed ${percent(target)}`);
+        log(
+          $,
+          `context ${contextTokens} tokens, history ${messagesInContext ? `${messagesInContext} tokens (engine count)` : `~${historyTokens} tokens (estimate)`}, history cut needed ${percent(target)}`,
+        );
       }
       // Unknown (a subagent, or an engine without the API form) counts as having images.
       let imagesInContext = true;
@@ -1185,7 +1220,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
           return { status: response.status, ok: response.ok, text: response.text, headers: response.headers };
         },
         config.archiveResults ? archiveWriter($, await archiveDir($), config.apiKey) : undefined,
-        { signal: next.signal, sleep: clockSleep($), remainingMs: () => next.budget.remainingMs },
+        { signal: next.signal, sleep: clockSleep($), remainingMs: () => next.budget.remainingMs, baseUrl: await getBaseUrl($) },
       );
       if (next.signal.aborted) return interrupted($);
       for (const line of decisionLogLines(result)) log($, line);
@@ -1193,18 +1228,31 @@ export const register: Register = (on: On, options: PluginOptions) => {
         const tried = `${prose ? ', prose trim tried' : ''}${notifications ? ', notification trim tried' : ''}${injected ? ', injected-content fold tried' : ''}${exchanges ? ', exchange drop tried' : ''}${steps ? ', step trim tried' : ''}${
           target > configured.minReductionRatio ? `, history needs ${percent(target)} to free ${percent(configured.minReductionRatio)} of context` : ''
         }`;
+        // The cut Jev did make: below the minimum, but where no summary may run
+        // (or the summary fails) it still beats leaving the session as it is.
+        const tokensAfter = messageTokens(messages);
+        const partial = tokensAfter < historyTokens ? { messages, tokensBefore: historyTokens, tokensAfter } : undefined;
+        // What the cut frees of the whole context, the share the minimum is about.
+        const freed = percent(
+          (1 - tokensAfter / Math.max(1, historyTokens)) *
+            (contextTokens && contextTokens > historyInContext ? historyInContext / contextTokens : 1),
+        );
         if (!mayUseBuiltin(event.trigger, config.builtinFallback)) {
+          if (partial) {
+            notify(
+              $,
+              `Compacted with Jev: ${event.messages.length} → ${messages.length} messages, frees ${freed} of the context (below the ${percent(configured.minReductionRatio)} target)`,
+              `kept the cut below the minimum (${percent(configured.minReductionRatio)} minimum${tried}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result, prose, notifications, injected, exchanges, steps)})`,
+            );
+            return partial;
+          }
           notify(
             $,
-            `Not compacted: Jev freed ${percent(reductionRatio(result))}, below the ${percent(configured.minReductionRatio)} minimum`,
+            'Not compacted: Jev found nothing it could remove',
             `skipped (below ${percent(configured.minReductionRatio)} minimum${tried}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result)})`,
           );
           return { skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' };
         }
-        // When the built-in summary itself fails, the shorter cut still beats
-        // leaving the session over its limit.
-        const tokensAfter = messageTokens(messages);
-        const partial = tokensAfter < historyTokens ? { messages, tokensBefore: historyTokens, tokensAfter } : undefined;
         const summary = async (e: typeof event): ReturnType<typeof next> => {
           try {
             return await next(e);
@@ -1212,7 +1260,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
             if (next.signal.aborted || !partial) throw error;
             notify(
               $,
-              `Claude's summary failed; kept Jev's ${percent(reductionRatio(result))} cut`,
+              `Claude's summary failed; kept Jev's cut (frees ${freed} of the context)`,
               `built-in summary failed, kept the Jev cut (${summarize(result)})`,
             );
             return partial;
@@ -1236,7 +1284,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         }
         notify(
           $,
-          `Using Claude's summary: Jev freed ${percent(reductionRatio(result))}, below the ${percent(configured.minReductionRatio)} minimum`,
+          `Using Claude's summary: Jev's cut frees ${freed} of the context, below the ${percent(configured.minReductionRatio)} minimum`,
           `fallback to built-in summary (below ${percent(configured.minReductionRatio)} minimum${tried}: ${summarize(result)})`,
         );
         return summary(event);
@@ -1306,7 +1354,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         },
         apiKey,
         configured.model,
-        { signal: next.signal, sleep: clockSleep($), remainingMs: () => next.budget.remainingMs },
+        { signal: next.signal, sleep: clockSleep($), remainingMs: () => next.budget.remainingMs, baseUrl: await getBaseUrl($) },
       );
       const trimmed = await trimOutput(
         { command: typeof e.command === 'string' ? e.command : '', goal: configured.goal ?? '', output: stdout },

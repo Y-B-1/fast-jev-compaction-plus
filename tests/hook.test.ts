@@ -29,7 +29,7 @@ const resolveHookConfig = (options: Record<string, unknown>) =>
   resolveHookConfigLib({ ...LEGACY, ...options });
 
 /** The engine's `$.clock`: a sleep that never elapses, only aborts. */
-const NOTICE = /^(fallback to built-in summary|skipped \(|kept \d+\/\d+ messages|summarized \d+ older|built-in summary failed)/;
+const NOTICE = /^(fallback to built-in summary|skipped \(|kept \d+\/\d+ messages|summarized \d+ older|built-in summary failed|kept the cut)/;
 const clock = {
   calls: 0,
   sleep: (_ms: number, options?: { signal?: AbortSignal }) =>
@@ -934,6 +934,7 @@ describe('proseTrim rescue', () => {
       fetchFn = fetchWith(0.1),
       usageTokens?: number,
       builtin: (e: unknown) => Promise<unknown> = async (e) => e,
+      messagesInContext?: number,
     ) => {
       const hooks: Record<string, (...args: any[]) => Promise<any>> = {};
       (register as any)(
@@ -950,7 +951,19 @@ describe('proseTrim rescue', () => {
         ui: { log: (t: string) => void (NOTICE.test(t) && notices.push(t)), toast: (t: string) => toasts.push(t) },
         ...(usageTokens === undefined
           ? {}
-          : { session: { usage: async () => ({ context: { tokens: usageTokens, window: 200_000 } }) } }),
+          : {
+              session: {
+                usage: async () => ({
+                  context: {
+                    tokens: usageTokens,
+                    window: 200_000,
+                    ...(messagesInContext === undefined
+                      ? {}
+                      : { breakdown: { categories: [{ name: 'Messages', kind: 'used', tokens: messagesInContext }] } }),
+                  },
+                }),
+              },
+            }),
       };
       const next = Object.assign(builtin, {
         signal: new AbortController().signal,
@@ -976,12 +989,23 @@ describe('proseTrim rescue', () => {
         expect(on.notices[0]).toBe('fallback to built-in summary (history is too small a share of the context to free 25%)');
       });
 
+      it("measures the history's share with the engine's Messages count, not the plugin's estimate", async () => {
+        const requests: string[][] = [];
+        const event = { trigger: 'auto', messages: proseTranscript() };
+        // By the estimate the history is a quarter of the context, too small to free 25%
+        // even if all of it went; by the engine's count it is three quarters.
+        const on = hook({ proseTrim: true }, fetchWith(0.1, requests), history() * 4, undefined, history() * 3);
+        await on.run(event);
+        expect(requests.length).toBeGreaterThan(0);
+        expect(on.notices[0]).not.toMatch(/too small a share/);
+      });
+
       it('falls back when the history cut frees too little of the context', async () => {
         const event = { trigger: 'auto', messages: proseTranscript() };
         const on = hook({ proseTrim: true }, fetchWith(0.1), Math.round(history() * 3.9));
         expect(await on.run(event)).toBe(event);
         expect(on.notices[0]).toMatch(/^fallback to built-in summary \(below 25% minimum, prose trim tried, history needs 9\d% to free 25% of context: /);
-        expect(on.toasts).toEqual([expect.stringMatching(/^Using Claude's summary: Jev freed \d+%, below the 25% minimum$/)]);
+        expect(on.toasts).toEqual([expect.stringMatching(/^Using Claude's summary: Jev's cut frees \d+% of the context, below the 25% minimum$/)]);
       });
 
       it('rethrows a failed built-in summary when its own cut freed nothing', async () => {
@@ -1441,8 +1465,12 @@ describe('notificationTrim rescue', () => {
       expect(await on.run(event)).toBe(event);
       expect(on.notices[0]).toMatch(/^fallback to built-in summary \(below 99% minimum, notification trim tried, step trim tried: /);
       const never = hook({ notificationTrim: true, proseTrim: false, minReductionRatio: 0.99, builtinFallback: 'never' }, fetchWith(0.9));
-      expect(await never.run(event)).toEqual({ skip: 'fast-jev-compaction: below minimum reduction, builtin fallback disabled' });
-      expect(never.notices[0]).toContain('minimum, notification trim tried, step trim tried, builtin fallback disabled');
+      // No summary may run, so the cut Jev did make is kept rather than nothing.
+      const kept = await never.run(event);
+      expect(Object.keys(kept)).toEqual(['messages', 'tokensBefore', 'tokensAfter']);
+      expect(kept.tokensAfter).toBeLessThan(kept.tokensBefore);
+      expect(never.notices[0]).toContain('kept the cut below the minimum (99% minimum, notification trim tried, step trim tried, builtin fallback disabled');
+      expect(never.toasts).toEqual([expect.stringMatching(/^Compacted with Jev: \d+ → \d+ messages, frees \d+% of the context \(below the 99% target\)$/)]);
       const both = hook({ notificationTrim: true, proseTrim: true, minReductionRatio: 0.99 }, fetchWith(0.9));
       expect(await both.run(event)).toBe(event);
       expect(both.notices[0]).toContain('minimum, prose trim tried, notification trim tried, step trim tried: ');

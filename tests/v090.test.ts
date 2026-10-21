@@ -49,7 +49,7 @@ function archive() {
 const BIG = 'line of real output with detail\n'.repeat(400); // 12,800 chars
 const tail = [message('assistant', 'Working.'), message('user', 'continue'), message('assistant', 'ok'), message('user', 'go')];
 
-const NOTICE = /^(fallback to built-in summary|skipped \(|kept \d+\/\d+ messages|summarized \d+ older|built-in summary failed)/;
+const NOTICE = /^(fallback to built-in summary|skipped \(|kept \d+\/\d+ messages|summarized \d+ older|built-in summary failed|kept the cut)/;
 describe('defaults', () => {
   it('keeps a shorter head and salvage, and caps kept results at 4000 chars', () => {
     const o = resolveOptions();
