@@ -1,6 +1,7 @@
 import { dedupeBlocks, supersededCalls } from './dedupe.js';
 import { MAX_QUESTIONS_PER_REQUEST, noulAnswer } from './request.js';
 import { salvageBlock } from './salvage.js';
+import { splitMediaNotes } from './media.js';
 import { collectToolCalls, estimateTokens, fitState, goalFromMessages, isPinned } from './state.js';
 import type {
   ArchiveResult,
@@ -600,7 +601,13 @@ export function applyDecisions(
       actions.set(call.tool_use_id, 'cap');
     }
   }
+  // An image's or document's placeholder (see `placeMedia`) stays whole; only the rest is cut.
   const cutResult = (id: string, text: string, isError: boolean): string => {
+    const { rest, notes } = splitMediaNotes(text);
+    if (notes.length === 0) return cutText(id, text, isError);
+    return [cutText(id, rest, isError), ...notes].filter(Boolean).join('\n');
+  };
+  const cutText = (id: string, text: string, isError: boolean): string => {
     const action = actions.get(id);
     if (action !== 'drop_result' && action !== 'cap') return text;
     // A result an earlier compaction capped is not capped again, and when Jev
@@ -615,6 +622,14 @@ export function applyDecisions(
       ? cappedResultText(text, isError, capChars, archive?.(id, text), salvageChars)
       : truncatedResultText(text, isError, headChars, archive?.(id, text), salvageChars);
   };
+  // A dropped call's result goes with it: its media placeholders move to the call's note.
+  const mediaNotes = new Map<string, string[]>();
+  for (const message of messages) {
+    for (const result of message.toolResults ?? []) {
+      const { notes } = splitMediaNotes(result.text);
+      if (notes.length > 0) mediaNotes.set(result.tool_use_id, notes);
+    }
+  }
   const kept: Message[] = [];
   for (const [index, message] of messages.entries()) {
     const touched =
@@ -637,13 +652,16 @@ export function applyDecisions(
     const droppedCallNotes = message.toolUses
       .filter((tool) => actions.get(tool.tool_use_id) === 'drop_call')
       .map((tool) =>
-        droppedCallNote(
-          tool,
-          // A result an earlier compaction capped already has its full output
-          // archived: cite that file, never overwrite it with the capped copy.
-          wasCapped(tool.text ?? '') ? cappedPath(tool.text ?? '') : archive?.(tool.tool_use_id, tool.text ?? ''),
-          salvageChars,
-        ),
+        [
+          droppedCallNote(
+            tool,
+            // A result an earlier compaction capped already has its full output
+            // archived: cite that file, never overwrite it with the capped copy.
+            wasCapped(tool.text ?? '') ? cappedPath(tool.text ?? '') : archive?.(tool.tool_use_id, tool.text ?? ''),
+            salvageChars,
+          ),
+          ...(mediaNotes.get(tool.tool_use_id) ?? []),
+        ].join('\n'),
       );
     const toolUses = message.toolUses
       .filter((tool) => actions.get(tool.tool_use_id) !== 'drop_call')

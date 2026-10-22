@@ -30,6 +30,7 @@ import {
 } from '../src/prose.js';
 import { redactCompactionState, redactText } from '../src/redact.js';
 import { estimateTokens, goalFromMessages } from '../src/state.js';
+import { type MediaArchive, findMedia, mediaNote, placeMedia, splitMediaNotes } from '../src/media.js';
 import type { InjectStats } from '../src/inject.js';
 import { failedProseStats, trimRescue } from '../src/trim.js';
 import type {
@@ -596,6 +597,8 @@ const ARCHIVE_DIR = '.claude/fast-jev-compaction';
 export type ArchiveWriter = {
   /** Names the file a dropped call's or result's full text will be written to. */
   cite: (toolUseId: string, text: string) => string | undefined;
+  /** Names the file an image's or document's base64 copy will be written to, with its INDEX.md line (see `placeMedia`). */
+  media: MediaArchive;
   /** Writes the files named so far. */
   flush: () => Promise<void>;
   /** The path `cite` returns for an archive id. */
@@ -638,6 +641,8 @@ export function archiveWriter($: {
   };
 }, dir: string = ARCHIVE_DIR, apiKey?: string): ArchiveWriter {
   const pending = new Map<string, string>();
+  // Base64 is written as it is: redaction could only corrupt it. Its INDEX.md line is kept apart.
+  const media = new Map<string, { data: string; line: string }>();
   const pathOf = (id: string) => `${dir}/${id}.txt`;
   return {
     pathOf,
@@ -647,13 +652,20 @@ export function archiveWriter($: {
       pending.set(path, redactText(text, apiKey));
       return path;
     },
+    media(name, data, line) {
+      const path = `${dir}/${name}`;
+      media.set(path, { data, line: redactText(line, apiKey) });
+      return path;
+    },
     async flush() {
-      if (pending.size === 0) return;
+      if (pending.size === 0 && media.size === 0) return;
       const ignorePath = `${dir}/.gitignore`;
       if (!(await $.fs.exists(ignorePath))) await $.fs.write(ignorePath, '*\n');
       for (const [path, text] of pending) await $.fs.write(path, text);
-      await writeIndex($, `${dir}/INDEX.md`, pending);
+      for (const [path, { data }] of media) await $.fs.write(path, data);
+      await writeIndex($, `${dir}/INDEX.md`, new Map([...pending, ...[...media].map(([path, { line }]) => [path, line] as const)]));
       pending.clear();
+      media.clear();
     },
   };
 }
@@ -1208,7 +1220,10 @@ export function originalIndex(
     const at = original.findIndex((m) => m.handle === row.handle);
     if (at > 0) return at;
   }
-  const isPrompt = (m: SessionMessage) => m.role === 'user' && (m.toolResults?.length ?? 0) === 0 && m.text === row.text;
+  // A prompt that gained media placeholders (see `placeMedia`) still matches its original.
+  const bare = (text: string) => splitMediaNotes(text).rest;
+  const isPrompt = (m: SessionMessage) =>
+    m.role === 'user' && (m.toolResults?.length ?? 0) === 0 && bare(m.text) === bare(row.text);
   const rank = trimmed.slice(0, index).filter(isPrompt).length;
   let seen = 0;
   for (let i = 0; i < original.length; i++) {
@@ -1367,8 +1382,10 @@ async function compactHook(
     }
     // Unknown (a subagent, or an engine without the API form) counts as having images.
     let imagesInContext = true;
+    let api: readonly { role: string; content: readonly unknown[] }[] | undefined;
     if (!event.agentId) try {
-      const breakdown = contextBreakdown(await $.session.messages({ as: 'api' }));
+      api = await $.session.messages({ as: 'api' });
+      const breakdown = contextBreakdown(api);
       imagesInContext = breakdown.images > 0;
       log($, `history as the model sees it: ${formatBreakdown(breakdown)}`, report);
     } catch {
@@ -1403,14 +1420,24 @@ async function compactHook(
       once.inertNoticeLogged = true;
       log($, 'notification trim skipped: archiveResults is off', report);
     }
+    const archive = config.archiveResults ? archiveWriter($, await archiveDir($), config.apiKey) : undefined;
+    // Media leave with their rows' handles; without stripHandles the handles, and the media, stay.
+    const media =
+      api && (config.stripHandles ?? HOOK_DEFAULTS.stripHandles)
+        ? placeMedia(event.messages, findMedia(api), archive?.media)
+        : { messages: event.messages, images: 0, documents: 0, kept: 0 };
+    if (media.images + media.documents + media.kept > 0) {
+      log($, `media: ${media.images} images and ${media.documents} documents removed with a placeholder, ${media.kept} kept in the current prompt`, report);
+    }
+    const removedMedia = mediaNote(media.images, media.documents);
     const { result, messages, prose, notifications, injected, exchanges, steps } = await compactSession(
-      event.messages,
+      media.messages,
       config,
       async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text, headers: response.headers };
       },
-      config.archiveResults ? archiveWriter($, await archiveDir($), config.apiKey) : undefined,
+      archive,
       { signal: next.signal, sleep: clockSleep($), remainingMs: () => next.budget.remainingMs, baseUrl: await getBaseUrl($) },
     );
     if (next.signal.aborted) return interrupted($, report);
@@ -1456,7 +1483,7 @@ async function compactHook(
         if (partial) {
           notify(
             $,
-            `Compacted with Jev: ${event.messages.length} → ${messages.length} messages, frees ${freed} of the context (below the ${percent(configured.minReductionRatio)} target)`,
+            `Compacted with Jev: ${event.messages.length} → ${messages.length} messages, frees ${freed} of the context (below the ${percent(configured.minReductionRatio)} target)${removedMedia ? `, ${removedMedia}` : ''}`,
             `kept the cut below the minimum (${percent(configured.minReductionRatio)} minimum${tried}, builtin fallback disabled for ${event.trigger ?? 'this'} trigger: ${summarize(result, prose, notifications, injected, exchanges, steps)})`,
             report,
           );
@@ -1518,7 +1545,7 @@ async function compactHook(
     log($, `kept history ~${tokensAfter} tokens of ~${historyTokens}`, report);
     notify(
       $,
-      `Compacted with Jev: ${event.messages.length} → ${messages.length} messages, ${percent(1 - tokensAfter / Math.max(1, historyTokens))} smaller, no summary`,
+      `Compacted with Jev: ${event.messages.length} → ${messages.length} messages, ${percent(1 - tokensAfter / Math.max(1, historyTokens))} smaller, no summary${removedMedia ? `, ${removedMedia}` : ''}`,
       `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose, notifications, injected, exchanges, steps)})`,
       report,
     );
