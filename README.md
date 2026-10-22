@@ -104,8 +104,14 @@ built-in compaction summary with the original messages.
    are merged into one message. A kept message with its handle makes `--resume` restore
    the history the compaction removed (anthropics/claude-code#95328), and a
    handle-less row inside a parallel group splits it, after which Claude Code
-   reports a sibling's result as missing. The cost: hidden reasoning and
-   tool-result images of the older messages are dropped.
+   reports a sibling's result as missing. The cost: hidden reasoning of the
+   older messages is dropped. Images and documents (PDFs) are removed too, as
+   Claude Code's own compaction removes them: tool-result ones, and pasted ones
+   before the current prompt (whose own stay). Each leaves a one-line
+   placeholder: the file name, the model's first sentence about it then, the
+   path to Read it again, and an archived base64 copy listed in `INDEX.md`
+   (when `archiveResults` is on). Later cuts of the result keep the placeholder
+   whole. The toast counts what was removed.
 
 Jev failures, malformed answers, a missing key, a history that cannot be
 fitted, or answers that drop every call they score (at least
@@ -183,7 +189,7 @@ put it in a source file.
 | `stepTrim` | `true` | Plugin hook only; needs `archiveResults`. The last trim stage, run on the best result of the stages before it. First it archives old steps before your last prompt at the keep cut-offs `0.05`, `0.15`, `0.35`; if that falls short it archives the lowest-scored steps, the current task included, until the minimum is met. Your prompt text, row 0, pinned rows, typed `!` commands, slash-command arguments, messages sent mid-turn and unpaired tool calls are never touched. The built-in summary then runs only when Jev fails or nothing is left to archive. |
 | `dedupeRepeats` | `true` | Remove repeats without asking Jev: an earlier call a later one repeats (the same Bash command whatever its description or timeout, a Read of a file a later whole-file Read covers, otherwise the same tool and input) gets its result truncated when the later output did not fail and is at least half as long, and earlier copies of repeated injected blocks or long repeated user messages become a marker; a user prompt Claude Code still holds whole is never rewritten, since it may carry images the hook cannot see |
 | `minKeepSignalCalls` | `3` | When Jev scores at least this many calls and drops them all, call and result, the answers count as a failure and the fallback rules apply; `0` disables |
-| `stripHandles` | `true` | Plugin hook only. Return older messages without the engine's handle and merge parallel tool-call rows, so `--resume` keeps the compaction and parallel calls stay paired; costs the hidden reasoning and tool-result images of those messages |
+| `stripHandles` | `true` | Plugin hook only. Return older messages without the engine's handle and merge parallel tool-call rows, so `--resume` keeps the compaction and parallel calls stay paired; costs the hidden reasoning of those messages, and replaces their images and documents with a placeholder (path, description, archived copy) |
 | `jevPruneBashOutput` | `false` | Opt-in: before a Bash tool result reaches the transcript, trim its stdout through Jev when it is long (`src/output.ts`). A second, separate Jev call site from compaction — leave it off unless you want the extra cost |
 | `jevPruneMinChars` | `4000` | Stdout shorter than this is left untouched even when `jevPruneBashOutput` is on |
 

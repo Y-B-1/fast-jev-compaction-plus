@@ -1,6 +1,7 @@
 import { dedupeBlocks, supersededCalls } from './dedupe.js';
 import { MAX_QUESTIONS_PER_REQUEST, noulAnswer } from './request.js';
 import { salvageBlock } from './salvage.js';
+import { splitMediaNotes } from './media.js';
 import { collectToolCalls, estimateTokens, fitState, goalFromMessages, isPinned } from './state.js';
 import type {
   ArchiveResult,
@@ -600,7 +601,13 @@ export function applyDecisions(
       actions.set(call.tool_use_id, 'cap');
     }
   }
+  // An image's or document's placeholder (see `placeMedia`) stays whole; only the rest is cut.
   const cutResult = (id: string, text: string, isError: boolean): string => {
+    const { rest, notes } = splitMediaNotes(text);
+    if (notes.length === 0) return cutText(id, text, isError);
+    return [cutText(id, rest, isError), ...notes].filter(Boolean).join('\n');
+  };
+  const cutText = (id: string, text: string, isError: boolean): string => {
     const action = actions.get(id);
     if (action !== 'drop_result' && action !== 'cap') return text;
     // A result an earlier compaction capped is not capped again, and when Jev
