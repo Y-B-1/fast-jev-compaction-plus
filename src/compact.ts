@@ -622,6 +622,14 @@ export function applyDecisions(
       ? cappedResultText(text, isError, capChars, archive?.(id, text), salvageChars)
       : truncatedResultText(text, isError, headChars, archive?.(id, text), salvageChars);
   };
+  // A dropped call's result goes with it: its media placeholders move to the call's note.
+  const mediaNotes = new Map<string, string[]>();
+  for (const message of messages) {
+    for (const result of message.toolResults ?? []) {
+      const { notes } = splitMediaNotes(result.text);
+      if (notes.length > 0) mediaNotes.set(result.tool_use_id, notes);
+    }
+  }
   const kept: Message[] = [];
   for (const [index, message] of messages.entries()) {
     const touched =
@@ -644,13 +652,16 @@ export function applyDecisions(
     const droppedCallNotes = message.toolUses
       .filter((tool) => actions.get(tool.tool_use_id) === 'drop_call')
       .map((tool) =>
-        droppedCallNote(
-          tool,
-          // A result an earlier compaction capped already has its full output
-          // archived: cite that file, never overwrite it with the capped copy.
-          wasCapped(tool.text ?? '') ? cappedPath(tool.text ?? '') : archive?.(tool.tool_use_id, tool.text ?? ''),
-          salvageChars,
-        ),
+        [
+          droppedCallNote(
+            tool,
+            // A result an earlier compaction capped already has its full output
+            // archived: cite that file, never overwrite it with the capped copy.
+            wasCapped(tool.text ?? '') ? cappedPath(tool.text ?? '') : archive?.(tool.tool_use_id, tool.text ?? ''),
+            salvageChars,
+          ),
+          ...(mediaNotes.get(tool.tool_use_id) ?? []),
+        ].join('\n'),
       );
     const toolUses = message.toolUses
       .filter((tool) => actions.get(tool.tool_use_id) !== 'drop_call')

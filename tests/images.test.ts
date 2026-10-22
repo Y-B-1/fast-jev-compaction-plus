@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { register } from '../hooks/fast-jev.js';
+import { originalIndex, register } from '../hooks/fast-jev.js';
 import { applyDecisions } from '../src/compact.js';
 import { collectToolCalls } from '../src/state.js';
 
@@ -180,5 +180,74 @@ describe('a placeholder survives a later cut of its result', () => {
     const text = out.flatMap((m) => m.toolResults ?? []).find((r) => r.tool_use_id === 'x')!.text;
     expect(text.length).toBeLessThan(4000 + note.length);
     expect(text).toContain(note);
+  });
+});
+
+describe('review notes on the placeholders', () => {
+  it('gives a pasted image to the prompt it came with when an earlier prompt has the same text', async () => {
+    const rows = [
+      { role: 'user', text: 'ok', toolUses: [], handle: 'u0' },
+      { role: 'assistant', text: 'Waiting.', toolUses: [], handle: 'a1' },
+      { role: 'user', text: 'ok\n[Image: source: /p/1.png]', toolUses: [], handle: 'u2' },
+      { role: 'assistant', text: 'A bar chart.', toolUses: [], handle: 'a3' },
+      { role: 'user', text: 'thanks', toolUses: [], handle: 'u4' },
+    ];
+    const form = [
+      { role: 'user', content: [{ type: 'text', text: 'ok' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'Waiting.' }] },
+      { role: 'user', content: [{ type: 'text', text: 'ok' }, png('QkFS'), { type: 'text', text: '[Image: source: /p/1.png]' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'A bar chart.' }] },
+      { role: 'user', content: [{ type: 'text', text: 'thanks' }] },
+    ];
+    const { $, next, hook } = setup(form);
+    const out = (await hook('session.compact')($, { trigger: 'manual', messages: rows }, next())) as { messages: Row[] };
+    expect(out.messages.find((r) => r.text === 'ok')).toMatchObject({ handle: 'u0' });
+    const pasted = out.messages.find((r) => r.text.startsWith('ok\n[Image'))!;
+    expect(pasted.handle).toBeUndefined();
+    expect(pasted.text).toContain('described then as: "A bar chart."');
+  });
+
+  it('keeps the placeholder in the note of a dropped call', () => {
+    const note = '[image removed by compaction · a.png (image/png) · described then as: "Red." · view again: Read /w/a.png]';
+    const tool = { tool_use_id: 'x', tool: 'Read', input: { file_path: '/w/a.png' }, text: '' };
+    const messages = [
+      { role: 'user' as const, text: 's', toolUses: [] },
+      { role: 'assistant' as const, text: '', toolUses: [tool] },
+      { role: 'user' as const, text: '', toolUses: [], toolResults: [{ tool_use_id: 'x', text: note }] },
+      { role: 'user' as const, text: 'e', toolUses: [] },
+    ];
+    const decision = { id: 't1', tool: 'Read', action: 'drop_call', reason: 'call_dropped', keepCall: 0, keepResult: 0 };
+    const out = applyDecisions(messages, [decision] as never, collectToolCalls(messages, 0), 150);
+    expect(out.map((m) => m.text).join('\n')).toContain(note);
+  });
+
+  it('names a tool-result image without a file path as a tool result, not a paste', async () => {
+    const rows = transcript().map((r) => (r.handle === 'a2' ? { ...r, toolUses: [{ ...r.toolUses[0]!, input: {} }] } : r));
+    const form = api().map((m) =>
+      m.role === 'assistant' && m.content.some((b: any) => b.id === 'toolu_IMG')
+        ? { ...m, content: m.content.map((b: any) => (b.id === 'toolu_IMG' ? { ...b, input: {} } : b)) }
+        : m,
+    );
+    const { $, next, hook } = setup(form);
+    const out = (await hook('session.compact')($, { trigger: 'manual', messages: rows }, next())) as { messages: Row[] };
+    const text = out.messages.flatMap((r) => r.toolResults ?? []).find((r) => r.tool_use_id === 'toolu_IMG')!.text;
+    expect(text).toContain('a tool result image');
+    expect(text).not.toContain('a pasted image');
+  });
+
+  it('finds the original prompt behind a row that gained a placeholder', () => {
+    const original = [
+      { role: 'user', text: 'start', toolUses: [] },
+      { role: 'user', text: 'yes', toolUses: [] },
+      { role: 'user', text: 'k', toolUses: [] },
+      { role: 'user', text: 'yes', toolUses: [] },
+    ];
+    const trimmed = [
+      { role: 'user', text: 'start', toolUses: [] },
+      { role: 'user', text: 'yes\n[image removed by compaction · a pasted image (image/png) · no description recorded · no copy kept]', toolUses: [] },
+      { role: 'user', text: 'k', toolUses: [] },
+      { role: 'user', text: 'yes', toolUses: [] },
+    ];
+    expect(originalIndex(original as never, trimmed as never, 3)).toBe(3);
   });
 });

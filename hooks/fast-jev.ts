@@ -30,7 +30,7 @@ import {
 } from '../src/prose.js';
 import { redactCompactionState, redactText } from '../src/redact.js';
 import { estimateTokens, goalFromMessages } from '../src/state.js';
-import { type MediaArchive, findMedia, mediaNote, placeMedia } from '../src/media.js';
+import { type MediaArchive, findMedia, mediaNote, placeMedia, splitMediaNotes } from '../src/media.js';
 import type { InjectStats } from '../src/inject.js';
 import { failedProseStats, trimRescue } from '../src/trim.js';
 import type {
@@ -1220,7 +1220,10 @@ export function originalIndex(
     const at = original.findIndex((m) => m.handle === row.handle);
     if (at > 0) return at;
   }
-  const isPrompt = (m: SessionMessage) => m.role === 'user' && (m.toolResults?.length ?? 0) === 0 && m.text === row.text;
+  // A prompt that gained media placeholders (see `placeMedia`) still matches its original.
+  const bare = (text: string) => splitMediaNotes(text).rest;
+  const isPrompt = (m: SessionMessage) =>
+    m.role === 'user' && (m.toolResults?.length ?? 0) === 0 && bare(m.text) === bare(row.text);
   const rank = trimmed.slice(0, index).filter(isPrompt).length;
   let seen = 0;
   for (let i = 0; i < original.length; i++) {
