@@ -31,7 +31,10 @@ lossy: a file path, exact error, constraint, or command can disappear even when
 it matters later. This library never rewrites anything. It only deletes tool
 calls and tool results Jev says are no longer needed, and it asks Jev while
 showing it the whole conversation. User and assistant text stays verbatim and
-in order.
+in order. The Claude Code plugin adds later stages for when that is not enough:
+they move whole old steps or exchanges, assistant text included, to archive
+files and leave one marker row per run naming the file. What you typed always
+stays verbatim.
 
 The repository is both an npm package (`src/`) and a Claude Code plugin
 (`hooks/`, `.claude-plugin/`) that uses the package to replace Claude Code's
@@ -184,9 +187,9 @@ put it in a source file.
 | `hybridSummary` | `true` | Plugin hook only. When trimming frees less than the minimum, the built-in summarizer summarizes only the older history and the recent turns (at most 30% of the history) stay as trimmed, instead of a summary of everything; see `hooks/README.md` |
 | `inputTrim` | `true` | Plugin hook only. On every compaction, cut the code bodies of old tool inputs (Write/Edit contents, notebook sources, workflow scripts, Bash heredocs) to a `truncateHeadChars` head and a note, by rule with no Jev request, archiving the full text when `archiveResults` is on. Prose inputs (Agent prompts), pinned messages and dropped calls are not touched |
 | `injectTrim` | `true` | Plugin hook only; needs `archiveResults`. When trimming falls short, fold old injected content in user rows (skill bodies, browser element selections, pastes, and other user rows of 3,000+ chars that are not among the last three prompts) to a head, a marker naming the archived original, and a salvage block. Jev decides which blocks stay; at the last rung every old skill body and element selection folds. Text typed around a block (a skill's `ARGUMENTS:`, the request after an element) stays verbatim. |
-| `replyTrim` | `true` | Plugin hook only; needs `archiveResults`. On every compaction, archive whole old steps (a reply, a closed run of tool calls with their results, or a row of host messages) that come before your last prompt and that Jev scores below `0.05`. Each step becomes one row naming its archive file and quoting its last line. No reply is cut mid-sentence. |
+| `replyTrim` | `true` | Plugin hook only; needs `archiveResults`. On every compaction, archive whole old steps (a reply, a closed run of tool calls with their results, or a row of host messages) that come before your last prompt and that Jev scores below `0.05`. Adjacent archived steps become one row naming one archive file and quoting, on one line, the start of the last thing the assistant wrote there (never an earlier marker). Runs only when it frees at least 5% of the context. No reply is cut mid-sentence. |
 | `exchangeDrop` | `true` | Plugin hook only; needs `archiveResults`. When every trim stage falls short, Jev scores each old finished exchange (a prompt and its work up to the next prompt). An exchange it no longer needs is archived whole and its work rows become one row naming the file. The prompt stays verbatim; the last three prompts, pinned rows, exchanges with an unpaired tool call and exchanges holding a typed `!` command, slash-command arguments or a message sent mid-turn are never offered. Runs before the built-in summary. |
-| `stepTrim` | `true` | Plugin hook only; needs `archiveResults`. The last trim stage, run on the best result of the stages before it. First it archives old steps before your last prompt at the keep cut-offs `0.05`, `0.15`, `0.35`; if that falls short it archives the lowest-scored steps, the current task included, until the minimum is met. Your prompt text, row 0, pinned rows, typed `!` commands, slash-command arguments, messages sent mid-turn and unpaired tool calls are never touched. The built-in summary then runs only when Jev fails or nothing is left to archive. |
+| `stepTrim` | `true` | Plugin hook only; needs `archiveResults`. The last trim stage, run on the best result of the stages before it. First it archives old steps before your last prompt at the keep cut-offs `0.05`, `0.15`, `0.35`; if that falls short it archives the lowest-scored steps, the current task included, until the minimum is met. Adjacent archived steps, and earlier marker rows just before or between them, share one marker row and one archive file. Your prompt text, row 0, pinned rows, typed `!` commands, slash-command arguments, messages sent mid-turn and unpaired tool calls are never touched. The built-in summary then runs only when Jev fails or nothing is left to archive. |
 | `dedupeRepeats` | `true` | Remove repeats without asking Jev: an earlier call a later one repeats (the same Bash command whatever its description or timeout, a Read of a file a later whole-file Read covers, otherwise the same tool and input) gets its result truncated when the later output did not fail and is at least half as long, and earlier copies of repeated injected blocks or long repeated user messages become a marker; a user prompt Claude Code still holds whole is never rewritten, since it may carry images the hook cannot see |
 | `minKeepSignalCalls` | `3` | When Jev scores at least this many calls and drops them all, call and result, the answers count as a failure and the fallback rules apply; `0` disables |
 | `stripHandles` | `true` | Plugin hook only. Return older messages without the engine's handle and merge parallel tool-call rows, so `--resume` keeps the compaction and parallel calls stay paired; costs the hidden reasoning of those messages, and replaces their images and documents with a placeholder (path, description, archived copy) |
@@ -199,8 +202,10 @@ stage was needed, and the number of requests.
 
 ## Limitations
 
-- Only tool calls and results are candidates; text messages are never removed
-  or shortened in the output (they are only abridged in the state Jev sees).
+- In the library, only tool calls and results are candidates; text messages
+  are never removed or shortened in the output (they are only abridged in the
+  state Jev sees). The plugin's later stages can archive whole old assistant
+  steps (see `replyTrim`, `exchangeDrop` and `stepTrim`).
 - Token sizes are estimates from character counts, not a tokenizer.
 - Calibration is at the request level; a probability is not a proof that a
   result is safe to delete. The assistant can always re-run the tool.
