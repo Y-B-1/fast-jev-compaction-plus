@@ -311,14 +311,14 @@ const MACHINE_TEXT_PREFIXES = [
 export const MARKER = '[fast-jev-compaction ';
 
 /**
- * `text` without the plugin's own lines: marker lines and the `Note:` or `Last reply:` line that
- * follows one. A new note quotes only what the assistant wrote, never an earlier marker.
+ * `text` without the plugin's own lines: lines that start with a marker and the `Note:` or
+ * `Last reply:` line that follows one. A new note quotes only what the assistant wrote, never an earlier marker.
  */
 export function ownText(text: string): string {
   const kept: string[] = [];
   let afterMarker = false;
   for (const line of text.split('\n')) {
-    if (line.includes(MARKER)) afterMarker = true;
+    if (line.trimStart().startsWith(MARKER)) afterMarker = true;
     else if (!(afterMarker && /^(Note|Last reply): /.test(line))) {
       afterMarker = false;
       kept.push(line);
