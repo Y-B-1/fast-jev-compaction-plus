@@ -310,6 +310,23 @@ const MACHINE_TEXT_PREFIXES = [
 /** The prefix of every marker this plugin leaves in the history. */
 export const MARKER = '[fast-jev-compaction ';
 
+/**
+ * `text` without the plugin's own lines: marker lines and the `Note:` or `Last reply:` line that
+ * follows one. A new note quotes only what the assistant wrote, never an earlier marker.
+ */
+export function ownText(text: string): string {
+  const kept: string[] = [];
+  let afterMarker = false;
+  for (const line of text.split('\n')) {
+    if (line.includes(MARKER)) afterMarker = true;
+    else if (!(afterMarker && /^(Note|Last reply): /.test(line))) {
+      afterMarker = false;
+      kept.push(line);
+    }
+  }
+  return kept.join('\n').trim();
+}
+
 /** A row the user typed (or the host typed for them): a user row with text, no tool results and no machine prefix. */
 export function isPromptRow(message: Message): boolean {
   return (
