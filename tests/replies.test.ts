@@ -18,11 +18,11 @@ const FLUFF = 'Let me take a careful look at how this module is laid out before 
 const KEPT = 'The cache key lives in src/cache/key.ts and must not change.';
 const REPLY = `${Array(20).fill(FLUFF).join(' ')} ${KEPT}`;
 
-function transcript(): SessionMessage[] {
+function transcript(big = BIG): SessionMessage[] {
   return [
     message('user', 'Fix the stale cache.', { handle: 'u-0' }),
-    call('rd1', 'Read', { file_path: 'src/big.ts' }, BIG),
-    result('rd1', BIG),
+    call('rd1', 'Read', { file_path: 'src/big.ts' }, big),
+    result('rd1', big),
     message('assistant', REPLY, { handle: 'a-1' }),
     message('user', 'first recent prompt', { handle: 'u-2' }),
     message('assistant', 'ok', { handle: 'a-3' }),
@@ -62,11 +62,15 @@ describe('replyTrim: old replies folded whole on every compaction', () => {
   it('folds an old reply Jev scores done into one archive pointer after tool compaction met the minimum', async () => {
     const a = archive();
     const requests: string[][] = [];
-    const out = await compactSession(transcript(), config() as never, fetchWith(0.01, requests), a);
+    // A smaller file, so the reply is more than MILD_MIN_SHARE of the context.
+    const out = await compactSession(transcript(BIG.slice(0, 8_000)), config() as never, fetchWith(0.01, requests), a);
     expect(replyOf(out.messages)).toBeUndefined();
-    const marker = out.messages.find((m) => m.text.includes('archived 1 row of earlier work'))!;
+    // The dropped Read call's note row folds into the same marker as the reply beside it.
+    const marker = out.messages.find((m) => m.text.includes('archived 2 rows of earlier work'))!;
+    expect(out.messages.filter((m) => m.text.includes('[fast-jev-compaction '))).toHaveLength(1);
     expect(marker.text).toMatch(/full text: arch\/step-[0-9a-f]{12}\.txt \(Read it if needed\)\]\nNote: Let me take/);
     expect([...a.files.values()].some((t) => t.includes(REPLY))).toBe(true);
+    expect([...a.files.values()].some((t) => t.includes(REPLY) && t.includes('removed the Read call'))).toBe(true);
     expect(out.steps).toMatchObject({ pass: 'trim', cutoff: 0.05, stats: { archived: 1 } });
     expect(stepRequests(requests)).toHaveLength(1);
     // The prompts and the recent rows are never scored or changed.
@@ -98,5 +102,13 @@ describe('replyTrim: old replies folded whole on every compaction', () => {
     expect(replyOf(out.messages)!.text).toContain(REPLY);
     expect(out.steps?.stats.failed).toBeDefined();
     expect([...a.files.keys()].some((id) => id.includes('step-'))).toBe(false);
+  });
+});
+
+describe('replyTrim floor', () => {
+  it('leaves an old reply alone when folding it frees less than 5% of the context', async () => {
+    const out = await compactSession(transcript(), config() as never, fetchWith(0.01), archive());
+    expect(replyOf(out.messages)!.text).toContain(REPLY);
+    expect(out.messages.some((m) => m.text.includes('[fast-jev-compaction archived'))).toBe(false);
   });
 });

@@ -29,7 +29,7 @@ import {
   type ProseStats,
 } from '../src/prose.js';
 import { redactCompactionState, redactText } from '../src/redact.js';
-import { estimateTokens, goalFromMessages } from '../src/state.js';
+import { MARKER, estimateTokens, goalFromMessages } from '../src/state.js';
 import { type MediaArchive, findMedia, mediaNote, placeMedia, splitMediaNotes } from '../src/media.js';
 import type { InjectStats } from '../src/inject.js';
 import { failedProseStats, trimRescue } from '../src/trim.js';
@@ -1450,6 +1450,16 @@ async function compactHook(
       contextTokens,
       historyInContext,
       reduction: Math.round(reductionRatio(result) * 1000) / 1000,
+      // Plugin marker rows left in the history, and what each stage that ran settled on.
+      markersAfter: messages.filter((m) => m.text.includes(MARKER)).length,
+      stages: {
+        tool: Math.round(reductionRatio(result) * 1000) / 1000,
+        ...(prose ? { prose: prose.cutoff ?? null } : {}),
+        ...(notifications ? { notifications: notifications.rung ?? null } : {}),
+        ...(injected ? { injected: injected.rung ?? null } : {}),
+        ...(exchanges ? { exchanges: exchanges.cutoff ?? null, exchangesDropped: exchanges.stats.dropped } : {}),
+        ...(steps ? { steps: steps.pass ?? null, stepsArchived: steps.stats.archived } : {}),
+      },
       requests: result.stats.requests,
       failedRequests: result.stats.failedRequests,
       stateStage: result.stats.stateStage,
@@ -1545,7 +1555,11 @@ async function compactHook(
     log($, `kept history ~${tokensAfter} tokens of ~${historyTokens}`, report);
     notify(
       $,
-      `Compacted with Jev: ${event.messages.length} → ${messages.length} messages, ${percent(1 - tokensAfter / Math.max(1, historyTokens))} smaller, no summary${removedMedia ? `, ${removedMedia}` : ''}`,
+      `Compacted with Jev: ${event.messages.length} → ${messages.length} messages, ${
+        contextTokens && contextTokens > historyInContext
+          ? `frees ${percent((1 - tokensAfter / Math.max(1, historyTokens)) * (historyInContext / contextTokens))} of the context`
+          : `${percent(1 - tokensAfter / Math.max(1, historyTokens))} smaller`
+      }, no summary${removedMedia ? `, ${removedMedia}` : ''}`,
       `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result, prose, notifications, injected, exchanges, steps)})`,
       report,
     );

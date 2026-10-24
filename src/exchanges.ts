@@ -3,7 +3,7 @@ import { goalIndices, isPromptRow } from './inject.js';
 import { type NotificationOptions, askNoul } from './notifications.js';
 import { PROSE_KEEP_LADDER } from './prose.js';
 import { sha256Hex } from './sha256.js';
-import { MARKER, isPinned, resultPreview } from './state.js';
+import { MARKER, isPinned, ownText, resultPreview } from './state.js';
 import type { CompactResult, JevAsker, JevQuestions, Message, NoulQuestion } from './types.js';
 
 /**
@@ -94,7 +94,8 @@ export function findExchanges(messages: readonly Message[], preserveRecentMessag
 function lastReply(messages: readonly Message[], [from, to]: [number, number]): string {
   for (let i = to - 1; i >= from; i--) {
     const m = messages[i] as Message;
-    if (m.role === 'assistant' && m.text.trim().length > 0) return m.text.trim();
+    const text = m.role === 'assistant' ? ownText(m.text) : '';
+    if (text.length > 0) return text;
   }
   return '';
 }
@@ -194,7 +195,8 @@ export function applyExchanges(
       calls += (messages[i] as Message).toolUses.length;
     }
     const reply = lastReply(messages, e.work);
-    const head = reply.length > REPLY_HEAD_CHARS ? `${headOf(reply, REPLY_HEAD_CHARS)}…` : reply;
+    const flat = reply.replace(/\s+/g, ' ');
+    const head = flat.length > REPLY_HEAD_CHARS ? `${headOf(flat, REPLY_HEAD_CHARS)}…` : flat;
     const marker = `${MARKER}archived this exchange: ${e.work[1] - e.work[0]} rows, ${calls} tool calls${
       calls > 0 ? ` (${toolList(e.tools)})` : ''
     }, ${chars} chars; full text: ${path} (Read it if needed)]`;

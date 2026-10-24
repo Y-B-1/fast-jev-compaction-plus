@@ -85,3 +85,22 @@ describe('compaction ledger', () => {
     expect(archiveFilesNamed({ file_path: 'src/a.txt' })).toEqual([]);
   });
 });
+
+describe('what a compaction reports', () => {
+  it('logs the marker rows left and each stage outcome', async () => {
+    const { $, files, next, hook } = setup();
+    await hook('session.compact')($, { trigger: 'manual', messages: transcript() }, next());
+    const [entry] = lines(files);
+    expect(entry.markersAfter).toBe(0);
+    expect(entry.stages).toEqual(expect.objectContaining({ tool: expect.any(Number) }));
+  });
+
+  it('states the share of the whole context freed when the engine reports the context size', async () => {
+    const { $, next, hook } = setup();
+    const toasts: string[] = [];
+    Object.assign($.ui, { toast: (t: string) => void toasts.push(t) });
+    Object.assign($.session, { usage: async () => ({ context: { tokens: 100_000, breakdown: { categories: [{ kind: 'used', name: 'Messages', tokens: 50_000 }] } } }) });
+    await hook('session.compact')($, { trigger: 'manual', messages: transcript() }, next());
+    expect(toasts[0]).toMatch(/^Compacted with Jev: 5 → \d+ messages, frees \d+% of the context, no summary$/);
+  });
+});

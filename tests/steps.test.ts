@@ -94,7 +94,7 @@ describe('stepLadder', () => {
     const scores = await scoreSteps(messages, asker((k) => (k === 's7' ? 0.02 : 0.9)), options);
     const out = stepLadder(scores, toolResult(messages), 0.75, (id) => `arch/${id}.txt`)!;
     expect(out.pass).toBe('fill');
-    expect(out.applied.archived[0]!.text).toContain('run e');
+    expect(out.applied.archived.some((a) => a.text.includes('run e'))).toBe(true);
     expect(reductionRatio(out.result)).toBeGreaterThanOrEqual(0.75);
     expect(stepLadder(scores, toolResult(messages), 0.99, (id) => id)).toBeUndefined();
   });

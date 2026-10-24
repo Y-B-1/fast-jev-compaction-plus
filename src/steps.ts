@@ -3,7 +3,7 @@ import { TYPED_WORK } from './exchanges.js';
 import { type NotificationOptions, askNoul } from './notifications.js';
 import { PROSE_KEEP_LADDER } from './prose.js';
 import { sha256Hex } from './sha256.js';
-import { MARKER, isHostOnly, isPinned, isPromptRow, resultPreview } from './state.js';
+import { MARKER, isHostOnly, isPinned, isPromptRow, ownText, resultPreview } from './state.js';
 import type { CompactResult, JevAsker, JevQuestions, Message, NoulQuestion } from './types.js';
 
 /**
@@ -22,6 +22,8 @@ import type { CompactResult, JevAsker, JevQuestions, Message, NoulQuestion } fro
 /** A step smaller than this is not worth its marker. */
 export const STEP_MIN_CHARS = 1_200;
 const NOTE_CHARS = 200;
+/** The reply trim on a compaction that already met its target runs only when it frees at least this share of it. */
+export const MILD_MIN_SHARE = 0.05;
 
 export type Step = {
   key: string;
@@ -52,7 +54,7 @@ export type StepScores = {
   stats: StepStats;
 };
 
-export type StepPlan = { step: Step; id: string; text: string; path: string; row: Message; saved: number };
+export type StepPlan = { step: Step; id: string; text: string; path: string; row: Message; saved: number; note: string };
 
 export type StepApplied = {
   messages: Message[];
@@ -118,9 +120,24 @@ export function findSteps(messages: readonly Message[], preserveRecentMessages: 
 function lastText(messages: readonly Message[], step: Step): string {
   for (let i = step.to - 1; i >= step.from; i--) {
     const m = messages[i] as Message;
-    if (m.role === 'assistant' && m.text.trim().length > 0) return m.text.trim();
+    const text = m.role === 'assistant' ? ownText(m.text) : '';
+    if (text.length > 0) return text;
   }
   return '';
+}
+
+/** A row made only of the plugin's own marker text: it carries no work of its own. */
+const markerOnly = (m: Message | undefined): boolean =>
+  m !== undefined && m.role === 'assistant' && m.toolUses.length === 0 && m.text.includes(MARKER) && ownText(m.text) === '';
+
+/** One marker row for `rows` archived rows in `path`, with the last thing the assistant wrote on one line. */
+function markerRow(rows: number, tools: ReadonlyMap<string, number>, chars: number, path: string, note: string): Message {
+  const calls = [...tools.values()].reduce((a, b) => a + b, 0);
+  const marker = `${MARKER}archived ${rows} row${rows > 1 ? 's' : ''} of earlier work${
+    calls > 0 ? `, ${calls} tool call${calls > 1 ? 's' : ''} (${toolList(tools)})` : ''
+  }, ${chars} chars; full text: ${path} (Read it if needed)]`;
+  const flat = note.replace(/\s+/g, ' ');
+  return { role: 'assistant', text: flat ? `${marker}\nNote: ${flat.length > NOTE_CHARS ? `${headOf(flat, NOTE_CHARS)}…` : flat}` : marker, toolUses: [] };
 }
 
 function toolList(tools: ReadonlyMap<string, number>): string {
@@ -190,38 +207,70 @@ export function planSteps(scores: StepScores, pathOf: (id: string) => string): S
     const text = renderStep(scores.messages, step);
     const id = `step-${sha256Hex(text).slice(0, 12)}`;
     const path = pathOf(id);
-    const calls = [...step.tools.values()].reduce((a, b) => a + b, 0);
     const note = lastText(scores.messages, step);
-    const marker = `${MARKER}archived ${step.to - step.from} row${step.to - step.from > 1 ? 's' : ''} of earlier work${
-      calls > 0 ? `, ${calls} tool call${calls > 1 ? 's' : ''} (${toolList(step.tools)})` : ''
-    }, ${step.chars} chars; full text: ${path} (Read it if needed)]`;
-    const row: Message = {
-      role: 'assistant',
-      text: note ? `${marker}\nNote: ${note.length > NOTE_CHARS ? `${headOf(note, NOTE_CHARS)}…` : note}` : marker,
-      toolUses: [],
-    };
+    const row = markerRow(step.to - step.from, step.tools, step.chars, path, note);
     const saved = step.chars - messageChars(row);
-    if (saved > 0) plans.push({ step, id, text, path, row, saved });
+    if (saved > 0) plans.push({ step, id, text, path, row, saved, note });
   }
   return plans;
 }
 
-/** Replaces each chosen step's rows with its marker row. Untouched rows come back as the same objects. */
-export function applySteps(scores: StepScores, chosen: readonly StepPlan[]): StepApplied {
+/**
+ * Replaces the chosen steps with marker rows: one row and one archive file per run of adjacent
+ * chosen steps, and earlier marker rows just before or between them fold into that run. Untouched
+ * rows come back as the same objects.
+ */
+export function applySteps(scores: StepScores, chosen: readonly StepPlan[], pathOf: (id: string) => string): StepApplied {
+  const { messages } = scores;
   const at = new Map(chosen.map((p) => [p.step.from, p]));
   const out: Message[] = [];
-  for (let i = 0; i < scores.messages.length; i++) {
-    const hit = at.get(i);
-    if (hit) {
-      out.push(hit.row);
-      i = hit.step.to - 1;
-    } else out.push(scores.messages[i] as Message);
+  const archived: StepApplied['archived'] = [];
+  let charsSaved = 0;
+  for (let i = 0; i < messages.length; i++) {
+    let first = at.get(i);
+    if (!first) {
+      out.push(messages[i] as Message);
+      continue;
+    }
+    // Earlier marker rows right before the run join it.
+    let from = i;
+    while (from - 1 >= 1 && markerOnly(messages[from - 1]) && out.at(-1) === messages[from - 1]) {
+      out.pop();
+      from--;
+    }
+    const run: StepPlan[] = [first];
+    let to = first.step.to;
+    for (;;) {
+      let next = to;
+      while (markerOnly(messages[next])) next++;
+      const more = at.get(next);
+      if (!more) break;
+      run.push(more);
+      to = more.step.to;
+    }
+    i = to - 1;
+    if (run.length === 1 && from === first.step.from) {
+      out.push(first.row);
+      archived.push({ id: first.id, text: first.text, path: first.path });
+      charsSaved += first.saved;
+      continue;
+    }
+    const step: Step = { ...first.step, from, to, chars: 0, tools: new Map() };
+    for (let k = from; k < to; k++) {
+      const m = messages[k] as Message;
+      step.chars += messageChars(m);
+      for (const use of m.toolUses) step.tools.set(use.tool, (step.tools.get(use.tool) ?? 0) + 1);
+    }
+    const text = renderStep(messages, step);
+    const id = `step-${sha256Hex(text).slice(0, 12)}`;
+    const path = pathOf(id);
+    const row = markerRow(to - from, step.tools, step.chars, path, (run.at(-1) as StepPlan).note);
+    out.push(row);
+    archived.push({ id, text, path });
+    charsSaved += step.chars - messageChars(row);
+    first = undefined;
   }
-  return {
-    messages: out,
-    archived: chosen.map((p) => ({ id: p.id, text: p.text, path: p.path })),
-    stats: { ...scores.stats, archived: chosen.length, charsSaved: chosen.reduce((a, p) => a + p.saved, 0) },
-  };
+  return { messages: out, archived, stats: { ...scores.stats, archived: chosen.length, charsSaved } };
 }
 
 export type StepOutcome = { pass: 'trim' | 'fill'; cutoff?: number; result: CompactResult; applied: StepApplied };
@@ -243,7 +292,7 @@ export function stepLadder(
   const { charsBefore, charsAfter } = result.stats;
   const reaches = (saved: number) => charsBefore > 0 && (charsBefore - (charsAfter - saved)) / charsBefore >= minRatio;
   const finish = (pass: StepOutcome['pass'], chosen: StepPlan[], cutoff?: number): StepOutcome => {
-    const applied = applySteps(scores, chosen);
+    const applied = applySteps(scores, chosen, pathOf);
     const after = applied.messages.reduce((sum, m) => sum + messageChars(m), 0);
     const out = { ...result, messages: applied.messages, stats: { ...result.stats, charsAfter: after } };
     return { pass, ...(cutoff !== undefined ? { cutoff } : {}), result: out, applied };
@@ -262,13 +311,18 @@ export function stepLadder(
   return undefined;
 }
 
-/** For a compaction that already met its target: archives only steps before the last prompt that Jev scores below the mildest cut-off. */
+/**
+ * For a compaction that already met its target: archives only steps before the last prompt that Jev
+ * scores below the mildest cut-off, and only when that frees at least `MILD_MIN_SHARE` of the context.
+ */
 export function mildSteps(scores: StepScores, result: CompactResult, pathOf: (id: string) => string): StepOutcome | undefined {
   const cutoff = PROSE_KEEP_LADDER[0] as number;
   const chosen = planSteps(scores, pathOf).filter((p) => !p.step.current && (scores.noul.get(p.step.key) as number) < cutoff);
   if (chosen.length === 0) return undefined;
-  const applied = applySteps(scores, chosen);
+  const applied = applySteps(scores, chosen, pathOf);
   const after = applied.messages.reduce((sum, m) => sum + messageChars(m), 0);
+  const now = result.messages.reduce((sum, m) => sum + messageChars(m), 0);
+  if (result.stats.charsBefore <= 0 || (now - after) / result.stats.charsBefore < MILD_MIN_SHARE) return undefined;
   return { pass: 'trim', cutoff, result: { ...result, messages: applied.messages, stats: { ...result.stats, charsAfter: after } }, applied };
 }
 
